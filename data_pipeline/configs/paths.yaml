@@ -1,8 +1,9 @@
 # Edit to match YOUR machine. This file IS git-tracked,
 # but each team member has their own local edits.
 
-raw_data_dir: C:/Users/naqee/OneDrive/Desktop/CSC415 Project/data
+raw_data_dir: C:/Users/naqee/OneDrive/Desktop/CSC415 Project/data/raw
 unified_data_dir: C:/Users/naqee/OneDrive/Desktop/CSC415 Project/data/unified
-robomimic_raw: C:/Users/naqee/OneDrive/Desktop/CSC415 Project/data/robomimic
-rlbench_raw: C:/Users/naqee/OneDrive/Desktop/CSC415 Project/data/rlbench
-maniskill_raw: C:/Users/naqee/OneDrive/Desktop/CSC415 Project/data/maniskill
+external_repos_dir: C:/Users/naqee/OneDrive/Desktop/CSC415 Project/data/external_repos
+robomimic_raw: C:/Users/naqee/OneDrive/Desktop/CSC415 Project/data/raw/robomimic
+rlbench_raw: C:/Users/naqee/OneDrive/Desktop/CSC415 Project/data/raw/rlbench
+maniskill_raw: C:/Users/naqee/OneDrive/Desktop/CSC415 Project/data/raw/maniskill
