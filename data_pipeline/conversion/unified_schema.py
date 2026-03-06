@@ -2,7 +2,10 @@
 Both conversion scripts and the dataset class import from here.
 
 Schema per demo group (data/<demo_key>/):
-  images      float32  [T, K, H, W, 3]     pixel values in [0, 1]
+  images      float32 or uint8  [T, K, H, W, 3]
+                float32 [0,1]:  robomimic, maniskill
+                uint8   [0,255]: rlbench  (saves ~3-4x disk vs float32)
+                base_dataset.py handles both transparently.
   view_present bool    [K]                  True if camera slot has real data
   actions     float32  [T, 7]               delta-EE: [dx,dy,dz,drx,dry,drz,gripper]
   proprio     float32  [T, D_prop]          benchmark-specific (dim stored in attrs)
@@ -63,15 +66,17 @@ def create_demo_group(
     D_prop: int,
     compress: bool = True,
     action_dim: int = ACTION_DIM,
+    image_dtype: np.dtype = np.float32,
 ) -> h5py.Group:
     """Create a demo group with pre-allocated datasets of the correct shapes.
 
     Args:
-        hdf5_file: Open h5py.File in write mode.
-        demo_key:  e.g. "demo_0"
-        T:         Number of timesteps in this demo.
-        D_prop:    Proprio vector dimension.
-        compress:  Whether to use gzip compression (recommended for images).
+        hdf5_file:   Open h5py.File in write mode.
+        demo_key:    e.g. "demo_0"
+        T:           Number of timesteps in this demo.
+        D_prop:      Proprio vector dimension.
+        compress:    Whether to use gzip compression (recommended for images).
+        image_dtype: np.float32 (robomimic/maniskill) or np.uint8 (rlbench).
 
     Returns:
         The newly created h5py.Group at data/<demo_key>.
@@ -83,11 +88,11 @@ def create_demo_group(
 
     kwargs = {"compression": "gzip", "compression_opts": 4} if compress else {}
 
-    # Images: stored as float32 in [0,1]
+    # Images: float32 [0,1] for robomimic/maniskill; uint8 [0,255] for rlbench
     grp.create_dataset(
         "images",
         shape=(T, K, H, W, 3),
-        dtype=np.float32,
+        dtype=image_dtype,
         **kwargs,
     )
 
