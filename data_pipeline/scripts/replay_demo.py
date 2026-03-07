@@ -116,11 +116,11 @@ def main():
     rate = n_success / len(successes)
     print(f"\nResult: {n_success}/{len(successes)} succeeded ({rate*100:.0f}%)")
 
-    if rate < 0.8:
-        print("FAIL: Success rate below 80% threshold — conversion bug likely.")
+    if rate < 0.99:
+        print("FAIL: Success rate below 99% threshold — conversion bug likely.")
         sys.exit(1)
     else:
-        print("PASS: Demo replay meets >=80% threshold.")
+        print("PASS: Demo replay meets >=99% threshold.")
 
 
 if __name__ == "__main__":
