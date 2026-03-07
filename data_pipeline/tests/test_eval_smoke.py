@@ -81,7 +81,7 @@ class TestGTReplayRobomimic:
     Loads initial states from raw HDF5 to restore scene, then steps through
     with actions from unified HDF5. Tests the full wrapper end-to-end.
 
-    Pass criterion: >= 9/10 demos succeed (matches Phase 1 demo replay).
+    Pass criterion: >= 90% of all train demos succeed.
     """
 
     def test_gt_replay_lift(self):
@@ -93,7 +93,6 @@ class TestGTReplayRobomimic:
         from data_pipeline.envs.robomimic_wrapper import RobomimicWrapper
 
         env = RobomimicWrapper("lift")
-        n_demos = 10
         successes = 0
 
         with h5py.File(str(_ROBOMIMIC_UNIFIED), "r") as uf, \
@@ -104,8 +103,9 @@ class TestGTReplayRobomimic:
 
             demo_keys = [
                 k.decode() if isinstance(k, bytes) else k
-                for k in uf["mask/train"][:n_demos]
+                for k in uf["mask/train"][:]
             ]
+            n_demos = len(demo_keys)
 
             for key in demo_keys:
                 actions = uf[f"data/{key}/actions"][:]  # [T, 7] raw
@@ -135,9 +135,12 @@ class TestGTReplayRobomimic:
                       f"(steps={t+1}/{len(actions)})")
 
         env.close()
-        print(f"\nGT replay lift: {successes}/{n_demos}")
-        assert successes >= 9, \
-            f"Expected >= 9/10 successes, got {successes}/10"
+        rate = successes / n_demos
+        print(f"\nGT replay lift: {successes}/{n_demos} ({rate*100:.0f}%)")
+        # Offscreen renderer introduces tiny FP perturbations vs bare sim,
+        # so borderline demos may flip. Require >= 98%.
+        assert rate >= 0.98, \
+            f"Expected >=98% success, got {successes}/{n_demos} ({rate*100:.1f}%)"
 
 
 @pytest.mark.slow
