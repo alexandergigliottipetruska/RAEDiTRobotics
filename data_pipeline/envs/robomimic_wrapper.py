@@ -67,8 +67,12 @@ class RobomimicWrapper(BaseManipulationEnv):
         image_size: int = 224,
         seed: int | None = None,
     ):
+        import logging
         import robosuite as suite
         from robosuite.controllers import load_composite_controller_config
+
+        # Suppress noisy robosuite warnings about unused controller components
+        logging.getLogger("robosuite").setLevel(logging.ERROR)
 
         self._task = task
         self._image_size = image_size
