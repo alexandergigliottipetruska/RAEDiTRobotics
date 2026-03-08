@@ -19,10 +19,15 @@ def evaluate_all_checkpoints(
     policy_class,
     ckpt_dir: str,
     env,
-    action_mean: np.ndarray,
-    action_std: np.ndarray,
-    proprio_mean: np.ndarray,
-    proprio_std: np.ndarray,
+    action_mean: np.ndarray = None,
+    action_std: np.ndarray = None,
+    proprio_mean: np.ndarray = None,
+    proprio_std: np.ndarray = None,
+    norm_mode: str = "zscore",
+    action_min: np.ndarray = None,
+    action_max: np.ndarray = None,
+    proprio_min: np.ndarray = None,
+    proprio_max: np.ndarray = None,
     ckpt_pattern: str = "ckpt_*.pt",
     last_n: int = 10,
     **eval_kwargs,
@@ -34,8 +39,11 @@ def evaluate_all_checkpoints(
                       returns a policy with .predict().
         ckpt_dir: Directory containing checkpoint files.
         env: BaseManipulationEnv instance.
-        action_mean, action_std: Normalization stats for actions.
-        proprio_mean, proprio_std: Normalization stats for proprio.
+        action_mean, action_std: For zscore denormalization.
+        proprio_mean, proprio_std: For zscore proprio normalization.
+        norm_mode: "zscore" or "minmax".
+        action_min, action_max: For minmax denormalization.
+        proprio_min, proprio_max: For minmax proprio normalization.
         ckpt_pattern: Glob pattern for checkpoint files.
         last_n: Number of last checkpoints to average.
         **eval_kwargs: Passed to evaluate_policy (num_episodes, max_steps, etc.)
@@ -59,10 +67,15 @@ def evaluate_all_checkpoints(
         sr, episode_results = evaluate_policy(
             policy,
             env,
+            norm_mode=norm_mode,
             action_mean=action_mean,
             action_std=action_std,
+            action_min=action_min,
+            action_max=action_max,
             proprio_mean=proprio_mean,
             proprio_std=proprio_std,
+            proprio_min=proprio_min,
+            proprio_max=proprio_max,
             **eval_kwargs,
         )
 
@@ -95,10 +108,15 @@ def evaluate_multi_seed(
     ckpt_path: str,
     env_fn,
     seeds: list[int],
-    action_mean: np.ndarray,
-    action_std: np.ndarray,
-    proprio_mean: np.ndarray,
-    proprio_std: np.ndarray,
+    action_mean: np.ndarray = None,
+    action_std: np.ndarray = None,
+    proprio_mean: np.ndarray = None,
+    proprio_std: np.ndarray = None,
+    norm_mode: str = "zscore",
+    action_min: np.ndarray = None,
+    action_max: np.ndarray = None,
+    proprio_min: np.ndarray = None,
+    proprio_max: np.ndarray = None,
     **eval_kwargs,
 ) -> dict:
     """Evaluate a single checkpoint across multiple seeds.
@@ -108,8 +126,11 @@ def evaluate_multi_seed(
         ckpt_path: Path to checkpoint.
         env_fn: Callable(seed) -> BaseManipulationEnv.
         seeds: List of random seeds.
-        action_mean, action_std: Normalization stats.
-        proprio_mean, proprio_std: Normalization stats.
+        action_mean, action_std: For zscore denormalization.
+        proprio_mean, proprio_std: For zscore proprio normalization.
+        norm_mode: "zscore" or "minmax".
+        action_min, action_max: For minmax denormalization.
+        proprio_min, proprio_max: For minmax proprio normalization.
         **eval_kwargs: Passed to evaluate_policy.
 
     Returns:
@@ -124,10 +145,15 @@ def evaluate_multi_seed(
         _, episode_results = evaluate_policy(
             policy,
             env,
+            norm_mode=norm_mode,
             action_mean=action_mean,
             action_std=action_std,
+            action_min=action_min,
+            action_max=action_max,
             proprio_mean=proprio_mean,
             proprio_std=proprio_std,
+            proprio_min=proprio_min,
+            proprio_max=proprio_max,
             **eval_kwargs,
         )
 

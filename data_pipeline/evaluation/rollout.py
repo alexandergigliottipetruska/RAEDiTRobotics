@@ -4,9 +4,9 @@ Benchmark-agnostic: only the environment wrapper changes per benchmark.
 
 Protocol (Chi et al. 2023, Dasari et al. 2024):
   1. Maintain rolling buffer of T_o past observations
-  2. On replan: stack T_o frames, z-score normalize proprio,
-     pass view_present flags, run diffusion -> [T_p, 7]
-  3. Denormalize actions: raw = normalized * std + mean
+  2. On replan: stack T_o frames, normalize proprio,
+     pass view_present flags, run diffusion -> [T_p, action_dim]
+  3. Denormalize actions (zscore or minmax)
   4. Execute first T_a actions from the chunk
   5. Re-observe and repeat until success or max_steps
 """
@@ -22,10 +22,15 @@ def evaluate_policy(
     env,
     num_episodes: int = 25,
     max_steps: int = 300,
+    norm_mode: str = "zscore",
     action_mean: np.ndarray | None = None,
     action_std: np.ndarray | None = None,
+    action_min: np.ndarray | None = None,
+    action_max: np.ndarray | None = None,
     proprio_mean: np.ndarray | None = None,
     proprio_std: np.ndarray | None = None,
+    proprio_min: np.ndarray | None = None,
+    proprio_max: np.ndarray | None = None,
     exec_horizon: int = 8,
     obs_horizon: int = 2,
 ) -> tuple[float, list[dict]]:
@@ -33,13 +38,16 @@ def evaluate_policy(
 
     Args:
         policy: Model with .predict(images, proprio, view_present)
-                -> [T_p, 7] normalized actions (torch tensor).
+                -> [T_p, action_dim] normalized actions (torch tensor).
         env: BaseManipulationEnv wrapper with reset(), step(),
              get_multiview_images(), get_proprio(), get_view_present().
         num_episodes: Number of evaluation rollouts.
         max_steps: Maximum timesteps per episode.
-        action_mean, action_std: From /norm_stats/actions/ ([7] arrays).
-        proprio_mean, proprio_std: From /norm_stats/proprio/ ([D_prop] arrays).
+        norm_mode: "zscore" or "minmax".
+        action_mean, action_std: For zscore denormalization.
+        action_min, action_max: For minmax denormalization.
+        proprio_mean, proprio_std: For zscore proprio normalization.
+        proprio_min, proprio_max: For minmax proprio normalization.
         exec_horizon: T_a = 8 (actions executed before re-planning).
         obs_horizon: T_o = 2 (past observation frames to condition on).
 
@@ -74,8 +82,11 @@ def evaluate_policy(
                 images_seq = np.concatenate(list(img_buffer), axis=0)
                 proprio_seq = np.concatenate(list(proprio_buffer), axis=0)
 
-                # Z-score normalize proprio (matches training)
-                if proprio_mean is not None and proprio_std is not None:
+                # Normalize proprio (matches training)
+                if norm_mode == "minmax" and proprio_min is not None and proprio_max is not None:
+                    p_range = np.clip(proprio_max - proprio_min, 1e-6, None)
+                    proprio_norm = 2.0 * (proprio_seq - proprio_min) / p_range - 1.0
+                elif proprio_mean is not None and proprio_std is not None:
                     proprio_norm = (proprio_seq - proprio_mean) / proprio_std
                 else:
                     proprio_norm = proprio_seq
@@ -89,7 +100,10 @@ def evaluate_policy(
 
                 # Denormalize to robot action space
                 raw = pred.cpu().numpy() if isinstance(pred, torch.Tensor) else np.asarray(pred)
-                if action_mean is not None and action_std is not None:
+                if norm_mode == "minmax" and action_min is not None and action_max is not None:
+                    a_range = action_max - action_min
+                    raw = (raw + 1.0) / 2.0 * a_range + action_min
+                elif action_mean is not None and action_std is not None:
                     raw = raw * action_std + action_mean
 
                 action_queue = list(raw[:exec_horizon])

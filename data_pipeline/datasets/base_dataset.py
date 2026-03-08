@@ -5,7 +5,7 @@ Benchmark-agnostic. Reads unified HDF5, builds flat index of
 
 Output per sample (dict):
   images:       (T_obs, K, 3, H, W)  float32, ImageNet-normalized, CHW
-  actions:      (T_pred, action_dim) float32, z-score normalized
+  actions:      (T_pred, action_dim) float32, normalized (zscore or minmax)
   proprio:      (T_obs, D_prop)      float32, raw (not normalized)
   view_present: (K,)                 bool
 """
@@ -67,15 +67,28 @@ class MultiViewManipulationDataset(Dataset):
         split: str = "train",
         T_obs: int = 2,
         T_pred: int = 50,
+        norm_mode: str = "zscore",
     ):
         self.hdf5_path = hdf5_path
         self.T_obs = T_obs
         self.T_pred = T_pred
+        self.norm_mode = norm_mode
+
+        if norm_mode not in ("zscore", "minmax"):
+            raise ValueError(f"norm_mode must be 'zscore' or 'minmax', got '{norm_mode}'")
 
         # Load norm stats once (small, safe to keep in memory)
         norm = load_norm_stats(hdf5_path)
         self._a_mean = norm["actions"]["mean"]   # [action_dim]
         self._a_std  = norm["actions"]["std"]    # [action_dim]
+        self._a_min  = norm["actions"]["min"]    # [action_dim] or None
+        self._a_max  = norm["actions"]["max"]    # [action_dim] or None
+
+        if norm_mode == "minmax" and self._a_min is None:
+            raise ValueError(
+                "norm_mode='minmax' requires min/max in HDF5. "
+                "Re-run conversion to generate them."
+            )
 
         # Read metadata and build flat index
         with h5py.File(hdf5_path, "r") as f:
@@ -137,8 +150,12 @@ class MultiViewManipulationDataset(Dataset):
         # ImageNet normalize + HWC -> CHW: (T_obs, K, H, W, 3) -> (T_obs, K, 3, H, W)
         images = _imagenet_normalize(imgs_raw)
 
-        # Z-score normalize actions
-        actions = (actions_raw - self._a_mean) / self._a_std
+        # Normalize actions
+        if self.norm_mode == "minmax":
+            a_range = np.clip(self._a_max - self._a_min, 1e-6, None)
+            actions = 2.0 * (actions_raw - self._a_min) / a_range - 1.0
+        else:
+            actions = (actions_raw - self._a_mean) / self._a_std
 
         return {
             "images":       torch.from_numpy(images),               # (T_obs, K, 3, H, W)

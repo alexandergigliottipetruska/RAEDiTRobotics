@@ -141,8 +141,8 @@ class TestRolloutActionCount:
 
 
 class TestRolloutActionValues:
-    def test_denormalized_values(self, action_stats, proprio_stats):
-        """Actions received by env match expected denormalized values."""
+    def test_denormalized_values_zscore(self, action_stats, proprio_stats):
+        """Actions received by env match expected z-score denormalized values."""
         a_mean, a_std = action_stats
         p_mean, p_std = proprio_stats
 
@@ -153,12 +153,35 @@ class TestRolloutActionValues:
 
         evaluate_policy(
             policy, env, num_episodes=1, max_steps=100,
+            norm_mode="zscore",
             action_mean=a_mean, action_std=a_std,
             proprio_mean=p_mean, proprio_std=p_std,
             exec_horizon=8, obs_horizon=2,
         )
 
         expected = 1.0 * a_std + a_mean  # denormalized
+        for action in env.received_actions:
+            np.testing.assert_allclose(action, expected, rtol=1e-5)
+
+    def test_denormalized_values_minmax(self):
+        """Actions received by env match expected min-max denormalized values."""
+        a_min = np.array([-1.0, -2.0, -0.5, -0.1, -0.1, -0.2, 0.0], dtype=np.float32)
+        a_max = np.array([1.0, 2.0, 0.5, 0.1, 0.1, 0.2, 1.0], dtype=np.float32)
+
+        # Policy outputs constant normalized action of 0.0 (midpoint)
+        chunk = np.zeros((50, 7), dtype=np.float32)
+        policy = MockPolicy(chunk)
+        env = MockEnv(episode_len=3)
+
+        evaluate_policy(
+            policy, env, num_episodes=1, max_steps=100,
+            norm_mode="minmax",
+            action_min=a_min, action_max=a_max,
+            exec_horizon=8, obs_horizon=2,
+        )
+
+        # 0.0 in [-1,1] maps to midpoint of [min, max]
+        expected = (a_min + a_max) / 2.0
         for action in env.received_actions:
             np.testing.assert_allclose(action, expected, rtol=1e-5)
 
@@ -288,19 +311,42 @@ class TestObsBufferInit:
 
 
 class TestNormRoundtrip:
-    def test_normalize_denormalize(self):
-        """Normalize with dataset logic, denormalize with rollout logic.
-        Max error < 1e-6."""
+    def test_zscore_normalize_denormalize(self):
+        """Z-score round-trip: normalize then denormalize recovers original."""
         raw_actions = np.random.randn(50, 7).astype(np.float32)
         mean = np.random.randn(7).astype(np.float32)
         std = np.abs(np.random.randn(7).astype(np.float32)) + 1e-6
 
-        # Normalize (as dataset class does)
         normalized = (raw_actions - mean) / std
-        # Denormalize (as rollout does)
         recovered = normalized * std + mean
 
         np.testing.assert_allclose(recovered, raw_actions, atol=1e-5)
+
+    def test_minmax_normalize_denormalize(self):
+        """Min-max round-trip: normalize to [-1,1] then denormalize recovers original."""
+        raw_actions = np.random.randn(50, 7).astype(np.float32)
+        a_min = raw_actions.min(axis=0)
+        a_max = raw_actions.max(axis=0)
+        a_range = np.clip(a_max - a_min, 1e-6, None)
+
+        # Normalize (as dataset does with minmax)
+        normalized = 2.0 * (raw_actions - a_min) / a_range - 1.0
+        # Denormalize (as rollout does with minmax)
+        recovered = (normalized + 1.0) / 2.0 * a_range + a_min
+
+        np.testing.assert_allclose(recovered, raw_actions, atol=1e-5)
+
+    def test_minmax_range(self):
+        """Min-max normalized actions should lie in [-1, 1]."""
+        raw_actions = np.random.randn(100, 7).astype(np.float32)
+        a_min = raw_actions.min(axis=0)
+        a_max = raw_actions.max(axis=0)
+        a_range = np.clip(a_max - a_min, 1e-6, None)
+
+        normalized = 2.0 * (raw_actions - a_min) / a_range - 1.0
+
+        assert normalized.min() >= -1.0 - 1e-6
+        assert normalized.max() <= 1.0 + 1e-6
 
 
 class TestGripperThreshold:

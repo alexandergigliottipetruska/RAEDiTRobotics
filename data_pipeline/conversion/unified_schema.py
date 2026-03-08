@@ -2,10 +2,8 @@
 Both conversion scripts and the dataset class import from here.
 
 Schema per demo group (data/<demo_key>/):
-  images      float32 or uint8  [T, K, H, W, 3]
-                float32 [0,1]:  robomimic, maniskill
-                uint8   [0,255]: rlbench  (saves ~3-4x disk vs float32)
-                base_dataset.py handles both transparently.
+  images      uint8  [T, K, H, W, 3]   [0,255] for all benchmarks
+                base_dataset.py converts to float32 and ImageNet-normalizes at load time.
   view_present bool    [K]                  True if camera slot has real data
   actions     float32  [T, 7]               delta-EE: [dx,dy,dz,drx,dry,drz,gripper]
   proprio     float32  [T, D_prop]          benchmark-specific (dim stored in attrs)
@@ -19,10 +17,8 @@ File-level attrs:
   num_cam_slots   int    always 4
 
 Norm stats saved under /norm_stats/ group:
-  norm_stats/actions/mean   float32  [7]
-  norm_stats/actions/std    float32  [7]
-  norm_stats/proprio/mean   float32  [D_prop]
-  norm_stats/proprio/std    float32  [D_prop]
+  norm_stats/actions/{mean,std,min,max}   float32  [action_dim]
+  norm_stats/proprio/{mean,std,min,max}   float32  [D_prop]
 """
 
 import h5py

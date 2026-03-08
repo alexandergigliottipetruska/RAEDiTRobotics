@@ -7,7 +7,7 @@ Camera mapping:
 
 Proprio: [eef_pos(3), eef_quat(4), gripper_qpos(2)] = 9D
 Actions: copied directly (already 7D delta-EE from OSC_POSE controller).
-Images:  resized 84x84 -> 224x224, uint8 -> float32 /255.
+Images:  resized 84x84 -> 224x224, stored as uint8 [0,255].
 
 Usage:
   python -m data_pipeline.conversion.convert_robomimic \
@@ -69,10 +69,9 @@ def load_paths(config_path: str) -> dict:
 
 
 def _resize_image(img_uint8: np.ndarray) -> np.ndarray:
-    """Resize a single HxWx3 uint8 image to IMAGE_SIZE, return float32 in [0,1]."""
+    """Resize a single HxWx3 uint8 image to IMAGE_SIZE, return uint8."""
     H, W = IMAGE_SIZE
-    resized = cv2.resize(img_uint8, (W, H), interpolation=cv2.INTER_LINEAR)
-    return resized.astype(np.float32) / 255.0
+    return cv2.resize(img_uint8, (W, H), interpolation=cv2.INTER_LINEAR)
 
 
 def _convert_demo(
@@ -87,8 +86,8 @@ def _convert_demo(
     slot_map = cfg["slot_map"]
 
     # --- Images ---
-    # dst_grp["images"] already allocated as (T, K, H, W, 3) float32
-    img_buf = np.zeros((T, K, H, W, 3), dtype=np.float32)
+    # dst_grp["images"] already allocated as (T, K, H, W, 3) uint8
+    img_buf = np.zeros((T, K, H, W, 3), dtype=np.uint8)
     for src_key, slot in slot_map.items():
         raw = src_grp[f"obs/{src_key}"][:]  # (T, 84, 84, 3) uint8
         for t in range(T):
@@ -145,7 +144,7 @@ def convert_task(raw_hdf5_path: str, output_path: str, task: str = "lift") -> No
             for i, demo_key in enumerate(all_keys):
                 src_grp = src[f"data/{demo_key}"]
                 T = src_grp["actions"].shape[0]
-                dst_grp = create_demo_group(dst, demo_key, T, proprio_dim, action_dim=action_dim)
+                dst_grp = create_demo_group(dst, demo_key, T, proprio_dim, action_dim=action_dim, image_dtype=np.uint8)
                 _convert_demo(src_grp, dst_grp, cfg)
                 if (i + 1) % 20 == 0 or (i + 1) == len(all_keys):
                     print(f"  [{i+1}/{len(all_keys)}] done")

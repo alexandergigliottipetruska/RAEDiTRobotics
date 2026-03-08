@@ -46,12 +46,20 @@ class GroundTruthPolicy:
 
     Returns normalized action chunks. The rollout loop denormalizes them,
     resulting in the original raw actions being fed to the environment.
+    Supports both zscore and minmax normalization modes.
     """
 
     def __init__(self, actions_raw: np.ndarray, action_mean: np.ndarray,
-                 action_std: np.ndarray, chunk_size: int = 50):
+                 action_std: np.ndarray, chunk_size: int = 50,
+                 norm_mode: str = "zscore",
+                 action_min: np.ndarray = None,
+                 action_max: np.ndarray = None):
         # Pre-normalize so rollout's denormalization recovers the originals
-        self.actions_norm = ((actions_raw - action_mean) / action_std).astype(np.float32)
+        if norm_mode == "minmax" and action_min is not None and action_max is not None:
+            a_range = np.clip(action_max - action_min, 1e-6, None)
+            self.actions_norm = (2.0 * (actions_raw - action_min) / a_range - 1.0).astype(np.float32)
+        else:
+            self.actions_norm = ((actions_raw - action_mean) / action_std).astype(np.float32)
         self.chunk_size = chunk_size
         self.cursor = 0
 

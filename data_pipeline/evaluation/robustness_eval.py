@@ -71,10 +71,15 @@ def evaluate_robustness(
     policy,
     env,
     configs: list[dict] | None = None,
+    norm_mode: str = "zscore",
     action_mean: np.ndarray | None = None,
     action_std: np.ndarray | None = None,
+    action_min: np.ndarray | None = None,
+    action_max: np.ndarray | None = None,
     proprio_mean: np.ndarray | None = None,
     proprio_std: np.ndarray | None = None,
+    proprio_min: np.ndarray | None = None,
+    proprio_max: np.ndarray | None = None,
     **eval_kwargs,
 ) -> dict:
     """Run evaluation across all camera dropout configurations.
@@ -83,8 +88,11 @@ def evaluate_robustness(
         policy: Model with .predict().
         env: BaseManipulationEnv (unwrapped).
         configs: List of dropout configs. Defaults to DROPOUT_CONFIGS.
-        action_mean, action_std: Normalization stats for actions.
-        proprio_mean, proprio_std: Normalization stats for proprio.
+        norm_mode: "zscore" or "minmax".
+        action_mean, action_std: For zscore denormalization.
+        action_min, action_max: For minmax denormalization.
+        proprio_mean, proprio_std: For zscore proprio normalization.
+        proprio_min, proprio_max: For minmax proprio normalization.
         **eval_kwargs: Passed to evaluate_policy.
 
     Returns:
@@ -104,10 +112,15 @@ def evaluate_robustness(
         sr, episodes = evaluate_policy(
             policy,
             wrapped_env,
+            norm_mode=norm_mode,
             action_mean=action_mean,
             action_std=action_std,
+            action_min=action_min,
+            action_max=action_max,
             proprio_mean=proprio_mean,
             proprio_std=proprio_std,
+            proprio_min=proprio_min,
+            proprio_max=proprio_max,
             **eval_kwargs,
         )
 
