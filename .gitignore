@@ -9,3 +9,4 @@ __pycache__/
 wandb/
 /*.png
 *.log
+configs/secrets.yaml
