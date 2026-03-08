@@ -8,6 +8,10 @@ Implements the three-phase training schedule from Zheng et al. 2025:
 Separate optimizers for decoder/adapter vs discriminator head.
 Hyperparameters from Zheng et al. Table 12.
 
+Supports single-GPU, multi-GPU (DataParallel), and multi-node
+(DistributedDataParallel via torchrun). Single-GPU is the default;
+DDP activates automatically when launched with torchrun.
+
 Expected component interfaces (filled in by A.1-A.3):
   encoder(x)  ->  tokens       x: (B, 3, 224, 224) -> (B, N, d)
   adapter(z)  ->  adapted      z: (B, N, d) -> (B, N, d')
@@ -23,6 +27,7 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from data_pipeline.datasets.stage1_dataset import Stage1Dataset
@@ -37,6 +42,33 @@ from models.losses import (
 from models.discriminator import PatchDiscriminator
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Distributed helpers
+# ---------------------------------------------------------------------------
+
+def _is_distributed() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def _rank() -> int:
+    return torch.distributed.get_rank() if _is_distributed() else 0
+
+
+def _is_main() -> bool:
+    return _rank() == 0
+
+
+def _world_size() -> int:
+    return torch.distributed.get_world_size() if _is_distributed() else 1
+
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    """Get the underlying module from a DDP or DataParallel wrapper."""
+    if isinstance(model, (nn.parallel.DistributedDataParallel, nn.DataParallel)):
+        return model.module
+    return model
 
 
 # ---------------------------------------------------------------------------
@@ -97,8 +129,9 @@ def disc_forward_with_grad(
 
     Use for the GENERATOR step only. The disc step uses disc() normally.
     """
-    feat = disc.backbone(x)
-    return disc.head(feat)
+    raw = _unwrap(disc)
+    feat = raw.backbone(x)
+    return raw.head(feat)
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +171,9 @@ def train_step(
 
     adapted = adapter(tokens)               # (N, num_patches, d')
 
-    if hasattr(adapter, "noise_augment"):
-        adapted = adapter.noise_augment(adapted)
+    raw_adapter = _unwrap(adapter)
+    if hasattr(raw_adapter, "noise_augment"):
+        adapted = raw_adapter.noise_augment(adapted)
 
     pred = decoder(adapted)                 # (N, 3, 224, 224) in [0, 1]
 
@@ -158,7 +192,7 @@ def train_step(
     if use_gan:
         logits_fake = disc_forward_with_grad(disc, pred)
         L_gan = gan_generator_loss(logits_fake)
-        lam = compute_adaptive_lambda(L_rec, L_gan, decoder.last_layer_weight)
+        lam = compute_adaptive_lambda(L_rec, L_gan, _unwrap(decoder).last_layer_weight)
         L_total = L_rec + config.omega_G * lam * L_gan
         losses["gan_gen"] = L_gan.item()
         losses["lambda"] = lam.item()
@@ -251,14 +285,18 @@ def save_checkpoint(
     opt_disc: torch.optim.Optimizer,
     val_metrics: dict,
 ):
-    """Save training checkpoint (adapter + decoder + disc head + optimizers)."""
+    """Save training checkpoint (adapter + decoder + disc head + optimizers).
+
+    Automatically unwraps DDP/DataParallel wrappers so checkpoints
+    are portable across single-GPU and distributed setups.
+    """
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(
         {
             "epoch": epoch,
-            "adapter": adapter.state_dict(),
-            "decoder": decoder.state_dict(),
-            "disc_head": disc.head.state_dict(),
+            "adapter": _unwrap(adapter).state_dict(),
+            "decoder": _unwrap(decoder).state_dict(),
+            "disc_head": _unwrap(disc).head.state_dict(),
             "opt_gen": opt_gen.state_dict(),
             "opt_disc": opt_disc.state_dict(),
             "val_metrics": val_metrics,
@@ -302,15 +340,29 @@ def train_stage1(
 ):
     """Main Stage 1 training entry point.
 
+    Supports single-GPU (default), multi-GPU DataParallel, and multi-node
+    DistributedDataParallel (via torchrun). DDP is auto-detected — no flag
+    needed. The notebook and script both call this function identically.
+
     Args:
         config:      Training configuration.
         encoder:     Frozen encoder (A.1).
         adapter:     Trainable adapter (A.2).
         decoder:     Trainable decoder (A.3). Must expose `last_layer_weight`.
-        device:      Device to train on.
+        device:      Device to train on (ignored under DDP; uses LOCAL_RANK).
         resume_from: Path to checkpoint to resume from.
     """
-    device = torch.device(device)
+    distributed = _is_distributed()
+    rank = _rank()
+    is_main = _is_main()
+
+    # Under DDP, device is set from LOCAL_RANK
+    if distributed:
+        local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        device = torch.device(f"cuda:{local_rank}")
+        torch.cuda.set_device(device)
+    else:
+        device = torch.device(device)
 
     # Move models to device
     encoder = encoder.to(device).eval()
@@ -322,16 +374,41 @@ def train_stage1(
 
     lpips_net = create_lpips_net().to(device)
 
+    # Load checkpoint BEFORE wrapping in DDP (state_dicts are unwrapped)
+    start_epoch = 0
+    if resume_from and os.path.isfile(resume_from):
+        # Create temporary optimizers for checkpoint loading
+        gen_params = list(adapter.parameters()) + list(decoder.parameters())
+        _opt_gen = torch.optim.AdamW(gen_params, lr=config.lr_gen,
+                                     betas=config.betas, weight_decay=config.weight_decay)
+        _opt_disc = torch.optim.AdamW(disc.head.parameters(), lr=config.lr_disc,
+                                      betas=config.betas, weight_decay=config.weight_decay)
+        start_epoch = load_checkpoint(
+            resume_from, adapter, decoder, disc, _opt_gen, _opt_disc
+        )
+
+    # Wrap trainable models in DDP (after checkpoint load, before optimizer creation)
+    if distributed:
+        adapter = nn.parallel.DistributedDataParallel(adapter, device_ids=[local_rank])
+        decoder = nn.parallel.DistributedDataParallel(decoder, device_ids=[local_rank])
+        disc = nn.parallel.DistributedDataParallel(disc, device_ids=[local_rank])
+        if is_main:
+            log.info("DDP enabled: %d GPUs across %d nodes", _world_size(), _world_size())
+
     # Dataloaders
     train_ds = Stage1Dataset(config.hdf5_path, split="train")
     valid_ds = Stage1Dataset(config.hdf5_path, split="valid")
 
+    # DistributedSampler splits data across ranks; shuffle is handled by sampler
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if distributed else None
+
     train_loader = DataLoader(
         train_ds,
         batch_size=config.batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),  # only shuffle if no sampler
+        sampler=train_sampler,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
         drop_last=True,
     )
     valid_loader = DataLoader(
@@ -339,7 +416,7 @@ def train_stage1(
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
-        pin_memory=True,
+        pin_memory=(device.type == "cuda"),
     )
 
     # Optimizers: adapter+decoder share one, disc head separate
@@ -351,30 +428,34 @@ def train_stage1(
         weight_decay=config.weight_decay,
     )
     opt_disc = torch.optim.AdamW(
-        disc.head.parameters(),
+        _unwrap(disc).head.parameters(),
         lr=config.lr_disc,
         betas=config.betas,
         weight_decay=config.weight_decay,
     )
 
-    start_epoch = 0
-    if resume_from and os.path.isfile(resume_from):
-        start_epoch = load_checkpoint(
-            resume_from, adapter, decoder, disc, opt_gen, opt_disc
-        )
+    # If we loaded a checkpoint, reload optimizer states into the new optimizers
+    if resume_from and os.path.isfile(resume_from) and start_epoch > 0:
+        opt_gen.load_state_dict(_opt_gen.state_dict())
+        opt_disc.load_state_dict(_opt_disc.state_dict())
 
-    log.info(
-        "Stage 1 training: epochs %d-%d, %d train / %d valid samples",
-        start_epoch, config.num_epochs - 1, len(train_ds), len(valid_ds),
-    )
-    log.info(
-        "Phase schedule: disc @ epoch %d, GAN @ epoch %d",
-        config.epoch_start_disc, config.epoch_start_gan,
-    )
+    if is_main:
+        log.info(
+            "Stage 1 training: epochs %d-%d, %d train / %d valid samples",
+            start_epoch, config.num_epochs - 1, len(train_ds), len(valid_ds),
+        )
+        log.info(
+            "Phase schedule: disc @ epoch %d, GAN @ epoch %d",
+            config.epoch_start_disc, config.epoch_start_gan,
+        )
 
     best_val_rec = float("inf")
 
     for epoch in range(start_epoch, config.num_epochs):
+        # DistributedSampler must know the epoch for proper shuffling
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
         # Phase label for logging
         if epoch < config.epoch_start_disc:
             phase = "phase1_rec"
@@ -389,7 +470,8 @@ def train_stage1(
         epoch_losses: dict[str, float] = {}
         n_steps = 0
 
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch} [{phase}]", leave=True):
+        loader_iter = tqdm(train_loader, desc=f"Epoch {epoch} [{phase}]", leave=True) if is_main else train_loader
+        for batch in loader_iter:
             batch = {k: v.to(device) for k, v in batch.items()}
 
             step_losses = train_step(
@@ -404,27 +486,30 @@ def train_stage1(
         # Average epoch losses
         avg = {k: v / max(n_steps, 1) for k, v in epoch_losses.items()}
 
-        # Validation
-        val = validate(valid_loader, encoder, adapter, decoder, lpips_net)
+        # Validation + logging + checkpointing only on rank 0
+        if is_main:
+            val = validate(valid_loader, encoder, adapter, decoder, lpips_net)
 
-        # Log
-        train_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(avg.items()))
-        val_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(val.items()))
-        log.info("Epoch %d [%s]  %s  ||  %s", epoch, phase, train_str, val_str)
+            train_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(avg.items()))
+            val_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(val.items()))
+            log.info("Epoch %d [%s]  %s  ||  %s", epoch, phase, train_str, val_str)
 
-        # Save best
-        if val["val_rec"] < best_val_rec:
-            best_val_rec = val["val_rec"]
-            save_checkpoint(
-                os.path.join(config.save_dir, "best.pt"),
-                epoch, adapter, decoder, disc, opt_gen, opt_disc, val,
-            )
+            if val["val_rec"] < best_val_rec:
+                best_val_rec = val["val_rec"]
+                save_checkpoint(
+                    os.path.join(config.save_dir, "best.pt"),
+                    epoch, adapter, decoder, disc, opt_gen, opt_disc, val,
+                )
 
-        # Periodic checkpoint
-        if (epoch + 1) % config.save_every == 0:
-            save_checkpoint(
-                os.path.join(config.save_dir, f"epoch_{epoch:03d}.pt"),
-                epoch, adapter, decoder, disc, opt_gen, opt_disc, val,
-            )
+            if (epoch + 1) % config.save_every == 0:
+                save_checkpoint(
+                    os.path.join(config.save_dir, f"epoch_{epoch:03d}.pt"),
+                    epoch, adapter, decoder, disc, opt_gen, opt_disc, val,
+                )
 
-    log.info("Training complete. Best val_rec=%.4f", best_val_rec)
+        # Sync all ranks before next epoch
+        if distributed:
+            torch.distributed.barrier()
+
+    if is_main:
+        log.info("Training complete. Best val_rec=%.4f", best_val_rec)
