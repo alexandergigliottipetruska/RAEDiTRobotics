@@ -34,6 +34,8 @@ class ViTDecoder(nn.Module):
         # Final linear layer to project from hidden_dim back to pixel space (16*16*3 = 768)
         self.pixels_per_patch = (patch_size ** 2) * self.out_channels
         self.head = nn.Linear(hidden_dim, self.pixels_per_patch)
+        self.last_layer_weight = self.head.weight
+
 
     def unpatchify(self, x):
         """
@@ -62,17 +64,12 @@ class ViTDecoder(nn.Module):
     def forward(self, z_tilde):
         """
         Args:
-            z_tilde: Noised adapted tokens of shape (B, K, 196, 512)
+            z_tilde: Adapted tokens of shape (B, 196, 512)
         Returns:
-            I_hat: Reconstructed images of shape (B, K, 3, 224, 224)
+            I_hat: Reconstructed images of shape (B, 3, 224, 224) in [0, 1]
         """
-        B, K, N, D = z_tilde.shape
-        
-        # Collapse B and K for a single forward pass through the transformer
-        x = z_tilde.view(B * K, N, D)
-        
         # Add positional embeddings
-        x = x + self.pos_embed
+        x = z_tilde + self.pos_embed
         
         # Apply transformer blocks
         x = self.transformer(x)
@@ -81,10 +78,10 @@ class ViTDecoder(nn.Module):
         x = self.head(x)
         
         # Reshape to image dimensions
-        img_flat = self.unpatchify(x)
+        I_hat = self.unpatchify(x)
         
-        # Separate B and K back out to match the input format
-        I_hat = img_flat.view(B, K, self.out_channels, self.grid_size * self.patch_size, self.grid_size * self.patch_size)
+        # Clamp to [0, 1] for reconstruction targets
+        I_hat = torch.sigmoid(I_hat)
         
         return I_hat
 
@@ -95,13 +92,19 @@ if __name__ == '__main__':
     decoder = ViTDecoder().to(device)
     
     # use dummy input for testing
-    B, K, N, D = 2, 4, 196, 512
-    dummy_z_tilde = torch.randn(B, K, N, D).to(device)
+    B, N, D = 2, 196, 512
+    dummy_z_tilde = torch.randn(B, N, D).to(device)
     
     I_hat = decoder(dummy_z_tilde)
     
     # test output shape
-    expected_shape = (B, K, 3, 224, 224)
+    expected_shape = (B, 3, 224, 224)
     assert I_hat.shape == expected_shape, f"Error: Expected {expected_shape}, got {I_hat.shape}"
+    
+    # test output is in [0, 1]
+    assert I_hat.min() >= 0.0 and I_hat.max() <= 1.0, "Error: Output not in [0, 1]!"
+    
+    # test last_layer_weight exists
+    assert hasattr(decoder, 'last_layer_weight'), "Error: Missing last_layer_weight!"
 
     print("\n All Decoder Tests Passed successfully!")
