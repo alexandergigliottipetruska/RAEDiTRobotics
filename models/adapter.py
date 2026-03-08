@@ -79,4 +79,4 @@ if __name__ == '__main__':
     # test no noise was added
     assert torch.allclose(z_bar, z_tilde_eval), "Error: Noise was added even when training=False!"
 
-    print("\n✅ All Adapter Tests Passed successfully!")
+    print("\n All Adapter Tests Passed successfully!")
