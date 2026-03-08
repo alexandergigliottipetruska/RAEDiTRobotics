@@ -94,9 +94,9 @@ class RLBenchWrapper(BaseManipulationEnv):
     ):
         from rlbench.environment import Environment
         from rlbench.action_modes.action_mode import MoveArmThenGripper
+        from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaPlanning
         from rlbench.action_modes.gripper_action_modes import Discrete
         from rlbench.observation_config import ObservationConfig
-        from data_pipeline.envs.rlbench_action_mode import EndEffectorPoseViaPlanning2
 
         self._task_name = task_name
         self._image_size = image_size
@@ -112,10 +112,10 @@ class RLBenchWrapper(BaseManipulationEnv):
         obs_config.set_all_low_dim(True)
         obs_config.set_all_high_dim(cameras)
 
-        # OMPL motion planning — matches RVT-2 and CoA eval approach.
-        # Plans collision-free path to target pose, executes step-by-step.
+        # Stock OMPL motion planning — matches replay_rlbench.py and RVT-2.
+        # EndEffectorPoseViaPlanning defaults: absolute_mode=True, ignore_collisions=True
         action_mode = MoveArmThenGripper(
-            arm_action_mode=EndEffectorPoseViaPlanning2(),
+            arm_action_mode=EndEffectorPoseViaPlanning(),
             gripper_action_mode=Discrete(),
         )
 
