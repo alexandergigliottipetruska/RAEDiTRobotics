@@ -3,8 +3,6 @@
 Reconstructs images from adapted tokens. ViT architecture with
 learned positional embeddings, patch-to-pixel reshape head.
 Default: 8 layers, 8 heads, d'=512.
-
-Owner: Other team member
 """
 
 raise NotImplementedError("A.3: decoder.py — to be implemented")

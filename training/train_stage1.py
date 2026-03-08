@@ -1,21 +1,19 @@
 """Phased RAE training loop (Phase A.6).
 
 Implements the three-phase training schedule from Zheng et al. 2025:
-  Phase 1 (epochs 0–E_d): L1 + LPIPS only
-  Phase 2 (epochs E_d–E_g): + discriminator training
-  Phase 3 (epochs E_g–end): + GAN loss for decoder
+  Phase 1 (epochs 0-E_d): L1 + LPIPS only
+  Phase 2 (epochs E_d-E_g): + discriminator training
+  Phase 3 (epochs E_g-end): + GAN loss for decoder
 
 Separate optimizers for decoder/adapter vs discriminator head.
 Hyperparameters from Zheng et al. Table 12.
 
-Expected component interfaces (filled in by A.1–A.3):
+Expected component interfaces (filled in by A.1-A.3):
   encoder(x)  ->  tokens       x: (B, 3, 224, 224) -> (B, N, d)
   adapter(z)  ->  adapted      z: (B, N, d) -> (B, N, d')
   adapter.noise_augment(z)     z: (B, N, d') -> (B, N, d')  [training only]
   decoder(z)  ->  images       z: (B, N, d') -> (B, 3, 224, 224) in [0, 1]
   decoder.last_layer_weight    nn.Parameter for adaptive lambda
-
-Owner: Swagman (scaffold), other team member (integration with A.1–A.3)
 """
 
 import logging
@@ -365,7 +363,7 @@ def train_stage1(
         )
 
     log.info(
-        "Stage 1 training: epochs %d–%d, %d train / %d valid samples",
+        "Stage 1 training: epochs %d-%d, %d train / %d valid samples",
         start_epoch, config.num_epochs - 1, len(train_ds), len(valid_ds),
     )
     log.info(

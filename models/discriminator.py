@@ -10,8 +10,6 @@ Architecture (from Zheng et al. 2025, Appendix C.2):
 
 Mock mode (pretrained=False): uses a lightweight frozen feature
 extractor for local CPU testing without downloading weights.
-
-Owner: Swagman
 """
 
 import torch

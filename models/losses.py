@@ -11,9 +11,7 @@ Loss components (Zheng et al. 2025, Appendix C.2, Table 12):
              = ‖∇_w L_rec‖ / (‖∇_w L_GAN‖ + ε), clamped [0, 1e4]
              computed w.r.t. decoder's last layer weight
 
-Constants: ω_L = 1.0, ω_G = 0.75
-
-Owner: Swagman
+Constants: ω_L = 1.0, ω_G = 0.75 (Zheng et al. 2025, Appendix C.2, Table 12).
 """
 
 import torch
