@@ -20,9 +20,11 @@ Expected component interfaces (filled in by A.1-A.3):
   decoder.last_layer_weight    nn.Parameter for adaptive lambda
 """
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import torch
 import torch.nn as nn
@@ -450,17 +452,91 @@ def train_stage1(
         opt_gen.load_state_dict(_opt_gen.state_dict())
         opt_disc.load_state_dict(_opt_disc.state_dict())
 
+    # --- Logging & metrics (rank 0 only) ---
+    metrics_path = None
     if is_main:
+        os.makedirs(config.save_dir, exist_ok=True)
+
+        # Timestamped log file
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = os.path.join(config.save_dir, f"train_{ts}.log")
+        fh = logging.FileHandler(log_file)
+        fh.setLevel(logging.INFO)
+        fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
+        log.addHandler(fh)
+
+        # Metrics JSONL (append-friendly, one line per epoch)
+        metrics_path = os.path.join(config.save_dir, f"metrics_{ts}.jsonl")
+
+        # Write run header as first line
+        run_info = {
+            "type": "run_info",
+            "timestamp": ts,
+            "gpu": torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu",
+            "vram_gb": round(torch.cuda.get_device_properties(device).total_mem / 1e9, 1) if torch.cuda.is_available() else 0,
+            "use_amp": use_amp,
+            "distributed": distributed,
+            "world_size": _world_size(),
+            "resume_from": resume_from,
+            "start_epoch": start_epoch,
+            "config": {
+                "hdf5_path": config.hdf5_path,
+                "batch_size": config.batch_size,
+                "num_workers": config.num_workers,
+                "num_epochs": config.num_epochs,
+                "epoch_start_disc": config.epoch_start_disc,
+                "epoch_start_gan": config.epoch_start_gan,
+                "omega_L": config.omega_L,
+                "omega_G": config.omega_G,
+                "lr_gen": config.lr_gen,
+                "lr_disc": config.lr_disc,
+                "betas": list(config.betas),
+                "weight_decay": config.weight_decay,
+                "disc_pretrained": config.disc_pretrained,
+            },
+        }
+        with open(metrics_path, "a") as mf:
+            mf.write(json.dumps(run_info) + "\n")
+
+        # Log run info
+        log.info("=" * 60)
+        log.info("Stage 1 RAE Training Run")
+        log.info("=" * 60)
+
+        # Hardware
+        if torch.cuda.is_available():
+            gpu_name = torch.cuda.get_device_name(device)
+            vram_gb = torch.cuda.get_device_properties(device).total_mem / 1e9
+            log.info("GPU: %s (%.1f GB VRAM)", gpu_name, vram_gb)
+        else:
+            log.info("Device: CPU")
+        if use_amp:
+            log.info("BF16 mixed precision enabled")
+        if distributed:
+            log.info("DDP: %d GPUs across %d nodes", _world_size(), _world_size())
+
+        # Config
+        log.info("Config: batch_size=%d, num_workers=%d, lr_gen=%.1e, lr_disc=%.1e",
+                 config.batch_size, config.num_workers, config.lr_gen, config.lr_disc)
+        log.info("Config: omega_L=%.2f, omega_G=%.2f, weight_decay=%.4f, betas=%s",
+                 config.omega_L, config.omega_G, config.weight_decay, config.betas)
+        log.info("Config: disc_pretrained=%s", config.disc_pretrained)
+
+        # Data & schedule
         log.info(
-            "Stage 1 training: epochs %d-%d, %d train / %d valid samples",
+            "Data: epochs %d-%d, %d train / %d valid samples",
             start_epoch, config.num_epochs - 1, len(train_ds), len(valid_ds),
         )
         log.info(
             "Phase schedule: disc @ epoch %d, GAN @ epoch %d",
             config.epoch_start_disc, config.epoch_start_gan,
         )
-        if use_amp:
-            log.info("BF16 mixed precision enabled")
+        if resume_from:
+            log.info("Resumed from: %s (epoch %d)", resume_from, start_epoch)
+
+        log.info("Log file: %s", log_file)
+        log.info("Metrics file: %s", metrics_path)
+        log.info("=" * 60)
 
     best_val_rec = float("inf")
 
@@ -507,6 +583,14 @@ def train_stage1(
             val_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(val.items()))
             log.info("Epoch %d [%s]  %s  ||  %s", epoch, phase, train_str, val_str)
 
+            # Append metrics for plotting
+            if metrics_path:
+                with open(metrics_path, "a") as mf:
+                    mf.write(json.dumps({
+                        "epoch": epoch, "phase": phase,
+                        "train": avg, "val": val,
+                    }) + "\n")
+
             if val["val_rec"] < best_val_rec:
                 best_val_rec = val["val_rec"]
                 save_checkpoint(
@@ -526,3 +610,5 @@ def train_stage1(
 
     if is_main:
         log.info("Training complete. Best val_rec=%.4f", best_val_rec)
+        log.removeHandler(fh)
+        fh.close()
