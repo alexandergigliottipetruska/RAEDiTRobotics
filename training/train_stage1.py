@@ -83,8 +83,9 @@ class Stage1Config:
 
     Defaults from Zheng et al. 2025 Table 12, scaled for robotics.
     """
-    # Data
-    hdf5_path: str = ""
+    # Data — accepts single path (str) or list of paths for multi-task
+    hdf5_path: str = ""         # single file (backward compat)
+    hdf5_paths: list = field(default_factory=list)  # multi-file
     batch_size: int = 32
     num_workers: int = 4
 
@@ -326,7 +327,7 @@ def load_checkpoint(
     opt_disc: torch.optim.Optimizer,
 ) -> int:
     """Load checkpoint. Returns the epoch to resume from (saved_epoch + 1)."""
-    ckpt = torch.load(path, weights_only=False)
+    ckpt = torch.load(path, weights_only=False, map_location="cpu")
     adapter.load_state_dict(ckpt["adapter"])
     decoder.load_state_dict(ckpt["decoder"])
     disc.head.load_state_dict(ckpt["disc_head"])
@@ -408,9 +409,10 @@ def train_stage1(
         if is_main:
             log.info("DDP enabled: %d GPUs across %d nodes", _world_size(), _world_size())
 
-    # Dataloaders
-    train_ds = Stage1Dataset(config.hdf5_path, split="train")
-    valid_ds = Stage1Dataset(config.hdf5_path, split="valid")
+    # Dataloaders — resolve hdf5_paths (multi-file) vs hdf5_path (single)
+    paths = config.hdf5_paths if config.hdf5_paths else [config.hdf5_path]
+    train_ds = Stage1Dataset(paths, split="train")
+    valid_ds = Stage1Dataset(paths, split="valid")
 
     # DistributedSampler splits data across ranks; shuffle is handled by sampler
     train_sampler = DistributedSampler(train_ds, shuffle=True) if distributed else None
@@ -473,14 +475,14 @@ def train_stage1(
             "type": "run_info",
             "timestamp": ts,
             "gpu": torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu",
-            "vram_gb": round(torch.cuda.get_device_properties(device).total_mem / 1e9, 1) if torch.cuda.is_available() else 0,
+            "vram_gb": round(torch.cuda.get_device_properties(device).total_memory / 1e9, 1) if torch.cuda.is_available() else 0,
             "use_amp": use_amp,
             "distributed": distributed,
             "world_size": _world_size(),
             "resume_from": resume_from,
             "start_epoch": start_epoch,
             "config": {
-                "hdf5_path": config.hdf5_path,
+                "hdf5_paths": paths,
                 "batch_size": config.batch_size,
                 "num_workers": config.num_workers,
                 "num_epochs": config.num_epochs,
@@ -506,7 +508,7 @@ def train_stage1(
         # Hardware
         if torch.cuda.is_available():
             gpu_name = torch.cuda.get_device_name(device)
-            vram_gb = torch.cuda.get_device_properties(device).total_mem / 1e9
+            vram_gb = torch.cuda.get_device_properties(device).total_memory / 1e9
             log.info("GPU: %s (%.1f GB VRAM)", gpu_name, vram_gb)
         else:
             log.info("Device: CPU")

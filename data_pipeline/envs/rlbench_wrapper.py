@@ -48,6 +48,8 @@ TASK_CLASS_MAP = {
     "turn_tap": "TurnTap",
     "push_buttons": "PushButtons",
     "reach_and_drag": "ReachAndDrag",
+    "place_wine_at_rack_location": "PlaceWineAtRackLocation",
+    "sweep_to_dustpan_of_size": "SweepToDustpanOfSize",
 }
 
 

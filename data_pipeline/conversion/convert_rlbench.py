@@ -37,7 +37,14 @@ Episode layout (HQfang/rlbench-18-tasks):
 Prerequisite:
   pip install rlbench  (needed to unpickle Observation objects)
 
-Usage:
+Usage (official PerAct splits — recommended):
+  python data_pipeline/conversion/convert_rlbench.py \\
+      --task close_jar \\
+      --input     data/raw/rlbench/data/train/close_jar \\
+      --val-input data/raw/rlbench/data/valid/close_jar \\
+      --output    data/unified/rlbench/close_jar.hdf5
+
+Usage (legacy auto-split):
   python data_pipeline/conversion/convert_rlbench.py \\
       --task close_jar \\
       --input  data/raw/rlbench/data/train/close_jar \\
@@ -242,38 +249,62 @@ def convert_episode(
 # Task conversion
 # ---------------------------------------------------------------------------
 
-def convert_task(task_dir: str, output_path: str, train_frac: float = 0.9) -> None:
+def _collect_episodes(task_root: Path) -> list[Path]:
+    """Find all episode directories under task_root/all_variations/episodes/."""
+    ep_parent = task_root / "all_variations" / "episodes"
+    if not ep_parent.exists():
+        raise FileNotFoundError(f"Expected episodes at {ep_parent}")
+    return sorted(
+        [d for d in ep_parent.iterdir()
+         if d.is_dir() and (d / "low_dim_obs.pkl").exists()],
+        key=lambda d: int(d.name.replace("episode", "")),
+    )
+
+
+def convert_task(
+    task_dir: str,
+    output_path: str,
+    train_frac: float = 0.9,
+    val_dir: str | None = None,
+) -> None:
     """Convert all episodes for one task.
 
-    Iterates over <task>/all_variations/episodes/episode<N> directories.
-    Splits demos into train/valid by train_frac (ordered, not shuffled).
+    If val_dir is provided, train episodes come from task_dir and valid
+    episodes come from val_dir (official PerAct splits). train_frac is
+    ignored in this case.
+
+    If val_dir is None, all episodes are loaded from task_dir and split
+    by train_frac (legacy behavior).
 
     Args:
         task_dir:    Path to e.g. data/raw/rlbench/data/train/close_jar/
         output_path: Path for output unified HDF5.
-        train_frac:  Fraction of episodes for training (default 0.9).
+        train_frac:  Fraction for training (ignored when val_dir is set).
+        val_dir:     Path to e.g. data/raw/rlbench/data/valid/close_jar/
     """
     task_root   = Path(task_dir)
     task_name   = task_root.name
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Episodes are flat under all_variations/episodes/
-    ep_parent = task_root / "all_variations" / "episodes"
-    if not ep_parent.exists():
-        raise FileNotFoundError(f"Expected episodes at {ep_parent}")
-
-    ep_dirs = sorted(
-        [d for d in ep_parent.iterdir()
-         if d.is_dir() and (d / "low_dim_obs.pkl").exists()],
-        key=lambda d: int(d.name.replace("episode", "")),
-    )
-
-    n_total = len(ep_dirs)
-    n_train = max(1, int(n_total * train_frac))
-    print(f"Task: {task_name}")
-    print(f"Total episodes found: {n_total}")
-    print(f"Train: {n_train} | Valid: {n_total - n_train}")
+    if val_dir is not None:
+        # Official split mode: separate train and valid folders
+        val_root = Path(val_dir)
+        train_ep_dirs = _collect_episodes(task_root)
+        val_ep_dirs   = _collect_episodes(val_root)
+        print(f"Task: {task_name} (official split)")
+        print(f"Train episodes: {len(train_ep_dirs)} (from {task_root})")
+        print(f"Valid episodes: {len(val_ep_dirs)} (from {val_root})")
+    else:
+        # Legacy mode: single folder, split by fraction
+        all_ep_dirs = _collect_episodes(task_root)
+        n_total = len(all_ep_dirs)
+        n_train = max(1, int(n_total * train_frac))
+        train_ep_dirs = all_ep_dirs[:n_train]
+        val_ep_dirs   = all_ep_dirs[n_train:]
+        print(f"Task: {task_name} (auto-split {train_frac:.0%})")
+        print(f"Total episodes: {n_total}")
+        print(f"Train: {len(train_ep_dirs)} | Valid: {len(val_ep_dirs)}")
 
     with create_unified_hdf5(
         str(output_path),
@@ -284,18 +315,23 @@ def convert_task(task_dir: str, output_path: str, train_frac: float = 0.9) -> No
     ) as f:
         train_keys = []
         valid_keys = []
+        demo_idx = 0
 
-        for i, ep_dir in enumerate(ep_dirs):
-            demo_key = f"demo_{i}"
-            split    = "train" if i < n_train else "valid"
-            print(f"  [{split:5s}] {demo_key} <- {ep_dir.name}")
+        for ep_dir in train_ep_dirs:
+            demo_key = f"demo_{demo_idx}"
+            print(f"  [train] {demo_key} <- {ep_dir.name}")
             ok = convert_episode(ep_dir, f, demo_key)
-            if not ok:
-                continue
-            if split == "train":
+            if ok:
                 train_keys.append(demo_key)
-            else:
+            demo_idx += 1
+
+        for ep_dir in val_ep_dirs:
+            demo_key = f"demo_{demo_idx}"
+            print(f"  [valid] {demo_key} <- {ep_dir.name}")
+            ok = convert_episode(ep_dir, f, demo_key)
+            if ok:
                 valid_keys.append(demo_key)
+            demo_idx += 1
 
         write_mask(f, "train", train_keys)
         write_mask(f, "valid", valid_keys)
@@ -321,11 +357,17 @@ def main():
         "--task", required=True,
         choices=["close_jar", "open_drawer", "slide_block_to_color_target",
                  "put_item_in_drawer", "stack_cups", "place_shape_in_shape_sorter",
-                 "meat_off_grill", "turn_tap", "push_buttons", "reach_and_drag"],
+                 "meat_off_grill", "turn_tap", "push_buttons", "reach_and_drag",
+                 "place_wine_at_rack_location", "sweep_to_dustpan_of_size"],
     )
     parser.add_argument(
         "--input", required=True,
-        help="Path to task dir (e.g. data/raw/rlbench/data/train/close_jar).",
+        help="Path to train task dir (e.g. data/raw/rlbench/data/train/close_jar).",
+    )
+    parser.add_argument(
+        "--val-input", default=None,
+        help="Path to valid task dir (e.g. data/raw/rlbench/data/valid/close_jar). "
+             "When provided, uses official PerAct splits instead of --train-frac.",
     )
     parser.add_argument(
         "--output", required=True,
@@ -333,10 +375,12 @@ def main():
     )
     parser.add_argument(
         "--train-frac", type=float, default=0.9,
-        help="Fraction of episodes for training split (default: 0.9).",
+        help="Fraction of episodes for training split (default: 0.9). "
+             "Ignored when --val-input is provided.",
     )
     args = parser.parse_args()
-    convert_task(args.input, args.output, train_frac=args.train_frac)
+    convert_task(args.input, args.output, train_frac=args.train_frac,
+                 val_dir=args.val_input)
 
 
 if __name__ == "__main__":

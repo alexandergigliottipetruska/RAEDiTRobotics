@@ -1,21 +1,24 @@
 """CLI entry point for Stage 1 RAE training.
 
 Usage:
-  # Single GPU
+  # Single task
   python training/train_stage1_script.py --hdf5 /path/to/ph.hdf5
 
+  # Multi-task (multiple HDF5 files)
+  python training/train_stage1_script.py --hdf5 /path/to/lift.hdf5 /path/to/can.hdf5 /path/to/close_jar.hdf5
+
   # Multi-GPU on one machine (e.g., 2 GPUs)
-  torchrun --nproc_per_node=2 training/train_stage1_script.py --hdf5 /path/to/ph.hdf5
+  torchrun --nproc_per_node=2 training/train_stage1_script.py --hdf5 /path/to/lift.hdf5 /path/to/can.hdf5
 
   # Multi-node (e.g., 2 machines, 1 GPU each)
   # On node 0 (master):
   torchrun --nproc_per_node=1 --nnodes=2 --node_rank=0 \\
     --master_addr=dh2020pc13.utm.utoronto.ca --master_port=29500 \\
-    training/train_stage1_script.py --hdf5 /path/to/ph.hdf5
+    training/train_stage1_script.py --hdf5 /path/to/lift.hdf5
   # On node 1:
   torchrun --nproc_per_node=1 --nnodes=2 --node_rank=1 \\
     --master_addr=dh2020pc13.utm.utoronto.ca --master_port=29500 \\
-    training/train_stage1_script.py --hdf5 /path/to/ph.hdf5
+    training/train_stage1_script.py --hdf5 /path/to/lift.hdf5
 """
 
 import argparse
@@ -37,7 +40,8 @@ from training.train_stage1 import Stage1Config, train_stage1
 
 def main():
     parser = argparse.ArgumentParser(description="Stage 1 RAE Training")
-    parser.add_argument("--hdf5", required=True, help="Path to unified HDF5 file")
+    parser.add_argument("--hdf5", required=True, nargs="+",
+                        help="Path(s) to unified HDF5 file(s). Multiple paths for multi-task training.")
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--num_epochs", type=int, default=50)
@@ -66,7 +70,7 @@ def main():
     )
 
     config = Stage1Config(
-        hdf5_path=args.hdf5,
+        hdf5_paths=args.hdf5,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         num_epochs=args.num_epochs,

@@ -6,6 +6,10 @@ images (reconstruction target for L1 + LPIPS losses).
 
 No actions or proprio — Stage 1 is pure image reconstruction.
 
+Supports single or multiple HDF5 files for combined multi-task training.
+When multiple files are provided, samples from all files are merged into
+one flat index and shuffled by the DataLoader.
+
 Output per sample (dict):
   images_enc:    (K, 3, H, W)  float32, ImageNet-normalized
   images_target: (K, 3, H, W)  float32, [0, 1] range
@@ -35,34 +39,47 @@ class Stage1Dataset(Dataset):
     ImageNet-normalized images (for the frozen encoder) and raw [0,1]
     images (for reconstruction loss computation).
 
+    Accepts a single HDF5 path (backward-compatible) or a list of paths
+    for combined multi-task training.
+
     Args:
-        hdf5_path: Path to unified HDF5 file.
-        split:     "train" or "valid".
+        hdf5_paths: Path or list of paths to unified HDF5 files.
+        split:      "train" or "valid".
     """
 
-    def __init__(self, hdf5_path: str, split: str = "train"):
-        self.hdf5_path = hdf5_path
+    def __init__(self, hdf5_paths: "str | list[str]", split: str = "train"):
+        if isinstance(hdf5_paths, str):
+            hdf5_paths = [hdf5_paths]
+        self._hdf5_paths = list(hdf5_paths)
 
-        with h5py.File(hdf5_path, "r") as f:
-            demo_keys = read_mask(f, split)
+        # Build flat index: one entry per (file_idx, demo_key, timestep)
+        self._index = []
+        self._view_present_per_file = []
 
-            # Build flat index: one entry per (demo_key, timestep)
-            self._index = []
-            for key in demo_keys:
-                T = f[f"data/{key}/images"].shape[0]
-                for t in range(T):
-                    self._index.append((key, t))
+        for file_idx, path in enumerate(self._hdf5_paths):
+            with h5py.File(path, "r") as f:
+                demo_keys = read_mask(f, split)
 
-            # Cache view_present (constant across all demos in a benchmark)
-            self._view_present = f[f"data/{demo_keys[0]}/view_present"][:]
+                for key in demo_keys:
+                    T = f[f"data/{key}/images"].shape[0]
+                    for t in range(T):
+                        self._index.append((file_idx, key, t))
+
+                # Cache view_present per file (differs by benchmark)
+                self._view_present_per_file.append(
+                    f[f"data/{demo_keys[0]}/view_present"][:]
+                )
+
+        # Backward compat: expose single path for existing code
+        self.hdf5_path = self._hdf5_paths[0] if len(self._hdf5_paths) == 1 else None
 
     def __len__(self) -> int:
         return len(self._index)
 
     def __getitem__(self, idx: int) -> dict:
-        demo_key, t = self._index[idx]
+        file_idx, demo_key, t = self._index[idx]
 
-        with h5py.File(self.hdf5_path, "r") as f:
+        with h5py.File(self._hdf5_paths[file_idx], "r") as f:
             imgs_hwc = f[f"data/{demo_key}/images"][t]  # (K, H, W, 3)
 
         # Convert to float32 [0, 1]
@@ -81,5 +98,7 @@ class Stage1Dataset(Dataset):
         return {
             "images_enc":    torch.from_numpy(images_enc),
             "images_target": torch.from_numpy(images_target),
-            "view_present":  torch.from_numpy(self._view_present),
+            "view_present":  torch.from_numpy(
+                self._view_present_per_file[file_idx]
+            ),
         }

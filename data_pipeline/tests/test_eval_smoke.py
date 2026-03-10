@@ -304,6 +304,45 @@ class TestGTReplayRLBench:
         assert rate >= 0.4, \
             f"Expected >=40% success, got {successes}/{total} ({rate*100:.1f}%)"
 
+    def test_gt_replay_meat_off_grill(self):
+        successes, total = self._run_gt_replay("meat_off_grill", n_demos=20)
+        rate = successes / total
+        print(f"meat_off_grill: {successes}/{total} ({rate*100:.0f}%)")
+        assert rate >= 0.2, \
+            f"Expected >=20% success, got {successes}/{total} ({rate*100:.1f}%)"
+
+    def test_gt_replay_turn_tap(self):
+        successes, total = self._run_gt_replay("turn_tap", n_demos=20)
+        rate = successes / total
+        print(f"turn_tap: {successes}/{total} ({rate*100:.0f}%)")
+        assert rate >= 0.3, \
+            f"Expected >=30% success, got {successes}/{total} ({rate*100:.1f}%)"
+
+    def test_gt_replay_push_buttons(self):
+        successes, total = self._run_gt_replay("push_buttons", n_demos=20)
+        rate = successes / total
+        print(f"push_buttons: {successes}/{total} ({rate*100:.0f}%)")
+        assert rate >= 0.3, \
+            f"Expected >=30% success, got {successes}/{total} ({rate*100:.1f}%)"
+
+    def test_gt_replay_place_wine(self):
+        successes, total = self._run_gt_replay(
+            "place_wine_at_rack_location", n_demos=20,
+        )
+        rate = successes / total
+        print(f"place_wine_at_rack_location: {successes}/{total} ({rate*100:.0f}%)")
+        assert rate >= 0.3, \
+            f"Expected >=30% success, got {successes}/{total} ({rate*100:.1f}%)"
+
+    def test_gt_replay_sweep_to_dustpan(self):
+        successes, total = self._run_gt_replay(
+            "sweep_to_dustpan_of_size", n_demos=20,
+        )
+        rate = successes / total
+        print(f"sweep_to_dustpan_of_size: {successes}/{total} ({rate*100:.0f}%)")
+        assert rate >= 0.3, \
+            f"Expected >=30% success, got {successes}/{total} ({rate*100:.1f}%)"
+
 
 @pytest.mark.rlbench
 class TestRandomPolicyRLBench:
