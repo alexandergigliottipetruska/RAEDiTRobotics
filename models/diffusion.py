@@ -32,7 +32,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
-from data4robotics.agent import BaseAgent
+try:
+    from data4robotics.agent import BaseAgent
+except ImportError:
+    BaseAgent = nn.Module  # fallback when data4robotics not installed
 
 
 def _get_activation_fn(activation):
@@ -61,18 +64,18 @@ class _PositionalEncoding(nn.Module):
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0).transpose(0, 1)
+        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
         self.register_buffer("pe", pe)
 
     def forward(self, x):
         """
         Args:
-            x: Tensor of shape (seq_len, batch_size, d_model)
+            x: Tensor of shape (batch_size, seq_len, d_model)
         Returns:
-            Positional encodings of shape (seq_len, batch_size, d_model)
+            Positional encodings of shape (batch_size, seq_len, d_model)
         """
-        pe = self.pe[: x.shape[0]]
-        pe = pe.repeat((1, x.shape[1], 1))
+        pe = self.pe[:, : x.shape[1]]
+        pe = pe.repeat((x.shape[0], 1, 1))
         return pe.detach().clone()
 
 
@@ -102,7 +105,7 @@ class _SelfAttnEncoder(nn.Module):
         self, d_model, nhead=8, dim_feedforward=2048, dropout=0.1, activation="gelu"
     ):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
 
@@ -140,7 +143,7 @@ class _ShiftScaleMod(nn.Module):
 
     def forward(self, x, c):
         c = self.act(c)
-        return x * self.scale(c)[None] + self.shift(c)[None]
+        return x * self.scale(c).unsqueeze(1) + self.shift(c).unsqueeze(1)
 
     def reset_parameters(self):
         nn.init.xavier_uniform_(self.scale.weight)
@@ -157,7 +160,7 @@ class _ZeroScaleMod(nn.Module):
 
     def forward(self, x, c):
         c = self.act(c)
-        return x * self.scale(c)[None]
+        return x * self.scale(c).unsqueeze(1)
 
     def reset_parameters(self):
         nn.init.zeros_(self.scale.weight)
@@ -175,12 +178,12 @@ class _FinalLayer(nn.Module):
         self.reset_parameters()
 
     def forward(self, x, t, cond):
-        # cond: (seq_len, B, d) — mean-pool to (B, d) then add timestep
-        cond = torch.mean(cond, axis=0) + t
+        # cond: (B, seq_len, d) — mean-pool to (B, d) then add timestep
+        cond = torch.mean(cond, dim=1) + t
         shift, scale = self.adaLN_modulation(cond).chunk(2, dim=1)
-        x = x * scale[None] + shift[None]
+        x = x * scale.unsqueeze(1) + shift.unsqueeze(1)
         x = self.linear(x)
-        return x.transpose(0, 1)
+        return x
 
     def reset_parameters(self):
         for p in self.parameters():
@@ -231,8 +234,8 @@ class _DiTCrossAttnBlock(nn.Module):
         self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="gelu"
     ):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
 
@@ -308,8 +311,8 @@ class _LightningDiTBlock(nn.Module):
         self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="gelu"
     ):
         super().__init__()
-        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
 
@@ -337,9 +340,9 @@ class _LightningDiTBlock(nn.Module):
         shift1, scale1, gate1, shift2, scale2, gate2 = self.adaLN(t).chunk(6, dim=1)
 
         # 1. Self-attention with adaLN-Zero
-        x2 = self.norm1(x) * (1 + scale1[None]) + shift1[None]
+        x2 = self.norm1(x) * (1 + scale1.unsqueeze(1)) + shift1.unsqueeze(1)
         x2, _ = self.self_attn(x2, x2, x2, need_weights=False)
-        x = x + gate1[None] * self.drop_self(x2)
+        x = x + gate1.unsqueeze(1) * self.drop_self(x2)
 
         # 2. Cross-attention to obs/RAE conditioning tokens  [iRDT]
         x2 = self.norm_cross(x)
@@ -347,9 +350,9 @@ class _LightningDiTBlock(nn.Module):
         x = x + self.drop_cross(x2)
 
         # 3. MLP with adaLN-Zero
-        x2 = self.norm2(x) * (1 + scale2[None]) + shift2[None]
+        x2 = self.norm2(x) * (1 + scale2.unsqueeze(1)) + shift2.unsqueeze(1)
         x2 = self.linear2(self.drop_mlp(self.activation(self.linear1(x2))))
-        x = x + gate2[None] * x2
+        x = x + gate2.unsqueeze(1) * x2
         return x
 
     def reset_parameters(self):
@@ -411,7 +414,7 @@ class _DiTNoiseNet(nn.Module):
         self.enc_pos = _PositionalEncoding(hidden_dim)
         self.register_parameter(
             "dec_pos",
-            nn.Parameter(torch.empty(ac_chunk, 1, hidden_dim), requires_grad=True),
+            nn.Parameter(torch.empty(1, ac_chunk, hidden_dim), requires_grad=True),
         )
         nn.init.xavier_uniform_(self.dec_pos.data)
 
@@ -475,9 +478,8 @@ class _DiTNoiseNet(nn.Module):
         Returns a list of per-depth tensors for multi-scale conditioning  [iRDT].
         Pass the returned list (or any single tensor) as `enc_cache` to `forward_dec`.
         """
-        obs_enc = obs_enc.transpose(0, 1)
         pos = self.enc_pos(obs_enc)
-        return self.encoder(obs_enc, pos)   # list[depth] of (seq_len, B, hidden_dim)
+        return self.encoder(obs_enc, pos)   # list[depth] of (B, seq_len, hidden_dim)
 
     def _forward_dec_inner(self, noise_actions, time, enc_cache):
         """Run the decoder and return pre-output state (x, time_enc, final_cond).
@@ -489,7 +491,7 @@ class _DiTNoiseNet(nn.Module):
         """
         time_enc = self.time_net(time)
 
-        ac_tokens = self.ac_proj(noise_actions).transpose(0, 1) + self.dec_pos
+        ac_tokens = self.ac_proj(noise_actions) + self.dec_pos
         x = ac_tokens
 
         if isinstance(enc_cache, list):
@@ -591,7 +593,7 @@ class _DDTHead(nn.Module):
         # Learnable positional embeddings for action tokens
         self.register_parameter(
             "dec_pos",
-            nn.Parameter(torch.empty(ac_chunk, 1, head_dim), requires_grad=True),
+            nn.Parameter(torch.empty(1, ac_chunk, head_dim), requires_grad=True),
         )
         nn.init.xavier_uniform_(self.dec_pos.data)
 
@@ -629,15 +631,15 @@ class _DDTHead(nn.Module):
         Args:
             noise_actions: (B, ac_chunk, ac_dim)
             time:          (B,) integer timesteps
-            zt:            (ac_chunk, B, backbone_dim) — backbone intermediate tokens
+            zt:            (B, ac_chunk, backbone_dim) — backbone intermediate tokens
         Returns:
             (B, ac_chunk, ac_dim) predicted noise / velocity
         """
         time_enc = self.time_net(time)
 
         # Project xt and zt into head dimension
-        x = self.ac_proj(noise_actions).transpose(0, 1) + self.dec_pos  # (ac_chunk, B, head_dim)
-        cond = self.zt_proj(zt)                                          # (ac_chunk, B, head_dim)
+        x = self.ac_proj(noise_actions) + self.dec_pos  # (B, ac_chunk, head_dim)
+        cond = self.zt_proj(zt)                          # (B, ac_chunk, head_dim)
 
         for block in self.blocks:
             x = block(x, time_enc, cond)
