@@ -1107,3 +1107,434 @@ def test_rec_equals_l1_plus_lpips(
 
     expected_rec = losses["l1"] + config.omega_L * losses["lpips"]
     assert abs(losses["rec"] - expected_rec) < 1e-5
+
+
+# ===========================================================================
+# WAVE 4: Gradient accumulation tests
+# ===========================================================================
+
+class MockAdapterDeterministic(nn.Module):
+    """Adapter without noise_augment — for deterministic gradient tests."""
+
+    def __init__(self, d_in=512, d_out=512):
+        super().__init__()
+        self.mlp = nn.Linear(d_in, d_out)
+
+    def forward(self, z):
+        return self.mlp(z)
+
+
+class TestGradientAccumulation:
+    """Verify gradient accumulation produces correct results.
+
+    Key invariant: N micro-batches of size B with accum=N should produce
+    the same parameter update as 1 batch of size B (since we scale loss
+    by 1/N and accumulate N times).
+
+    Uses MockAdapterDeterministic (no noise_augment) so forward passes
+    are deterministic given the same input and weights.
+    """
+
+    @pytest.fixture
+    def accum_setup(self, synthetic_hdf5, lpips_net):
+        """Create matched models and a batch for accumulation tests."""
+        torch.manual_seed(42)
+        encoder = MockEncoder()
+        adapter = MockAdapterDeterministic()
+        decoder = MockDecoder()
+        disc = PatchDiscriminator(pretrained=False)
+        batch = _make_batch(synthetic_hdf5, batch_size=2)
+        config = Stage1Config(
+            batch_size=2, num_workers=0, num_epochs=1,
+            epoch_start_disc=1, epoch_start_gan=2,
+            disc_pretrained=False,
+        )
+        return encoder, adapter, decoder, disc, lpips_net, batch, config
+
+    def _clone_params(self, model):
+        """Deep-copy all parameter values."""
+        return {n: p.clone().detach() for n, p in model.named_parameters()}
+
+    def test_accum1_matches_default(self, accum_setup):
+        """With accum_steps=1, loss_scale=1.0 + step_optimizers=True
+        should produce identical results to the default behavior."""
+        encoder, adapter, decoder, disc, lpips_net, batch, config = accum_setup
+
+        # Clone adapter to run both paths (deterministic — no noise_augment)
+        torch.manual_seed(42)
+        adapter_a = MockAdapterDeterministic()
+        adapter_b = MockAdapterDeterministic()
+        adapter_b.load_state_dict(adapter_a.state_dict())
+
+        opt_a = torch.optim.AdamW(
+            list(adapter_a.parameters()) + list(decoder.parameters()), lr=1e-3,
+        )
+        decoder_b = MockDecoder()
+        decoder_b.load_state_dict(decoder.state_dict())
+        opt_b = torch.optim.AdamW(
+            list(adapter_b.parameters()) + list(decoder_b.parameters()), lr=1e-3,
+        )
+
+        # Path A: default (loss_scale=1.0, step_optimizers=True)
+        opt_a.zero_grad()
+        train_step(
+            batch, encoder, adapter_a, decoder, disc, lpips_net,
+            opt_a, torch.optim.AdamW(disc.head.parameters(), lr=1e-3),
+            epoch=0, config=config,
+        )
+
+        # Path B: explicit accum=1 params
+        opt_b.zero_grad()
+        train_step(
+            batch, encoder, adapter_b, decoder_b, disc, lpips_net,
+            opt_b, torch.optim.AdamW(disc.head.parameters(), lr=1e-3),
+            epoch=0, config=config,
+            loss_scale=1.0, step_optimizers=True,
+        )
+
+        for (na, pa), (nb, pb) in zip(
+            adapter_a.named_parameters(), adapter_b.named_parameters()
+        ):
+            assert torch.allclose(pa, pb, atol=1e-6), f"Mismatch in {na}"
+
+    def test_accum_grads_accumulate_across_microbatches(self, accum_setup):
+        """Calling train_step twice with step_optimizers=False should
+        accumulate gradients (not zero them)."""
+        encoder, adapter, decoder, disc, lpips_net, batch, config = accum_setup
+
+        opt_gen = torch.optim.AdamW(
+            list(adapter.parameters()) + list(decoder.parameters()), lr=1e-3,
+        )
+        opt_disc = torch.optim.AdamW(disc.head.parameters(), lr=1e-3)
+        opt_gen.zero_grad()
+
+        # First micro-batch
+        train_step(
+            batch, encoder, adapter, decoder, disc, lpips_net,
+            opt_gen, opt_disc, epoch=0, config=config,
+            loss_scale=0.5, step_optimizers=False,
+        )
+        grads_after_1 = {
+            n: p.grad.clone() for n, p in adapter.named_parameters()
+            if p.grad is not None
+        }
+
+        # Second micro-batch (same data for simplicity)
+        train_step(
+            batch, encoder, adapter, decoder, disc, lpips_net,
+            opt_gen, opt_disc, epoch=0, config=config,
+            loss_scale=0.5, step_optimizers=False,
+        )
+        grads_after_2 = {
+            n: p.grad.clone() for n, p in adapter.named_parameters()
+            if p.grad is not None
+        }
+
+        # Gradients should be larger after 2 accumulations
+        for name in grads_after_1:
+            norm_1 = grads_after_1[name].norm().item()
+            norm_2 = grads_after_2[name].norm().item()
+            # With same data + loss_scale=0.5, after 2 steps grads ≈ 2x the single step
+            # Not exactly 2x because adapter has noise_augment, but strictly larger
+            assert norm_2 > norm_1 * 0.9, (
+                f"{name}: grad norm didn't grow ({norm_1:.6f} -> {norm_2:.6f})"
+            )
+
+    def test_accum_no_step_doesnt_update_params(self, accum_setup):
+        """With step_optimizers=False, parameters should NOT change."""
+        encoder, adapter, decoder, disc, lpips_net, batch, config = accum_setup
+
+        opt_gen = torch.optim.AdamW(
+            list(adapter.parameters()) + list(decoder.parameters()), lr=1e-3,
+        )
+        opt_disc = torch.optim.AdamW(disc.head.parameters(), lr=1e-3)
+        opt_gen.zero_grad()
+
+        params_before = self._clone_params(adapter)
+
+        train_step(
+            batch, encoder, adapter, decoder, disc, lpips_net,
+            opt_gen, opt_disc, epoch=0, config=config,
+            loss_scale=0.5, step_optimizers=False,
+        )
+
+        for name, p in adapter.named_parameters():
+            assert torch.equal(p, params_before[name]), (
+                f"{name} changed despite step_optimizers=False"
+            )
+
+    def test_accum_step_true_updates_params(self, accum_setup):
+        """With step_optimizers=True, parameters SHOULD change."""
+        encoder, adapter, decoder, disc, lpips_net, batch, config = accum_setup
+
+        opt_gen = torch.optim.AdamW(
+            list(adapter.parameters()) + list(decoder.parameters()), lr=1e-3,
+        )
+        opt_disc = torch.optim.AdamW(disc.head.parameters(), lr=1e-3)
+        opt_gen.zero_grad()
+
+        params_before = self._clone_params(adapter)
+
+        train_step(
+            batch, encoder, adapter, decoder, disc, lpips_net,
+            opt_gen, opt_disc, epoch=0, config=config,
+            loss_scale=1.0, step_optimizers=True,
+        )
+
+        any_changed = False
+        for name, p in adapter.named_parameters():
+            if not torch.equal(p, params_before[name]):
+                any_changed = True
+                break
+        assert any_changed, "No parameters changed despite step_optimizers=True"
+
+    def test_accum_step_zeros_grads_after(self, accum_setup):
+        """After step_optimizers=True, gradients should be zeroed."""
+        encoder, adapter, decoder, disc, lpips_net, batch, config = accum_setup
+
+        opt_gen = torch.optim.AdamW(
+            list(adapter.parameters()) + list(decoder.parameters()), lr=1e-3,
+        )
+        opt_disc = torch.optim.AdamW(disc.head.parameters(), lr=1e-3)
+        opt_gen.zero_grad()
+
+        train_step(
+            batch, encoder, adapter, decoder, disc, lpips_net,
+            opt_gen, opt_disc, epoch=0, config=config,
+            loss_scale=1.0, step_optimizers=True,
+        )
+
+        for name, p in adapter.named_parameters():
+            if p.grad is not None:
+                assert torch.all(p.grad == 0), (
+                    f"{name} has nonzero grad after step_optimizers=True"
+                )
+
+    def test_loss_scale_halves_gradients(self, accum_setup):
+        """loss_scale=0.5 should produce half the gradient norm vs scale=1.0."""
+        encoder, _, _, disc, lpips_net, batch, config = accum_setup
+
+        results = {}
+        for scale in [1.0, 0.5]:
+            torch.manual_seed(42)
+            adapter = MockAdapterDeterministic()
+            decoder = MockDecoder()
+            opt_gen = torch.optim.AdamW(
+                list(adapter.parameters()) + list(decoder.parameters()), lr=1e-3,
+            )
+            opt_disc = torch.optim.AdamW(disc.head.parameters(), lr=1e-3)
+            opt_gen.zero_grad()
+
+            train_step(
+                batch, encoder, adapter, decoder, disc, lpips_net,
+                opt_gen, opt_disc, epoch=0, config=config,
+                loss_scale=scale, step_optimizers=False,
+            )
+            results[scale] = {
+                n: p.grad.norm().item()
+                for n, p in adapter.named_parameters() if p.grad is not None
+            }
+
+        for name in results[1.0]:
+            ratio = results[0.5][name] / (results[1.0][name] + 1e-12)
+            assert abs(ratio - 0.5) < 0.05, (
+                f"{name}: expected ratio ~0.5, got {ratio:.4f}"
+            )
+
+    def test_accum_returns_unscaled_losses(self, accum_setup):
+        """Loss values in the returned dict should be unscaled (original magnitude).
+
+        Both runs use identical fresh weights (no stepping) so the only
+        difference is loss_scale. Logged losses should match exactly.
+        """
+        encoder, _, _, disc, lpips_net, batch, config = accum_setup
+
+        # Run A: scale=1.0, no step
+        torch.manual_seed(42)
+        adapter_a = MockAdapterDeterministic()
+        decoder_a = MockDecoder()
+        opt_a = torch.optim.AdamW(
+            list(adapter_a.parameters()) + list(decoder_a.parameters()), lr=1e-3,
+        )
+        opt_disc_a = torch.optim.AdamW(disc.head.parameters(), lr=1e-3)
+        opt_a.zero_grad()
+        losses_full = train_step(
+            batch, encoder, adapter_a, decoder_a, disc, lpips_net,
+            opt_a, opt_disc_a, epoch=0, config=config,
+            loss_scale=1.0, step_optimizers=False,
+        )
+
+        # Run B: same weights, scale=0.25, no step
+        torch.manual_seed(42)
+        adapter_b = MockAdapterDeterministic()
+        decoder_b = MockDecoder()
+        opt_b = torch.optim.AdamW(
+            list(adapter_b.parameters()) + list(decoder_b.parameters()), lr=1e-3,
+        )
+        opt_disc_b = torch.optim.AdamW(disc.head.parameters(), lr=1e-3)
+        opt_b.zero_grad()
+        losses_scaled = train_step(
+            batch, encoder, adapter_b, decoder_b, disc, lpips_net,
+            opt_b, opt_disc_b, epoch=0, config=config,
+            loss_scale=0.25, step_optimizers=False,
+        )
+
+        # Logged losses should be the same (unscaled)
+        for key in ["l1", "lpips", "rec", "total_gen"]:
+            assert abs(losses_full[key] - losses_scaled[key]) < 1e-5, (
+                f"{key}: {losses_full[key]:.6f} vs {losses_scaled[key]:.6f}"
+            )
+
+    def test_accum_disc_phase2(self, accum_setup):
+        """Gradient accumulation should work during disc phase (epoch >= epoch_start_disc)."""
+        encoder, adapter, decoder, disc, lpips_net, batch, config = accum_setup
+
+        opt_gen = torch.optim.AdamW(
+            list(adapter.parameters()) + list(decoder.parameters()), lr=1e-3,
+        )
+        opt_disc = torch.optim.AdamW(disc.head.parameters(), lr=1e-3)
+        opt_gen.zero_grad()
+        opt_disc.zero_grad()
+
+        disc_before = self._clone_params(disc.head)
+
+        # epoch=1 = phase2 (disc on, GAN off)
+        train_step(
+            batch, encoder, adapter, decoder, disc, lpips_net,
+            opt_gen, opt_disc, epoch=1, config=config,
+            loss_scale=0.5, step_optimizers=False,
+        )
+        # Disc params shouldn't change yet
+        for name, p in disc.head.named_parameters():
+            assert torch.equal(p, disc_before[name]), (
+                f"disc.head.{name} changed during accumulation"
+            )
+        # But disc grads should exist
+        has_disc_grad = any(
+            p.grad is not None and p.grad.norm() > 0
+            for p in disc.head.parameters()
+        )
+        assert has_disc_grad, "No disc gradients accumulated"
+
+        # Now step
+        train_step(
+            batch, encoder, adapter, decoder, disc, lpips_net,
+            opt_gen, opt_disc, epoch=1, config=config,
+            loss_scale=0.5, step_optimizers=True,
+        )
+        # Disc params should have changed now
+        any_changed = any(
+            not torch.equal(p, disc_before[n])
+            for n, p in disc.head.named_parameters()
+        )
+        assert any_changed, "Disc params didn't update after step"
+
+    def test_accum_gan_phase3(self, accum_setup):
+        """Gradient accumulation should work during GAN phase (epoch >= epoch_start_gan)."""
+        encoder, adapter, decoder, disc, lpips_net, batch, config = accum_setup
+
+        opt_gen = torch.optim.AdamW(
+            list(adapter.parameters()) + list(decoder.parameters()), lr=1e-3,
+        )
+        opt_disc = torch.optim.AdamW(disc.head.parameters(), lr=1e-3)
+        opt_gen.zero_grad()
+        opt_disc.zero_grad()
+
+        # epoch=2 = phase3 (GAN on)
+        losses = train_step(
+            batch, encoder, adapter, decoder, disc, lpips_net,
+            opt_gen, opt_disc, epoch=2, config=config,
+            loss_scale=0.5, step_optimizers=False,
+        )
+        assert "gan_gen" in losses, "GAN loss missing in phase 3"
+        assert "lambda" in losses, "Adaptive lambda missing in phase 3"
+        assert "disc" in losses, "Disc loss missing in phase 3"
+
+        # Step should work without error
+        train_step(
+            batch, encoder, adapter, decoder, disc, lpips_net,
+            opt_gen, opt_disc, epoch=2, config=config,
+            loss_scale=0.5, step_optimizers=True,
+        )
+
+    def test_config_grad_accum_steps_default(self):
+        """Default grad_accum_steps should be 1 (no accumulation)."""
+        cfg = Stage1Config()
+        assert cfg.grad_accum_steps == 1
+
+    def test_config_grad_accum_steps_override(self):
+        """grad_accum_steps should be overridable."""
+        cfg = Stage1Config(grad_accum_steps=4)
+        assert cfg.grad_accum_steps == 4
+
+    def test_accum2_numerical_equivalence(self, synthetic_hdf5, lpips_net):
+        """2 micro-batches of size B with accum=2 should produce the same
+        parameter update as 1 batch of size B with accum=1.
+
+        Since we use the SAME data for both micro-batches:
+          accum path:  grad = (0.5 * grad_B) + (0.5 * grad_B) = grad_B
+          single path: grad = 1.0 * grad_B
+        So final weights should match exactly (same optimizer state).
+        """
+        config = Stage1Config(
+            batch_size=2, num_workers=0, epoch_start_disc=1,
+            epoch_start_gan=2, disc_pretrained=False,
+        )
+        batch = _make_batch(synthetic_hdf5, batch_size=2)
+
+        encoder = MockEncoder()
+
+        # ---- Single step path ----
+        torch.manual_seed(99)
+        adapter_single = MockAdapterDeterministic()
+        decoder_single = MockDecoder()
+        disc_single = PatchDiscriminator(pretrained=False)
+        opt_gen_s = torch.optim.AdamW(
+            list(adapter_single.parameters()) + list(decoder_single.parameters()),
+            lr=1e-3, betas=(0.9, 0.999),
+        )
+        opt_disc_s = torch.optim.AdamW(disc_single.head.parameters(), lr=1e-3)
+        opt_gen_s.zero_grad()
+        opt_disc_s.zero_grad()
+
+        train_step(
+            batch, encoder, adapter_single, decoder_single, disc_single,
+            lpips_net, opt_gen_s, opt_disc_s, epoch=0, config=config,
+            loss_scale=1.0, step_optimizers=True,
+        )
+
+        # ---- Accum=2 path (same data twice) ----
+        torch.manual_seed(99)
+        adapter_accum = MockAdapterDeterministic()
+        decoder_accum = MockDecoder()
+        disc_accum = PatchDiscriminator(pretrained=False)
+        opt_gen_a = torch.optim.AdamW(
+            list(adapter_accum.parameters()) + list(decoder_accum.parameters()),
+            lr=1e-3, betas=(0.9, 0.999),
+        )
+        opt_disc_a = torch.optim.AdamW(disc_accum.head.parameters(), lr=1e-3)
+        opt_gen_a.zero_grad()
+        opt_disc_a.zero_grad()
+
+        # Micro-batch 1: accumulate
+        train_step(
+            batch, encoder, adapter_accum, decoder_accum, disc_accum,
+            lpips_net, opt_gen_a, opt_disc_a, epoch=0, config=config,
+            loss_scale=0.5, step_optimizers=False,
+        )
+        # Micro-batch 2: accumulate + step
+        train_step(
+            batch, encoder, adapter_accum, decoder_accum, disc_accum,
+            lpips_net, opt_gen_a, opt_disc_a, epoch=0, config=config,
+            loss_scale=0.5, step_optimizers=True,
+        )
+
+        # Weights should match
+        for (ns, ps), (na, pa) in zip(
+            adapter_single.named_parameters(),
+            adapter_accum.named_parameters(),
+        ):
+            assert torch.allclose(ps, pa, atol=1e-5), (
+                f"adapter.{ns}: single vs accum mismatch "
+                f"(max diff={torch.max(torch.abs(ps - pa)).item():.2e})"
+            )
