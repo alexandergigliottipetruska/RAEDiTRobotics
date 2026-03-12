@@ -67,9 +67,12 @@ def _world_size() -> int:
 
 
 def _unwrap(model: nn.Module) -> nn.Module:
-    """Get the underlying module from a DDP or DataParallel wrapper."""
+    """Get the underlying module from DDP, DataParallel, or torch.compile wrapper."""
     if isinstance(model, (nn.parallel.DistributedDataParallel, nn.DataParallel)):
-        return model.module
+        model = model.module
+    # torch.compile wraps the original module as _orig_mod
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
     return model
 
 
@@ -328,9 +331,17 @@ def load_checkpoint(
 ) -> int:
     """Load checkpoint. Returns the epoch to resume from (saved_epoch + 1)."""
     ckpt = torch.load(path, weights_only=False, map_location="cpu")
-    adapter.load_state_dict(ckpt["adapter"])
-    decoder.load_state_dict(ckpt["decoder"])
-    disc.head.load_state_dict(ckpt["disc_head"])
+
+    def _strip_compile_prefix(state_dict):
+        """Remove '_orig_mod.' prefix left by torch.compile."""
+        prefix = "_orig_mod."
+        if any(k.startswith(prefix) for k in state_dict):
+            return {k.removeprefix(prefix): v for k, v in state_dict.items()}
+        return state_dict
+
+    adapter.load_state_dict(_strip_compile_prefix(ckpt["adapter"]))
+    decoder.load_state_dict(_strip_compile_prefix(ckpt["decoder"]))
+    disc.head.load_state_dict(_strip_compile_prefix(ckpt["disc_head"]))
     opt_gen.load_state_dict(ckpt["opt_gen"])
     opt_disc.load_state_dict(ckpt["opt_disc"])
     log.info("Loaded checkpoint from epoch %d: %s", ckpt["epoch"], path)
