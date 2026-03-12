@@ -51,6 +51,8 @@ def main():
     parser.add_argument("--lr_disc", type=float, default=1e-4)
     parser.add_argument("--save_dir", default="checkpoints/stage1")
     parser.add_argument("--save_every", type=int, default=5)
+    parser.add_argument("--grad_accum_steps", type=int, default=1,
+                        help="Gradient accumulation steps (effective batch = batch_size * accum * world_size)")
     parser.add_argument("--resume", default=None, help="Checkpoint to resume from")
     parser.add_argument("--pretrained_encoder", action="store_true", default=True)
     parser.add_argument("--no_pretrained_encoder", dest="pretrained_encoder", action="store_false")
@@ -80,6 +82,7 @@ def main():
         lr_disc=args.lr_disc,
         save_dir=args.save_dir,
         save_every=args.save_every,
+        grad_accum_steps=args.grad_accum_steps,
         disc_pretrained=True,
     )
 

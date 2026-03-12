@@ -20,6 +20,7 @@ Expected component interfaces (filled in by A.1-A.3):
   decoder.last_layer_weight    nn.Parameter for adaptive lambda
 """
 
+import contextlib
 import json
 import logging
 import os
@@ -106,6 +107,7 @@ class Stage1Config:
     lr_disc: float = 1e-4      # LR for discriminator head
     betas: tuple = (0.5, 0.9)
     weight_decay: float = 0.01
+    grad_accum_steps: int = 1  # gradient accumulation steps
 
     # Checkpointing
     save_every: int = 5
@@ -156,10 +158,20 @@ def train_step(
     epoch: int,
     config: Stage1Config,
     use_amp: bool = False,
+    loss_scale: float = 1.0,
+    step_optimizers: bool = True,
 ) -> dict:
-    """One training step: generator update + optional discriminator update.
+    """One training micro-step: forward + backward, optionally step optimizers.
 
-    Returns dict of scalar loss values for logging.
+    For gradient accumulation, the caller sets loss_scale=1/accum_steps and
+    step_optimizers=False for intermediate micro-batches, then calls with
+    step_optimizers=True on the final micro-batch.
+
+    Args:
+        loss_scale:       Multiply losses by this before backward (1/accum_steps).
+        step_optimizers:  If True, call opt.step() + opt.zero_grad() after backward.
+
+    Returns dict of scalar loss values for logging (unscaled).
     """
     images_enc = batch["images_enc"]        # (B, K, 3, H, W)
     images_target = batch["images_target"]  # (B, K, 3, H, W)
@@ -212,9 +224,12 @@ def train_step(
 
     losses["total_gen"] = L_total.item()
 
-    opt_gen.zero_grad()
-    L_total.backward()
-    opt_gen.step()
+    # Scale loss for gradient accumulation (backward accumulates into .grad)
+    (L_total * loss_scale).backward()
+
+    if step_optimizers:
+        opt_gen.step()
+        opt_gen.zero_grad()
 
     # ---- Discriminator step (Phase 2+) ----
     if epoch >= config.epoch_start_disc:
@@ -223,9 +238,11 @@ def train_step(
             logits_fake_d = disc(pred.detach())
             L_disc = gan_discriminator_loss(logits_real, logits_fake_d)
 
-        opt_disc.zero_grad()
-        L_disc.backward()
-        opt_disc.step()
+        (L_disc * loss_scale).backward()
+
+        if step_optimizers:
+            opt_disc.step()
+            opt_disc.zero_grad()
 
         losses["disc"] = L_disc.item()
 
@@ -506,6 +523,7 @@ def train_stage1(
                 "betas": list(config.betas),
                 "weight_decay": config.weight_decay,
                 "disc_pretrained": config.disc_pretrained,
+                "grad_accum_steps": config.grad_accum_steps,
             },
         }
         with open(metrics_path, "a") as mf:
@@ -529,8 +547,9 @@ def train_stage1(
             log.info("DDP: %d GPUs across %d nodes", _world_size(), _world_size())
 
         # Config
-        log.info("Config: batch_size=%d, num_workers=%d, lr_gen=%.1e, lr_disc=%.1e",
-                 config.batch_size, config.num_workers, config.lr_gen, config.lr_disc)
+        eff_batch = config.batch_size * config.grad_accum_steps * _world_size()
+        log.info("Config: batch_size=%d, grad_accum=%d, effective_batch=%d, num_workers=%d, lr_gen=%.1e, lr_disc=%.1e",
+                 config.batch_size, config.grad_accum_steps, eff_batch, config.num_workers, config.lr_gen, config.lr_disc)
         log.info("Config: omega_L=%.2f, omega_G=%.2f, weight_decay=%.4f, betas=%s",
                  config.omega_L, config.omega_G, config.weight_decay, config.betas)
         log.info("Config: disc_pretrained=%s", config.disc_pretrained)
@@ -571,19 +590,46 @@ def train_stage1(
 
         epoch_losses: dict[str, float] = {}
         n_steps = 0
+        accum = config.grad_accum_steps
+
+        # Zero grads at start of epoch
+        opt_gen.zero_grad()
+        opt_disc.zero_grad()
 
         loader_iter = tqdm(train_loader, desc=f"Epoch {epoch} [{phase}]", leave=True) if is_main else train_loader
-        for batch in loader_iter:
+        for step_idx, batch in enumerate(loader_iter):
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            step_losses = train_step(
-                batch, encoder, adapter, decoder, disc, lpips_net,
-                opt_gen, opt_disc, epoch, config, use_amp=use_amp,
-            )
+            is_accum_step = (step_idx + 1) % accum == 0
+
+            # In DDP, skip AllReduce on intermediate accumulation steps
+            if distributed and not is_accum_step:
+                ctx_a = adapter.no_sync()
+                ctx_d = decoder.no_sync()
+                ctx_disc = disc.no_sync()
+            else:
+                ctx_a = contextlib.nullcontext()
+                ctx_d = contextlib.nullcontext()
+                ctx_disc = contextlib.nullcontext()
+
+            with ctx_a, ctx_d, ctx_disc:
+                step_losses = train_step(
+                    batch, encoder, adapter, decoder, disc, lpips_net,
+                    opt_gen, opt_disc, epoch, config, use_amp=use_amp,
+                    loss_scale=1.0 / accum,
+                    step_optimizers=is_accum_step,
+                )
 
             for k, v in step_losses.items():
                 epoch_losses[k] = epoch_losses.get(k, 0.0) + v
             n_steps += 1
+
+        # Handle leftover micro-batches that didn't complete an accumulation window
+        if n_steps % accum != 0:
+            opt_gen.step()
+            opt_gen.zero_grad()
+            opt_disc.step()
+            opt_disc.zero_grad()
 
         # Average epoch losses
         avg = {k: v / max(n_steps, 1) for k, v in epoch_losses.items()}
