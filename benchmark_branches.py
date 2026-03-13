@@ -10,7 +10,7 @@ STABLE_BRANCH = "feature/distributed_stage1"
 PERF_BRANCH = "feature/distributed_stage1-performance_boost"
 REAL_CONFIG = "configs/swarm_config.yaml"
 BACKUP_CONFIG = "configs/swarm_config.yaml.bak"
-NUM_EPOCHS = 6
+NUM_EPOCHS = 3
 DATA_PATH = "data/complete_unified_data/can.hdf5"
 NUM_TRIALS_PER_WORKER = 1
 
