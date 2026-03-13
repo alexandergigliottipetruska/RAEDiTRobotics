@@ -1,3 +1,5 @@
+## RUN LIKE THIS: nohup sh -c "python3 -u benchmark_branches.py" 2>&1 | grep --line-buffered "100%|" > benchmark.log &
+
 import subprocess
 import time
 import yaml
