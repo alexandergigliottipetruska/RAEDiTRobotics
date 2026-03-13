@@ -1,5 +1,5 @@
 ## RUN LIKE THIS:
-# nohup sh -c "python3 -u benchmark_branches.py 2>&1 | grep --line-buffered -v -E ' (  ?[0-9]{1,2})%\|'" > benchmark.log &
+# nohup sh -c "python3 -u benchmark_branches.py 2>&1 | grep --line-buffered -v -E '?[0-9]{1,2}'" > benchmark.log &
 
 ## kill all the background things after stopping a run:
 # ps -ux | grep -E "benchmark_branches.py|swarm_worker.py" | grep -v "ssh" | awk '{print $2}' | xargs kill -9

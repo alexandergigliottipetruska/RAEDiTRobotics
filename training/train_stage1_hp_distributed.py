@@ -27,7 +27,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import torch
-torch.set_float32_matmul_precision('high')
+# torch.set_float32_matmul_precision('high') # --- SPDUP:
+
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
@@ -375,6 +376,17 @@ def train_stage1(
     disc.train()  # backbone stays eval via overridden .train()
 
     lpips_net = create_lpips_net().to(device)
+
+    # --- SPDUP: the compilation of the models for speedup
+    if is_main:
+        log.info("🚀 Compiling models for maximum speed...")
+    
+    # Compile the heavy math parts
+    adapter = torch.compile(adapter, mode="reduce-overhead")
+    decoder = torch.compile(decoder, mode="reduce-overhead")
+    lpips_net = torch.compile(lpips_net)
+    # --- SPDUP UP TO HERE
+
 
     # Load checkpoint BEFORE wrapping in DDP (state_dicts are unwrapped)
     start_epoch = 0
