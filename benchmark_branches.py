@@ -10,6 +10,9 @@ STABLE_BRANCH = "feature/distributed_stage1"
 PERF_BRANCH = "feature/distributed_stage1-performance_boost"
 REAL_CONFIG = "configs/swarm_config.yaml"
 BACKUP_CONFIG = "configs/swarm_config.yaml.bak"
+NUM_EPOCHS = 6
+DATA_PATH = "data/complete_unified_data/can.hdf5"
+NUM_TRIALS_PER_WORKER = 1
 
 def cleanup_optuna_study(cfg):
     """Optional: Deletes the benchmark study from PostgreSQL to keep the DB clean."""
@@ -50,26 +53,46 @@ def run_bench_session(branch_name):
                 val = settings['default']
             elif 'choices' in settings:
                 val = settings['choices'][0]
+            elif 'low' in settings and 'high' in settings:
+                # Calculate the midpoint
+                low = settings['low']
+                high = settings['high']
+                
+                if settings.get('log', False):
+                    # For log scales (like Learning Rate), midpoint is geometric
+                    import math
+                    val = math.pow(10, (math.log10(low) + math.log10(high)) / 2)
+                else:
+                    # For linear scales, midpoint is arithmetic
+                    val = (low + high) / 2
             else:
                 val = settings.get('low', 0)
+
+            if 'epoch_start' in hp_name:
+                if 'disc' in hp_name:
+                    val = int(NUM_EPOCHS * (1/3)) # Start Discriminator at Epoch 1
+                elif 'gan' in hp_name:
+                    val = int(NUM_EPOCHS * (2/3))  # Start GAN at Epoch 2
+                else:
+                    val = 1  # Default to starting at Epoch 1 if not specified
             
             cfg['training_static'][hp_name] = val
+            print(f"   > Freezing {hp_name} to: {val}")
 
         # Clear the search space so Optuna is bypassed
         cfg['hyperparameters_search'] = {}
         
-        # Hardcoded single file and 10 epochs
-        cfg['training_static']['hdf5_paths'] = ["data/complete_unified_data/can.hdf5"]
-        cfg['training_static']['num_epochs'] = 10
+        # Hardcoded single file and 6 epochs
+        cfg['training_static']['hdf5_paths'] = [DATA_PATH]
+        cfg['training_static']['num_epochs'] = NUM_EPOCHS
         cfg['project']['study_name'] = f"bench_run_{branch_name.replace('/', '_')}"
-        cfg['project']['hf_repo_id'] = "dummy/benchmarking_trash"
-        cfg['project']['n_trials_per_worker'] = 1
+        cfg['project']['n_trials_per_worker'] = NUM_TRIALS_PER_WORKER
         
         # Overwrite the real config with these benchmark settings
         with open(REAL_CONFIG, 'w') as f:
             yaml.dump(cfg, f)
             
-        print(f">>> Running 10 epochs (1 trial) on {branch_name}...")
+        print(f">>> Running {NUM_EPOCHS} epochs (1 trial) on {branch_name}...")
         start_time = time.time()
         
         # Launch the local worker process
