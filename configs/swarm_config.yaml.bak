@@ -1,0 +1,92 @@
+# ==========================================
+# 1. INFRASTRUCTURE & NETWORK (Existing)
+# ==========================================
+# Network Infrastructure
+project_root: "/student/denassau/CSC415/Project/RAEDiTRobotics"
+venv_path: "/student/denassau/sweep_env/bin/activate"
+
+# List of Lab PCs to use as workers
+domain: ".utm.utoronto.ca"
+nodes:
+  - "dh2020pc10"
+  - "dh2020pc11"
+  - "dh2020pc23"
+  - "dh2020pc21"
+  - "dh2020pc15"
+  - "dh2020pc24"
+  - "dh2020pc17"
+  - "dh2020pc22"
+  - "dh2020pc19"
+
+# Training specific settings
+worker_script: "training/swarm_worker.py"
+log_directory: "/tmp/swarm_logs"
+
+# ==========================================
+# 2. OPTUNA & WORKER SETTINGS (New)
+# ==========================================
+project:
+  study_name: "robotics_stage1_phased_can_meat_off_grill"
+  hf_repo_id: "Denass04/RAEDiTRobotics-stage1-sweeps"
+  hf_cache_dir: "/tmp/denassau_hf_cache"
+  torch_cache_dir: "/tmp/denassau_torch_cache"
+  scratch_dir: "/tmp/denassau_stage1"
+  n_trials_per_worker: 5 # total trials is n_trials_per_worker * number_of_workers
+  n_startup_trials: 5 # number of trials before pruning can start
+  n_warmup_steps: 16 # number of epochs before optuna can start pruning
+
+manager:
+  sshpass_path: "/student/denassau/bin/sshpass" 
+
+training_static:
+  batch_size: 6
+  accum_steps: 2
+  num_epochs: 20
+  save_every: 10
+  num_workers: 8
+  betas: [0.5, 0.9]
+  disc_pretrained: true
+  hdf5_paths: 
+    - "data/complete_unified_data/can.hdf5"
+    - "data/complete_unified_data/meat_off_grill.hdf5"
+
+# Define the Optuna search space dynamically
+hyperparameters_search:
+  lr_gen:
+    method: "suggest_float"
+    kwargs:
+      low: 5.0e-05
+      high: 5.0e-04
+      log: true
+  lr_disc:
+    method: "suggest_float"
+    kwargs:
+      low: 5.0e-05
+      high: 5.0e-04
+      log: true
+  epoch_start_gan:
+    method: "suggest_int"
+    kwargs:
+      low: 6
+      high: 15
+  omega_L:
+    method: "suggest_float"
+    kwargs:
+      low: 0.5
+      high: 1.5
+  omega_G:
+    method: "suggest_float"
+    kwargs: 
+      low: 0.1
+      high: 1.0
+  weight_decay:
+    method: "suggest_float"
+    kwargs: 
+      low: 1.0e-04
+      high: 1.0e-02
+      log: true
+  epoch_start_disc:
+    method: "suggest_int"
+    kwargs: 
+      low: 2
+      high: "epoch_start_gan"  # <--- Dynamic Reference
