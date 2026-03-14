@@ -102,13 +102,13 @@ def run_bench_session(branch_name):
         # Overwrite the real config with these benchmark settings
         with open(REAL_CONFIG, 'w') as f:
             yaml.dump(cfg, f)
-            
-        print(f">>> Running {NUM_EPOCHS} epochs (1 trial) on {branch_name}...")
-        start_time = time.time()
 
         # Start the background spy
         monitor = BottleneckMonitor(interval=15)
         monitor.start()
+            
+        print(f">>> Running {NUM_EPOCHS} epochs (1 trial) on {branch_name}...")
+        start_time = time.time()
 
         # This tells tqdm to only update once every 3600 seconds (basically once per epoch)
         env_vars = os.environ.copy()
@@ -124,7 +124,7 @@ def run_bench_session(branch_name):
         print(f"\n✅ {branch_name} completed in {duration:.2f}s")
 
         # STOP AND REPORT HERE
-        monitor.stopped = True
+        monitor.stop()
         monitor.join()
         monitor.report(branch_name)
         
@@ -141,24 +141,31 @@ def run_bench_session(branch_name):
 
 
 class BottleneckMonitor(threading.Thread):
-    def __init__(self, interval=2):
+    def __init__(self, interval=5):
         super().__init__()
         self.interval = interval
-        self.stopped = False
+        self.stop_event = threading.Event()
         self.stats = []
+        self.daemon = True 
 
     def run(self):
         query = "utilization.gpu,utilization.memory,power.draw"
-        while not self.stopped:
+        # The loop runs until stop_event is set
+        while not self.stop_event.is_set():
             try:
                 out = subprocess.check_output([
                     "nvidia-smi", f"--query-gpu={query}", "--format=csv,noheader,nounits"
-                ]).decode().strip().split(",")
-                # Convert to integers: [SM_Util, Mem_Util, Power]
+                ], stderr=subprocess.DEVNULL).decode().strip().split(",")
                 self.stats.append([int(x) for x in out])
-            except:
+            except Exception:
                 pass
-            time.sleep(self.interval)
+            
+            # This is the elegant part: wait for 'interval' seconds 
+            # UNLESS the stop_event is triggered, in which case it returns immediately.
+            self.stop_event.wait(self.interval)
+
+    def stop(self):
+        self.stop_event.set()
 
     def report(self, branch_name):
         if not self.stats:

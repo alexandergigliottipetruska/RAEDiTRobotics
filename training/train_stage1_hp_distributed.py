@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 import torch
-torch.set_float32_matmul_precision('high') # --- SPDUP:
+# torch.set_float32_matmul_precision('high') # --- SPDUP:
 torch._inductor.config.freezing = True  # Optional: helps performance
 # The direct fix for the donated buffer issue in newer PyTorch:
 import torch._functorch.aot_autograd
