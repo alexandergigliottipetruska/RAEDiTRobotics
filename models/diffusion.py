@@ -32,10 +32,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
-try:
-    from data4robotics.agent import BaseAgent
-except ImportError:
-    BaseAgent = nn.Module  # fallback when data4robotics not installed
+from models.base_policy import BasePolicy
 
 
 def _get_activation_fn(activation):
@@ -64,7 +61,7 @@ class _PositionalEncoding(nn.Module):
         )
         pe[:, 0::2] = torch.sin(position * div_term)
         pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)  # (1, max_len, d_model)
+        pe = pe.unsqueeze(0)               # (1, max_len, d_model)
         self.register_buffer("pe", pe)
 
     def forward(self, x):
@@ -74,8 +71,8 @@ class _PositionalEncoding(nn.Module):
         Returns:
             Positional encodings of shape (batch_size, seq_len, d_model)
         """
-        pe = self.pe[:, : x.shape[1]]
-        pe = pe.repeat((x.shape[0], 1, 1))
+        pe = self.pe[:, : x.shape[1]]      # (1, seq_len, d_model)
+        pe = pe.repeat((x.shape[0], 1, 1)) # (batch_size, seq_len, d_model)
         return pe.detach().clone()
 
 
@@ -183,7 +180,7 @@ class _FinalLayer(nn.Module):
         shift, scale = self.adaLN_modulation(cond).chunk(2, dim=1)
         x = x * scale.unsqueeze(1) + shift.unsqueeze(1)
         x = self.linear(x)
-        return x
+        return x   # (B, ac_chunk, ac_dim)
 
     def reset_parameters(self):
         for p in self.parameters():
@@ -491,7 +488,7 @@ class _DiTNoiseNet(nn.Module):
         """
         time_enc = self.time_net(time)
 
-        ac_tokens = self.ac_proj(noise_actions) + self.dec_pos
+        ac_tokens = self.ac_proj(noise_actions) + self.dec_pos  # (B, ac_chunk, hidden_dim)
         x = ac_tokens
 
         if isinstance(enc_cache, list):
@@ -639,7 +636,7 @@ class _DDTHead(nn.Module):
 
         # Project xt and zt into head dimension
         x = self.ac_proj(noise_actions) + self.dec_pos  # (B, ac_chunk, head_dim)
-        cond = self.zt_proj(zt)                          # (B, ac_chunk, head_dim)
+        cond = self.zt_proj(zt)                         # (B, ac_chunk, head_dim)
 
         for block in self.blocks:
             x = block(x, time_enc, cond)
@@ -688,23 +685,25 @@ class _DiTDHNoiseNet(nn.Module):
 # Agent
 # ---------------------------------------------------------------------------
 
-class DiffusionTransformerAgent(BaseAgent):
+class DiffusionTransformerAgent(BasePolicy):
     def __init__(
         self,
         features,
-        odim,
+        feat_dim,
+        token_dim,
         n_cams,
-        use_obs,
+        odim,
         ac_dim,
         ac_chunk,
         train_diffusion_steps,
         eval_diffusion_steps,
+        use_obs=False,
         imgs_per_cam=1,
         dropout=0,
         share_cam_features=False,
-        early_fusion=False,
+        view_dropout_p=0.0,
         feat_norm=None,
-        token_dim=None,
+        max_patches_per_view=None,
         noise_net_kwargs=dict(),
         ddt_head_kwargs=dict(
             head_dim=2048,
@@ -717,16 +716,18 @@ class DiffusionTransformerAgent(BaseAgent):
         width_mult=None,
     ):
         super().__init__(
-            odim=odim,
             features=features,
+            feat_dim=feat_dim,
+            token_dim=token_dim,
             n_cams=n_cams,
-            imgs_per_cam=imgs_per_cam,
+            odim=odim,
             use_obs=use_obs,
+            imgs_per_cam=imgs_per_cam,
             share_cam_features=share_cam_features,
-            early_fusion=early_fusion,
+            view_dropout_p=view_dropout_p,
             dropout=dropout,
             feat_norm=feat_norm,
-            token_dim=token_dim,
+            max_patches_per_view=max_patches_per_view,
         )
 
         # Width scaling: hidden_dim ∝ latent_dim  [RAE-DiT]
