@@ -166,6 +166,41 @@ class TestEmbeddings:
         assert ta.spatial_pos_emb.requires_grad
         assert ta.spatial_pos_emb.shape == (1, N, D)
 
+    def test_view_present_emb_distinguishes_real_vs_masked(self):
+        """Real vs masked views get different view_present embeddings."""
+        ta = TokenAssembly(d_model=D, num_patches=N, num_views=K,
+                           num_obs_steps=1, proprio_dim=D_PROP)
+        adapted = torch.zeros(1, 1, K, N, D)
+        proprio = torch.zeros(1, 1, D_PROP)
+
+        # All present
+        vp_all = torch.ones(1, K, dtype=torch.bool)
+        out_all = ta(adapted, proprio, vp_all)
+
+        # View 0 masked
+        vp_partial = torch.tensor([[False, True, True, True]])
+        out_partial = ta(adapted, proprio, vp_partial)
+
+        # View 0 tokens should differ (different view_present_emb)
+        tok_v0_real = out_all[0, :N]
+        tok_v0_masked = out_partial[0, :N]
+        assert not torch.equal(tok_v0_real, tok_v0_masked), \
+            "Real vs masked view tokens should differ due to view_present_emb"
+
+        # View 1 tokens should be the same (both real)
+        tok_v1_real = out_all[0, N:2*N]
+        tok_v1_still_real = out_partial[0, N:2*N]
+        assert torch.equal(tok_v1_real, tok_v1_still_real)
+
+    def test_view_present_emb_gradient(self):
+        """Gradients flow to view_present_emb."""
+        ta = TokenAssembly(d_model=D, num_patches=N, num_views=K,
+                           num_obs_steps=T_O, proprio_dim=D_PROP)
+        adapted, proprio, vp = _make_inputs()
+        out = ta(adapted, proprio, vp)
+        out.sum().backward()
+        assert ta.view_present_emb.weight.grad is not None
+
 
 # ============================================================
 # Gradient flow tests

@@ -784,7 +784,8 @@ class TestFullPipelineIntegration:
         )
         assert loss.shape == ()
         assert torch.isfinite(loss)
-        assert loss.item() > 0
+        # Note: total can be negative because hinge GAN generator loss
+        # is -logits_fake.mean(), which can dominate with random weights.
 
     def test_full_pipeline_gradient_flow(self):
         """Gradients should flow to decoder param through disc head,

@@ -7,7 +7,7 @@ flat sequence ready for the observation encoder.
 Output is (B, S_obs, d') batch-first, directly compatible with
 _TransformerEncoder (after C.0 batch-first conversion).
 
-S_obs = T_o * K_real * N + T_o   (visual tokens + proprio tokens)
+S_obs = T_o * K * N + T_o   (visual tokens + proprio tokens, fixed length)
 """
 
 import torch
@@ -49,6 +49,9 @@ class TokenAssembly(nn.Module):
 
         # Observation timestep embedding: distinguishes T_o frames
         self.obs_time_emb = nn.Embedding(num_obs_steps, d_model)
+
+        # View presence embedding: distinguishes real vs masked views
+        self.view_present_emb = nn.Embedding(2, d_model)  # 0=masked, 1=real
 
         # Proprio projection: MLP maps proprio to a single token
         self.proprio_proj = nn.Sequential(
@@ -100,6 +103,10 @@ class TokenAssembly(nn.Module):
                     torch.tensor(k, device=device)
                 )  # broadcast (d',)
                 vis = vis + time_emb  # broadcast (d',)
+
+                # Add view presence embedding (0=masked, 1=real)
+                vp_flag = view_present[:, k].long()  # (B,)
+                vis = vis + self.view_present_emb(vp_flag).unsqueeze(1)  # (B, 1, d')
 
                 all_tokens.append(vis)
 
