@@ -112,9 +112,13 @@ def precompute(
 
                 tokens_all[:, k] = np.concatenate(view_tokens, axis=0)
 
-            # Save to output
+            # Save to output (gzip compresses zero-padded absent views well)
             dst_grp = dst.create_group(f"data/{key}")
-            dst_grp.create_dataset("tokens", data=tokens_all)
+            dst_grp.create_dataset(
+                "tokens", data=tokens_all,
+                chunks=(min(T, 16), K, 196, 1024),
+                compression="gzip", compression_opts=1,
+            )
             # Copy actions, proprio, view_present
             for ds_name in ["actions", "proprio", "view_present"]:
                 dst_grp.create_dataset(ds_name, data=grp[ds_name][:])
