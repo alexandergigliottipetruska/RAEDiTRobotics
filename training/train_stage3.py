@@ -4,19 +4,10 @@ Trains a DiT-Block Policy on adapted visual tokens from Stage 1 using
 DDPM noise prediction. Supports optional co-training with reconstruction
 loss (lambda_recon > 0).
 
-Key differences from Stage 1:
-  - DDPM noise prediction loss (MSE on predicted epsilon)
-  - Per-task training (one policy per task)
-  - Cosine LR with linear warmup
-  - EMA model for evaluation
-  - Separate LR for adapter (prevents drift from Stage 1 weights)
-  - Gradient clipping (max_norm=1.0)
-  - DDIM inference for evaluation
-
-Expected component interfaces:
-  noise_net.forward_enc(obs_tokens)                -> enc_cache (list of [B, S, d])
-  noise_net.forward_dec(noisy_actions, time, cache) -> eps_pred [B, T_p, D_act]
-  noise_net(noisy_actions, time, obs_tokens)       -> (enc_cache, eps_pred)
+Uses PolicyDiT (C.10) which composes Stage1Bridge + ViewDropout +
+TokenAssembly + _DiTNoiseNet into a single module with:
+  policy.compute_loss(batch) -> scalar loss
+  policy.predict_action(obs) -> (B, T_p, D_act)
 """
 
 import json
@@ -35,7 +26,6 @@ from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
 from data_pipeline.datasets.stage3_dataset import Stage3Dataset
 from models.ema import EMA
-from models.view_dropout import ViewDropout
 
 log = logging.getLogger(__name__)
 
@@ -87,6 +77,9 @@ class Stage3Config:
     norm_mode: str = "minmax"
 
     # Architecture
+    ac_dim: int = 7             # action dimension (7 robomimic, 8 RLBench)
+    proprio_dim: int = 9        # proprio dimension
+    num_views: int = 4          # max camera slots
     T_obs: int = 2
     T_pred: int = 16
     T_act: int = 8              # execution horizon (eval only)
@@ -143,134 +136,51 @@ def create_noise_scheduler(num_train_steps: int = 100) -> DDIMScheduler:
 
 def train_step(
     batch: dict,
-    noise_net: nn.Module,
-    encoder: nn.Module,
-    adapter: nn.Module,
-    view_dropout: ViewDropout,
-    scheduler: DDIMScheduler,
+    policy: nn.Module,
     optimizer: torch.optim.Optimizer,
     config: Stage3Config,
     global_step: int,
-    decoder: nn.Module | None = None,
-    lpips_net=None,
     use_amp: bool = False,
 ) -> dict:
-    """One DDPM training step.
+    """One DDPM training step using PolicyDiT.
 
     Args:
-        batch:        Dict from Stage3Dataset (images_enc, actions, proprio, view_present).
-        noise_net:    DiT noise prediction network (_DiTNoiseNet or wrapper).
-        encoder:      Frozen Stage 1 encoder.
-        adapter:      Trainable adapter (shared from Stage 1, lower LR).
-        view_dropout: ViewDropout module.
-        scheduler:    DDIM noise scheduler.
-        optimizer:    AdamW optimizer.
-        config:       Training config.
-        global_step:  Current global step (for warmup).
-        decoder:      Optional decoder for co-training L_recon.
-        lpips_net:    Optional LPIPS net for co-training.
-        use_amp:      Whether to use BF16 mixed precision.
+        batch:       Dict from Stage3Dataset (images_enc, actions, proprio, view_present).
+        policy:      PolicyDiT instance (composes bridge + view dropout + token assembly + noise net).
+        optimizer:   AdamW optimizer.
+        config:      Training config.
+        global_step: Current global step (for logging).
+        use_amp:     Whether to use BF16 mixed precision.
 
     Returns:
         Dict of scalar losses for logging.
     """
-    device = next(noise_net.parameters()).device
+    device = next(policy.parameters()).device
     device_type = device.type
 
-    images_enc = batch["images_enc"].to(device)       # [B, T_o, K, 3, H, W]
-    actions = batch["actions"].to(device)              # [B, T_p, D_act]
-    view_present = batch["view_present"].to(device)    # [B, K]
-
-    B, T_o, K, C, H, W = images_enc.shape
+    # Move batch to device
+    batch_dev = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in batch.items()
+    }
 
     with torch.amp.autocast(device_type, dtype=torch.bfloat16, enabled=use_amp):
-        # --- Step 1: Encode observations (frozen) ---
-        with torch.no_grad():
-            # Flatten [B, T_o, K, 3, H, W] -> [B*T_o*K, 3, H, W]
-            flat_imgs = images_enc.reshape(B * T_o * K, C, H, W)
-            flat_tokens = encoder(flat_imgs)  # [B*T_o*K, N, d]
+        loss = policy.compute_loss(batch_dev)
 
-        # Reshape back: [B, T_o, K, N, d]
-        N, d = flat_tokens.shape[1], flat_tokens.shape[2]
-        tokens = flat_tokens.reshape(B, T_o, K, N, d)
-
-        # --- Step 2: Adapt (trainable, lower LR) ---
-        adapted = adapter(tokens.reshape(B * T_o * K, N, d))
-        d_prime = adapted.shape[-1]
-        adapted = adapted.reshape(B, T_o, K, N, d_prime)
-
-        # --- Step 3: View dropout (training only) ---
-        # Apply per-timestep, reshape to [B, K, N, d'] for ViewDropout
-        adapted_dropped = []
-        vp_updated = view_present
-        for t_idx in range(T_o):
-            dropped_t, vp_updated = view_dropout(adapted[:, t_idx], vp_updated)
-            adapted_dropped.append(dropped_t)
-        adapted = torch.stack(adapted_dropped, dim=1)  # [B, T_o, K, N, d']
-
-        # --- Step 4: Flatten obs tokens for noise net ---
-        # Mask absent views, flatten [T_o, K, N] -> [S_obs] per sample
-        # Simple: flatten all tokens (noise_net encoder handles it)
-        obs_tokens = adapted.reshape(B, T_o * K * N, d_prime)
-
-        # --- Step 5: DDPM forward process ---
-        noise = torch.randn_like(actions)
-        timesteps = torch.randint(
-            0, config.train_diffusion_steps, (B,),
-            device=device, dtype=torch.long,
-        )
-        noisy_actions = scheduler.add_noise(actions, noise, timesteps)
-
-        # --- Step 6: Predict noise ---
-        _, eps_pred = noise_net(noisy_actions, timesteps, obs_tokens)
-
-        # --- Step 7: MSE loss on predicted noise ---
-        L_policy = nn.functional.mse_loss(eps_pred, noise)
-
-        # --- Step 8: Optional co-training reconstruction loss ---
-        L_recon = torch.tensor(0.0, device=device)
-        if config.lambda_recon > 0 and decoder is not None:
-            images_target = batch["images_target"].to(device)  # [B, T_o, K, 3, H, W]
-            # Use adapted tokens WITHOUT dropout for reconstruction
-            # Pick last timestep for efficiency
-            recon_tokens = adapter(
-                tokens[:, -1].reshape(B * K, N, d)
-            ).reshape(B * K, N, d_prime)
-
-            mask = view_present.reshape(B * K)
-            recon_input = recon_tokens[mask]
-            recon_target = images_target[:, -1].reshape(B * K, C, H, W)[mask]
-
-            pred_imgs = decoder(recon_input)
-            from models.losses import l1_loss, lpips_loss_fn
-            L_l1 = l1_loss(pred_imgs, recon_target)
-            L_lpips = lpips_loss_fn(pred_imgs, recon_target, lpips_net)
-            L_recon = L_l1 + L_lpips
-
-        L_total = L_policy + config.lambda_recon * L_recon
-
-    # --- Backward + optimizer step ---
+    # Backward + optimizer step
     optimizer.zero_grad()
-    L_total.backward()
+    loss.backward()
 
     # Gradient clipping
     if config.grad_clip > 0:
         torch.nn.utils.clip_grad_norm_(
-            [p for p in noise_net.parameters() if p.requires_grad] +
-            [p for p in adapter.parameters() if p.requires_grad],
+            [p for p in policy.parameters() if p.requires_grad],
             config.grad_clip,
         )
 
     optimizer.step()
 
-    losses = {
-        "policy": L_policy.item(),
-        "total": L_total.item(),
-    }
-    if config.lambda_recon > 0:
-        losses["recon"] = L_recon.item()
-
-    return losses
+    return {"policy": loss.item(), "total": loss.item()}
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +198,9 @@ def ddim_inference(
     device: torch.device | str = "cuda",
 ) -> torch.Tensor:
     """Run DDIM denoising to produce action predictions.
+
+    Note: For full inference with image encoding, use policy.predict_action(obs).
+    This function operates on pre-encoded observation tokens.
 
     Args:
         noise_net: DiT noise prediction network.
@@ -315,7 +228,7 @@ def ddim_inference(
 
     for t in scheduler.timesteps:
         t_batch = t.expand(B)
-        _, eps_pred = noise_net.forward_dec(actions, t_batch, enc_cache)
+        eps_pred = noise_net.forward_dec(actions, t_batch, enc_cache)
         actions = scheduler.step(eps_pred, t, actions).prev_sample
 
     return actions
@@ -413,26 +326,24 @@ def load_checkpoint(
 def train_stage3(
     config: Stage3Config,
     *,
-    encoder: nn.Module,
-    adapter: nn.Module,
-    noise_net: nn.Module,
-    decoder: nn.Module | None = None,
     device: torch.device | str = "cuda",
     resume_from: str | None = None,
 ):
     """Main Stage 3 training entry point.
 
+    Creates a PolicyDiT from the config, sets up optimizer with separate
+    LR for adapter, and trains with DDPM noise prediction.
+
     Supports single-GPU and DDP (via torchrun). DDP is auto-detected.
 
     Args:
-        config:     Training configuration.
-        encoder:    Frozen Stage 1 encoder (A.1).
-        adapter:    Trainable adapter (A.2), loaded from Stage 1 checkpoint.
-        noise_net:  DiT noise prediction network (from diffusion.py).
-        decoder:    Optional decoder for co-training L_recon.
-        device:     Device (ignored under DDP; uses LOCAL_RANK).
+        config:      Training configuration.
+        device:      Device (ignored under DDP; uses LOCAL_RANK).
         resume_from: Path to checkpoint to resume from.
     """
+    from models.policy_dit import PolicyDiT
+    from models.stage1_bridge import Stage1Bridge
+
     distributed = _is_distributed()
     rank = _rank()
     is_main = _is_main()
@@ -446,53 +357,50 @@ def train_stage3(
 
     use_amp = (device.type == "cuda")
 
-    # Move models to device
-    encoder = encoder.to(device).eval()
-    adapter = adapter.to(device).train()
-    noise_net = noise_net.to(device).train()
+    # --- Create PolicyDiT ---
+    bridge = Stage1Bridge(
+        checkpoint_path=config.stage1_checkpoint,
+        pretrained_encoder=True,
+        load_decoder=(config.lambda_recon > 0),
+    )
 
-    # View dropout
-    view_dropout = ViewDropout(
-        d_model=config.hidden_dim, p=config.p
-    ).to(device)
+    policy = PolicyDiT(
+        bridge=bridge,
+        ac_dim=config.ac_dim,
+        proprio_dim=config.proprio_dim,
+        hidden_dim=config.hidden_dim,
+        T_obs=config.T_obs,
+        T_pred=config.T_pred,
+        num_blocks=config.num_blocks,
+        nhead=config.nhead,
+        num_views=config.num_views,
+        train_diffusion_steps=config.train_diffusion_steps,
+        eval_diffusion_steps=config.eval_diffusion_steps,
+        p_view_drop=config.p,
+        lambda_recon=config.lambda_recon,
+        use_lightning=config.use_lightning,
+    )
+    policy = policy.to(device)
 
-    # DDPM scheduler
-    scheduler = create_noise_scheduler(config.train_diffusion_steps)
-
-    # Optional co-training components
-    lpips_net = None
-    if config.lambda_recon > 0 and decoder is not None:
-        decoder = decoder.to(device).train()
-        from models.losses import create_lpips_net
-        lpips_net = create_lpips_net().to(device)
-
-    # EMA
-    ema = EMA(noise_net, decay=config.ema_decay)
+    # EMA on noise net
+    ema = EMA(policy.noise_net, decay=config.ema_decay)
 
     # Load checkpoint before DDP wrapping
     start_epoch = 0
     global_step = 0
     if resume_from and os.path.isfile(resume_from):
-        _opt_tmp = torch.optim.AdamW(
-            list(noise_net.parameters()) + list(adapter.parameters()),
-            lr=config.lr,
-        )
+        _opt_tmp = torch.optim.AdamW(policy.parameters(), lr=config.lr)
         start_epoch, global_step = load_checkpoint(
-            resume_from, noise_net, adapter, _opt_tmp, ema, decoder
+            resume_from, policy.noise_net, policy.bridge.adapter,
+            _opt_tmp, ema, policy.bridge.decoder,
         )
 
     # DDP wrapping
     if distributed:
-        noise_net = nn.parallel.DistributedDataParallel(
-            noise_net, device_ids=[local_rank]
+        policy = nn.parallel.DistributedDataParallel(
+            policy, device_ids=[local_rank],
+            find_unused_parameters=True,
         )
-        adapter = nn.parallel.DistributedDataParallel(
-            adapter, device_ids=[local_rank]
-        )
-        if decoder is not None:
-            decoder = nn.parallel.DistributedDataParallel(
-                decoder, device_ids=[local_rank]
-            )
 
     # Dataset + DataLoader
     train_ds = Stage3Dataset(
@@ -525,17 +433,17 @@ def train_stage3(
     )
 
     # Optimizer with separate param groups
+    policy_unwrapped = _unwrap(policy)
     param_groups = [
-        {"params": list(noise_net.parameters()), "lr": config.lr},
-        {"params": list(adapter.parameters()), "lr": config.lr_adapter},
+        {"params": list(policy_unwrapped.noise_net.parameters()), "lr": config.lr},
+        {"params": list(policy_unwrapped.bridge.adapter.parameters()), "lr": config.lr_adapter},
+        {"params": list(policy_unwrapped.view_dropout.parameters()), "lr": config.lr},
+        {"params": list(policy_unwrapped.token_assembly.parameters()), "lr": config.lr},
     ]
-    if decoder is not None and config.lambda_recon > 0:
+    if policy_unwrapped.bridge.decoder is not None and config.lambda_recon > 0:
         param_groups.append(
-            {"params": list(decoder.parameters()), "lr": config.lr_adapter}
+            {"params": list(policy_unwrapped.bridge.decoder.parameters()), "lr": config.lr_adapter}
         )
-    param_groups.append(
-        {"params": list(view_dropout.parameters()), "lr": config.lr}
-    )
 
     optimizer = torch.optim.AdamW(
         param_groups,
@@ -594,9 +502,7 @@ def train_stage3(
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
-        noise_net.train()
-        adapter.train()
-        view_dropout.train()
+        policy.train()
 
         epoch_losses: dict[str, float] = {}
         n_steps = 0
@@ -608,9 +514,8 @@ def train_stage3(
 
         for batch in loader_iter:
             step_losses = train_step(
-                batch, noise_net, encoder, adapter, view_dropout,
-                scheduler, optimizer, config, global_step,
-                decoder=decoder, lpips_net=lpips_net, use_amp=use_amp,
+                batch, policy, optimizer, config, global_step,
+                use_amp=use_amp,
             )
 
             # EMA update
@@ -642,19 +547,21 @@ def train_stage3(
 
             # Periodic checkpointing
             if (epoch + 1) % config.save_every_epoch == 0:
+                pu = _unwrap(policy)
                 save_checkpoint(
                     os.path.join(config.save_dir, f"epoch_{epoch:03d}.pt"),
-                    epoch, global_step, noise_net, adapter, optimizer, ema, avg,
-                    decoder=decoder,
+                    epoch, global_step, pu.noise_net, pu.bridge.adapter,
+                    optimizer, ema, avg, decoder=pu.bridge.decoder,
                 )
 
             # Best checkpoint
             if avg.get("policy", float("inf")) < best_val_loss:
                 best_val_loss = avg["policy"]
+                pu = _unwrap(policy)
                 save_checkpoint(
                     os.path.join(config.save_dir, "best.pt"),
-                    epoch, global_step, noise_net, adapter, optimizer, ema, avg,
-                    decoder=decoder,
+                    epoch, global_step, pu.noise_net, pu.bridge.adapter,
+                    optimizer, ema, avg, decoder=pu.bridge.decoder,
                 )
 
         if distributed:

@@ -1,17 +1,11 @@
 """C.9 Integration tests for Stage 3 pipeline.
 
-These tests verify the interfaces between components. They are designed to:
-  - PASS once all teammate components (C.1, C.2, C.4, C.10) are implemented
-  - SKIP now (with clear messages) while those components don't exist yet
-  - Serve as acceptance criteria — if these pass, the wiring is correct
-
-Each test documents exactly what interface it expects, so the teammate
-knows what to implement.
+These tests verify the interfaces between components — that Stage1Bridge,
+TokenAssembly, ViewDropout, PolicyDiT, and the training loop wire together
+correctly with matching shapes, gradient flow, and checkpoint save/load.
 
 NOTE ON BATCH-FIRST: C.0 converted diffusion.py to batch-first (B, S, d).
-The spec mentions PolicyDiT should transpose to seq-first, but that was
-written BEFORE C.0. After C.0, no transpose is needed anywhere. PolicyDiT
-should pass batch-first tensors directly to noise_net.
+All components output batch-first. No transpose needed anywhere.
 
 Owner: Swagman
 """
@@ -25,8 +19,12 @@ import pytest
 import torch
 import torch.nn as nn
 
+from models.base_policy import BasePolicy
 from models.diffusion import _DiTNoiseNet
 from models.ema import EMA
+from models.policy_dit import PolicyDiT
+from models.stage1_bridge import Stage1Bridge
+from models.token_assembly import TokenAssembly
 from models.view_dropout import ViewDropout
 from training.train_stage3 import (
     Stage3Config,
@@ -36,24 +34,6 @@ from training.train_stage3 import (
     save_checkpoint,
     load_checkpoint,
 )
-
-# ---------------------------------------------------------------------------
-# Import guards for teammate components
-# ---------------------------------------------------------------------------
-
-def _try_import(module_path, class_name):
-    """Try to import a class, return (cls, None) or (None, skip_reason)."""
-    try:
-        mod = __import__(module_path, fromlist=[class_name])
-        return getattr(mod, class_name), None
-    except (ImportError, ModuleNotFoundError, AttributeError) as e:
-        return None, f"{class_name} not yet implemented: {e}"
-
-
-BasePolicy, _skip_c1 = _try_import("models.base_policy", "BasePolicy")
-Stage1Bridge, _skip_c2 = _try_import("models.stage1_bridge", "Stage1Bridge")
-TokenAssembly, _skip_c4 = _try_import("models.token_assembly", "TokenAssembly")
-PolicyDiT, _skip_c10 = _try_import("models.policy_dit", "PolicyDiT")
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +49,16 @@ T_O = 2
 T_P = 16
 AC_DIM = 7
 PROPRIO_DIM = 9
+
+# Checkpoint paths (set to None if not available)
+_CKPT_FULL = "checkpoints/stage1_full/epoch_007.pt"
+_CKPT_5090 = "checkpoints/stage1_rtx5090/epoch_024.pt"
+
+def _ckpt_available(path):
+    """Check if a checkpoint file exists (relative to repo root)."""
+    import pathlib
+    repo = pathlib.Path(__file__).resolve().parents[2]
+    return (repo / path).is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -111,28 +101,69 @@ def _make_hdf5(tmp_path, num_demos=2, demo_len=25):
     return path
 
 
+def _make_bridge(**kwargs):
+    """Create a Stage1Bridge with mock encoder."""
+    defaults = dict(pretrained_encoder=False, load_decoder=False)
+    defaults.update(kwargs)
+    return Stage1Bridge(**defaults)
+
+
+def _make_policy(**kwargs):
+    """Create a PolicyDiT with mock encoder and small architecture."""
+    bridge = _make_bridge(load_decoder=kwargs.pop("load_decoder", False))
+    defaults = dict(
+        bridge=bridge,
+        ac_dim=AC_DIM,
+        proprio_dim=PROPRIO_DIM,
+        hidden_dim=D_MODEL,
+        T_obs=T_O,
+        T_pred=T_P,
+        num_blocks=2,
+        nhead=8,
+        num_views=K,
+        train_diffusion_steps=100,
+        eval_diffusion_steps=5,
+        p_view_drop=0.0,
+        lambda_recon=0.0,
+        use_lightning=True,
+    )
+    defaults.update(kwargs)
+    return PolicyDiT(**defaults)
+
+
+def _make_batch(b=B, t_o=T_O, k=K, t_p=T_P, ac_dim=AC_DIM, d_prop=PROPRIO_DIM):
+    """Create a fake training batch."""
+    return {
+        "images_enc": torch.randn(b, t_o, k, 3, H, W),
+        "proprio": torch.randn(b, t_o, d_prop),
+        "actions": torch.randn(b, t_p, ac_dim),
+        "view_present": torch.ones(b, k, dtype=torch.bool),
+        "images_target": torch.rand(b, t_o, k, 3, H, W),
+    }
+
+
+def _make_obs(b=B, t_o=T_O, k=K, d_prop=PROPRIO_DIM):
+    """Create a fake observation dict for inference."""
+    return {
+        "images_enc": torch.randn(b, t_o, k, 3, H, W),
+        "proprio": torch.randn(b, t_o, d_prop),
+        "view_present": torch.ones(b, k, dtype=torch.bool),
+    }
+
+
 # ============================================================
 # C.1 BasePolicy interface tests
 # ============================================================
 
 class TestBasePolicy:
-    """Tests for C.1 BasePolicy abstract interface.
+    """Tests for C.1 BasePolicy abstract interface."""
 
-    BasePolicy must:
-      - Be an nn.Module subclass
-      - Define compute_loss(batch) -> scalar tensor
-      - Define predict_action(obs) -> [B, T_p, D_act] tensor
-    """
-
-    @pytest.mark.skipif(_skip_c1 is not None, reason=_skip_c1 or "")
     def test_is_nn_module(self):
         assert issubclass(BasePolicy, nn.Module)
 
-    @pytest.mark.skipif(_skip_c1 is not None, reason=_skip_c1 or "")
     def test_has_compute_loss(self):
         assert hasattr(BasePolicy, "compute_loss")
 
-    @pytest.mark.skipif(_skip_c1 is not None, reason=_skip_c1 or "")
     def test_has_predict_action(self):
         assert hasattr(BasePolicy, "predict_action")
 
@@ -142,43 +173,39 @@ class TestBasePolicy:
 # ============================================================
 
 class TestStage1Bridge:
-    """Tests for C.2 Stage1Bridge.
+    """Tests for C.2 Stage1Bridge with mock encoder."""
 
-    Stage1Bridge must:
-      - Load a Stage 1 checkpoint (encoder + adapter + decoder)
-      - encode(images_enc, view_present) -> adapted tokens [B_real, 196, 512]
-      - Encoder must be frozen (no gradients)
-      - Adapter must be trainable (gradients flow)
-      - compute_recon_loss(adapted, images_target, view_present) -> scalar
-    """
-
-    @pytest.mark.skipif(_skip_c2 is not None, reason=_skip_c2 or "")
     def test_has_encode_method(self):
-        assert hasattr(Stage1Bridge, "encode") or hasattr(Stage1Bridge, "encode_frozen")
+        assert hasattr(Stage1Bridge, "encode")
 
-    @pytest.mark.skipif(_skip_c2 is not None, reason=_skip_c2 or "")
     def test_has_compute_recon_loss(self):
         assert hasattr(Stage1Bridge, "compute_recon_loss")
 
-    @pytest.mark.skipif(_skip_c2 is not None, reason=_skip_c2 or "")
     def test_encode_output_shape(self):
-        """encode() should return tokens of shape [B_real, 196, 512]."""
-        # Requires a Stage 1 checkpoint — use mock mode if available
-        bridge = Stage1Bridge(checkpoint_path=None, pretrained=False)
-        images = torch.randn(B, K, 3, H, W)
-        vp = torch.tensor([[True, True, False, False]] * B)
+        """encode() returns (B, T_o, K, N, d') adapted tokens."""
+        bridge = _make_bridge()
+        images = torch.randn(B, T_O, K, 3, H, W)
+        vp = torch.ones(B, K, dtype=torch.bool)
         adapted = bridge.encode(images, vp)
-        B_real = vp.sum().item()  # total real views across batch
-        assert adapted.shape == (B_real, N, D_MODEL), (
-            f"Expected ({B_real}, {N}, {D_MODEL}), got {adapted.shape}"
+        assert adapted.shape == (B, T_O, K, N, D_MODEL), (
+            f"Expected ({B}, {T_O}, {K}, {N}, {D_MODEL}), got {adapted.shape}"
         )
 
-    @pytest.mark.skipif(_skip_c2 is not None, reason=_skip_c2 or "")
+    def test_encode_partial_views(self):
+        """Absent views are zero-filled in output."""
+        bridge = _make_bridge()
+        images = torch.randn(B, T_O, K, 3, H, W)
+        vp = torch.tensor([[True, True, False, False]] * B)
+        adapted = bridge.encode(images, vp)
+        assert adapted.shape == (B, T_O, K, N, D_MODEL)
+        # Absent views should be zero
+        assert torch.all(adapted[:, :, 2:] == 0)
+
     def test_encoder_frozen_no_grad(self):
         """Encoder parameters should not receive gradients."""
-        bridge = Stage1Bridge(checkpoint_path=None, pretrained=False)
-        images = torch.randn(B, K, 3, H, W)
-        vp = torch.tensor([[True, True, False, False]] * B)
+        bridge = _make_bridge()
+        images = torch.randn(B, T_O, K, 3, H, W)
+        vp = torch.ones(B, K, dtype=torch.bool)
         adapted = bridge.encode(images, vp)
         adapted.sum().backward()
         for name, p in bridge.encoder.named_parameters():
@@ -186,12 +213,11 @@ class TestStage1Bridge:
                 f"Encoder param {name} should be frozen"
             )
 
-    @pytest.mark.skipif(_skip_c2 is not None, reason=_skip_c2 or "")
     def test_adapter_receives_grad(self):
         """Adapter parameters should receive gradients."""
-        bridge = Stage1Bridge(checkpoint_path=None, pretrained=False)
-        images = torch.randn(B, K, 3, H, W)
-        vp = torch.tensor([[True, True, False, False]] * B)
+        bridge = _make_bridge()
+        images = torch.randn(B, T_O, K, 3, H, W)
+        vp = torch.ones(B, K, dtype=torch.bool)
         adapted = bridge.encode(images, vp)
         adapted.sum().backward()
         has_grad = any(
@@ -206,19 +232,10 @@ class TestStage1Bridge:
 # ============================================================
 
 class TestTokenAssembly:
-    """Tests for C.4 TokenAssembly.
+    """Tests for C.4 TokenAssembly embeddings and assembly."""
 
-    TokenAssembly must:
-      - Accept adapted_tokens [B, T_o, K, N, d'], proprio [B, T_o, D_prop],
-        view_present [B, K]
-      - Return obs_tokens [B, S_obs, d'] (batch-first!)
-        where S_obs = T_o * K_real * N + T_o (visual + proprio tokens)
-      - Add spatial_pos_emb, view_emb, obs_time_emb, proprio MLP embeddings
-    """
-
-    @pytest.mark.skipif(_skip_c4 is not None, reason=_skip_c4 or "")
     def test_output_shape_all_views(self):
-        """With 4 real views: S_obs = T_o * K * N + T_o = 2*4*196+2 = 1570."""
+        """All views present: S_obs = T_o * K * N + T_o = 2*4*196+2 = 1570."""
         ta = TokenAssembly(d_model=D_MODEL, num_patches=N, num_views=K,
                            num_obs_steps=T_O, proprio_dim=PROPRIO_DIM)
         adapted = torch.randn(B, T_O, K, N, D_MODEL)
@@ -226,37 +243,30 @@ class TestTokenAssembly:
         vp = torch.ones(B, K, dtype=torch.bool)
         out = ta(adapted, proprio, vp)
         expected_S = T_O * K * N + T_O  # 1570
-        assert out.shape == (B, expected_S, D_MODEL), (
-            f"Expected (B, {expected_S}, {D_MODEL}), got {out.shape}"
-        )
+        assert out.shape == (B, expected_S, D_MODEL)
 
-    @pytest.mark.skipif(_skip_c4 is not None, reason=_skip_c4 or "")
-    def test_output_shape_partial_views(self):
-        """With 2 real views: S_obs = T_o * 2 * N + T_o = 2*2*196+2 = 786."""
+    def test_output_shape_fixed_length(self):
+        """Even with partial views, sequence length is fixed (all K views included)."""
         ta = TokenAssembly(d_model=D_MODEL, num_patches=N, num_views=K,
                            num_obs_steps=T_O, proprio_dim=PROPRIO_DIM)
         adapted = torch.randn(B, T_O, K, N, D_MODEL)
         proprio = torch.randn(B, T_O, PROPRIO_DIM)
         vp = torch.tensor([[True, True, False, False]] * B)
         out = ta(adapted, proprio, vp)
-        expected_S = T_O * 2 * N + T_O  # 786
-        assert out.shape == (B, expected_S, D_MODEL), (
-            f"Expected (B, {expected_S}, {D_MODEL}), got {out.shape}"
-        )
+        # Fixed length regardless of view_present
+        expected_S = T_O * K * N + T_O  # 1570
+        assert out.shape == (B, expected_S, D_MODEL)
 
-    @pytest.mark.skipif(_skip_c4 is not None, reason=_skip_c4 or "")
     def test_output_is_batch_first(self):
-        """Output must be batch-first [B, S, d] (C.0 converted everything)."""
+        """Output must be batch-first [B, S, d]."""
         ta = TokenAssembly(d_model=D_MODEL, num_patches=N, num_views=K,
                            num_obs_steps=T_O, proprio_dim=PROPRIO_DIM)
         adapted = torch.randn(B, T_O, K, N, D_MODEL)
         proprio = torch.randn(B, T_O, PROPRIO_DIM)
         vp = torch.ones(B, K, dtype=torch.bool)
         out = ta(adapted, proprio, vp)
-        # First dim should be batch (B=2), not sequence
         assert out.shape[0] == B
 
-    @pytest.mark.skipif(_skip_c4 is not None, reason=_skip_c4 or "")
     def test_gradient_flows(self):
         """Gradients flow through token assembly to adapted tokens."""
         ta = TokenAssembly(d_model=D_MODEL, num_patches=N, num_views=K,
@@ -275,81 +285,46 @@ class TestTokenAssembly:
 # ============================================================
 
 class TestPolicyDiT:
-    """Tests for C.10 PolicyDiT wrapper.
+    """Tests for C.10 PolicyDiT wrapper with mock encoder."""
 
-    PolicyDiT must:
-      - Wrap Stage1Bridge + ViewDropout + TokenAssembly + _DiTNoiseNet
-      - compute_loss(batch) -> finite scalar
-      - predict_action(obs) -> [B, T_p, D_act]
-      - Pass batch-first tensors (NO transpose after C.0)
-      - Gradient reaches adapter but NOT encoder
-    """
-
-    @pytest.mark.skipif(_skip_c10 is not None, reason=_skip_c10 or "")
     def test_compute_loss_finite(self):
         """compute_loss returns a finite scalar."""
-        config = Stage3Config(T_pred=T_P, hidden_dim=D_MODEL)
-        # Assumes PolicyDiT can be instantiated with mock mode
-        policy = PolicyDiT(config, stage1_bridge=None)  # mock
-        batch = {
-            "images_enc": torch.randn(B, T_O, K, 3, H, W),
-            "images_target": torch.rand(B, T_O, K, 3, H, W),
-            "actions": torch.randn(B, T_P, AC_DIM),
-            "proprio": torch.randn(B, T_O, PROPRIO_DIM),
-            "view_present": torch.ones(B, K, dtype=torch.bool),
-        }
+        policy = _make_policy()
+        batch = _make_batch()
         loss = policy.compute_loss(batch)
         assert loss.dim() == 0, "Loss should be a scalar"
         assert torch.isfinite(loss), f"Loss should be finite, got {loss.item()}"
 
-    @pytest.mark.skipif(_skip_c10 is not None, reason=_skip_c10 or "")
     def test_predict_action_shape(self):
-        """predict_action returns [B, T_p, D_act]."""
-        config = Stage3Config(T_pred=T_P, hidden_dim=D_MODEL)
-        policy = PolicyDiT(config, stage1_bridge=None)
+        """predict_action returns (B, T_pred, ac_dim)."""
+        policy = _make_policy()
         policy.eval()
-        obs = {
-            "images_enc": torch.randn(B, T_O, K, 3, H, W),
-            "proprio": torch.randn(B, T_O, PROPRIO_DIM),
-            "view_present": torch.ones(B, K, dtype=torch.bool),
-        }
+        obs = _make_obs()
         actions = policy.predict_action(obs)
-        assert actions.shape == (B, T_P, AC_DIM), (
-            f"Expected ({B}, {T_P}, {AC_DIM}), got {actions.shape}"
-        )
+        assert actions.shape == (B, T_P, AC_DIM)
 
-    @pytest.mark.skipif(_skip_c10 is not None, reason=_skip_c10 or "")
     def test_no_transpose_batch_first(self):
-        """After C.0, PolicyDiT should NOT transpose before noise_net.
-
-        noise_net now expects batch-first (B, S, d) tensors.
-        If you see a .transpose(0,1) call before noise_net, remove it.
-        """
-        config = Stage3Config(T_pred=T_P, hidden_dim=D_MODEL)
-        policy = PolicyDiT(config, stage1_bridge=None)
-        batch = {
-            "images_enc": torch.randn(B, T_O, K, 3, H, W),
-            "images_target": torch.rand(B, T_O, K, 3, H, W),
-            "actions": torch.randn(B, T_P, AC_DIM),
-            "proprio": torch.randn(B, T_O, PROPRIO_DIM),
-            "view_present": torch.ones(B, K, dtype=torch.bool),
-        }
-        # If this doesn't crash, the dims are compatible
+        """After C.0, PolicyDiT passes batch-first tensors directly to noise_net."""
+        policy = _make_policy()
+        batch = _make_batch()
+        # If dims are incompatible this would crash
         loss = policy.compute_loss(batch)
         assert torch.isfinite(loss)
 
-    @pytest.mark.skipif(_skip_c10 is not None, reason=_skip_c10 or "")
     def test_encoder_frozen_adapter_trainable(self):
-        """Gradient reaches adapter but NOT encoder through PolicyDiT."""
-        config = Stage3Config(T_pred=T_P, hidden_dim=D_MODEL)
-        policy = PolicyDiT(config, stage1_bridge=None)
-        batch = {
-            "images_enc": torch.randn(B, T_O, K, 3, H, W),
-            "images_target": torch.rand(B, T_O, K, 3, H, W),
-            "actions": torch.randn(B, T_P, AC_DIM),
-            "proprio": torch.randn(B, T_O, PROPRIO_DIM),
-            "view_present": torch.ones(B, K, dtype=torch.bool),
-        }
+        """Gradient reaches adapter but NOT encoder through PolicyDiT.
+
+        adaLN-Zero starts with zero modulation, blocking upstream gradients.
+        Perturb zero-init params to unblock gradient flow for this test.
+        """
+        policy = _make_policy()
+        # Perturb zero-initialized params so gradients flow
+        with torch.no_grad():
+            for p in policy.noise_net.parameters():
+                if p.requires_grad and torch.all(p == 0):
+                    p.add_(torch.randn_like(p) * 0.01)
+
+        batch = _make_batch()
         loss = policy.compute_loss(batch)
         loss.backward()
 
@@ -370,43 +345,23 @@ class TestPolicyDiT:
 # ============================================================
 
 class TestCrossComponentWiring:
-    """Tests that verify correct wiring between components.
+    """Tests that verify correct wiring between components."""
 
-    These catch shape mismatches, wrong dim orders, and missing embeddings
-    that only surface when components are connected.
-    """
-
-    @pytest.mark.skipif(
-        any(s is not None for s in [_skip_c2, _skip_c4]),
-        reason="Requires C.2 + C.4"
-    )
     def test_bridge_to_assembly_shapes(self):
         """Stage1Bridge output feeds into TokenAssembly without shape errors."""
-        bridge = Stage1Bridge(checkpoint_path=None, pretrained=False)
+        bridge = _make_bridge()
         ta = TokenAssembly(d_model=D_MODEL, num_patches=N, num_views=K,
                            num_obs_steps=T_O, proprio_dim=PROPRIO_DIM)
 
         images = torch.randn(B, T_O, K, 3, H, W)
-        vp = torch.tensor([[True, True, False, False]] * B)
+        vp = torch.ones(B, K, dtype=torch.bool)
         proprio = torch.randn(B, T_O, PROPRIO_DIM)
 
-        # Encode each timestep
-        adapted_list = []
-        for t in range(T_O):
-            adapted_t = bridge.encode(images[:, t], vp)
-            adapted_list.append(adapted_t)
+        adapted = bridge.encode(images, vp)  # (B, T_o, K, N, d')
+        obs_tokens = ta(adapted, proprio, vp)
+        expected_S = T_O * K * N + T_O
+        assert obs_tokens.shape == (B, expected_S, D_MODEL)
 
-        # Reshape to [B, T_o, K, N, d'] for TokenAssembly
-        # (Bridge returns [B_real, N, d'] — need to reconstruct per-view structure)
-        # This reshaping is part of PolicyDiT's job, but we test the shapes match
-        obs_tokens = ta(torch.randn(B, T_O, K, N, D_MODEL), proprio, vp)
-        assert obs_tokens.shape[0] == B
-        assert obs_tokens.shape[2] == D_MODEL
-
-    @pytest.mark.skipif(
-        any(s is not None for s in [_skip_c4]),
-        reason="Requires C.4"
-    )
     def test_assembly_to_noise_net_shapes(self):
         """TokenAssembly output feeds into noise_net.forward_enc without errors."""
         ta = TokenAssembly(d_model=D_MODEL, num_patches=N, num_views=K,
@@ -420,19 +375,37 @@ class TestCrossComponentWiring:
         proprio = torch.randn(B, T_O, PROPRIO_DIM)
         vp = torch.ones(B, K, dtype=torch.bool)
 
-        obs_tokens = ta(adapted, proprio, vp)  # [B, S_obs, d']
-
-        # This should work batch-first after C.0
+        obs_tokens = ta(adapted, proprio, vp)  # (B, S_obs, d')
         enc_cache = noise_net.forward_enc(obs_tokens)
         assert isinstance(enc_cache, list)
         assert enc_cache[0].shape[0] == B  # batch dim first
 
-    @pytest.mark.skipif(
-        any(s is not None for s in [_skip_c10]),
-        reason="Requires C.10"
-    )
+    def test_bridge_viewdrop_assembly_pipeline(self):
+        """Bridge → ViewDropout → TokenAssembly produces correct shapes."""
+        bridge = _make_bridge()
+        vd = ViewDropout(d_model=D_MODEL, p=0.5)
+        ta = TokenAssembly(d_model=D_MODEL, num_patches=N, num_views=K,
+                           num_obs_steps=T_O, proprio_dim=PROPRIO_DIM)
+
+        images = torch.randn(B, T_O, K, 3, H, W)
+        vp = torch.ones(B, K, dtype=torch.bool)
+        proprio = torch.randn(B, T_O, PROPRIO_DIM)
+
+        adapted = bridge.encode(images, vp)  # (B, T_o, K, N, d')
+
+        # ViewDropout expects (B, K, N, d') — reshape per timestep
+        B_, T_o, K_, N_, d_ = adapted.shape
+        flat = adapted.reshape(B_ * T_o, K_, N_, d_)
+        flat_vp = vp.unsqueeze(1).expand(-1, T_o, -1).reshape(B_ * T_o, K_)
+        dropped, new_vp = vd(flat, flat_vp)
+        dropped = dropped.reshape(B_, T_o, K_, N_, d_)
+
+        obs_tokens = ta(dropped, proprio, vp)
+        expected_S = T_O * K * N + T_O
+        assert obs_tokens.shape == (B, expected_S, D_MODEL)
+
     def test_full_pipeline_dataset_to_loss(self, tmp_path):
-        """Full pipeline: Stage3Dataset → PolicyDiT.compute_loss → finite scalar."""
+        """Full pipeline: Stage3Dataset -> PolicyDiT.compute_loss -> finite scalar."""
         from data_pipeline.datasets.stage3_dataset import Stage3Dataset
 
         hdf5_path = _make_hdf5(tmp_path)
@@ -440,20 +413,13 @@ class TestCrossComponentWiring:
         loader = torch.utils.data.DataLoader(ds, batch_size=B)
         batch = next(iter(loader))
 
-        config = Stage3Config(T_pred=T_P, hidden_dim=D_MODEL)
-        policy = PolicyDiT(config, stage1_bridge=None)
-
+        policy = _make_policy()
         loss = policy.compute_loss(batch)
         assert torch.isfinite(loss)
 
-    @pytest.mark.skipif(
-        any(s is not None for s in [_skip_c10]),
-        reason="Requires C.10"
-    )
     def test_full_pipeline_checkpoint_roundtrip(self, tmp_path):
         """Save and load a full PolicyDiT checkpoint."""
-        config = Stage3Config(T_pred=T_P, hidden_dim=D_MODEL)
-        policy = PolicyDiT(config, stage1_bridge=None)
+        policy = _make_policy()
         ema = EMA(policy.noise_net, decay=0.999)
         optimizer = torch.optim.AdamW(policy.parameters(), lr=1e-3)
 
@@ -465,3 +431,121 @@ class TestCrossComponentWiring:
             optimizer=optimizer, ema=ema, val_metrics={},
         )
         assert os.path.isfile(path)
+
+
+# ============================================================
+# Real checkpoint tests (skip if checkpoints not available)
+# ============================================================
+
+class TestRealCheckpoint:
+    """Tests with actual Stage 1 checkpoints.
+
+    These verify that Stage1Bridge can load real trained weights
+    and produce meaningful adapted tokens.
+    """
+
+    @pytest.mark.skipif(
+        not _ckpt_available(_CKPT_FULL),
+        reason=f"Checkpoint not found: {_CKPT_FULL}"
+    )
+    def test_load_full_checkpoint(self):
+        """Load the multi-task Stage 1 checkpoint (epoch 7, torch.compile prefix)."""
+        import pathlib
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        bridge = Stage1Bridge(
+            checkpoint_path=str(repo / _CKPT_FULL),
+            pretrained_encoder=False,  # mock encoder for speed
+            load_decoder=True,
+        )
+        # Adapter should have loaded weights
+        w = bridge.adapter.adapter[0].weight  # first Linear in nn.Sequential
+        assert w.shape == (1024, 1024)
+        # Decoder should be loaded
+        assert bridge.decoder is not None
+
+    @pytest.mark.skipif(
+        not _ckpt_available(_CKPT_5090),
+        reason=f"Checkpoint not found: {_CKPT_5090}"
+    )
+    def test_load_rtx5090_checkpoint(self):
+        """Load the RTX 5090 checkpoint (epoch 24, no compile prefix)."""
+        import pathlib
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        bridge = Stage1Bridge(
+            checkpoint_path=str(repo / _CKPT_5090),
+            pretrained_encoder=False,
+            load_decoder=True,
+        )
+        assert bridge.decoder is not None
+
+    @pytest.mark.skipif(
+        not _ckpt_available(_CKPT_FULL),
+        reason=f"Checkpoint not found: {_CKPT_FULL}"
+    )
+    def test_encode_with_real_adapter(self):
+        """Encoding with trained adapter produces non-zero adapted tokens."""
+        import pathlib
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        bridge = Stage1Bridge(
+            checkpoint_path=str(repo / _CKPT_FULL),
+            pretrained_encoder=False,  # mock encoder
+        )
+        images = torch.randn(1, T_O, K, 3, H, W)
+        vp = torch.ones(1, K, dtype=torch.bool)
+        adapted = bridge.encode(images, vp)
+        assert adapted.shape == (1, T_O, K, N, D_MODEL)
+        # Should be non-zero (trained adapter transforms random encoder output)
+        assert adapted.abs().mean() > 0.01
+
+    @pytest.mark.skipif(
+        not _ckpt_available(_CKPT_FULL),
+        reason=f"Checkpoint not found: {_CKPT_FULL}"
+    )
+    def test_full_policy_with_real_adapter(self):
+        """PolicyDiT with trained adapter produces finite loss."""
+        import pathlib
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        bridge = Stage1Bridge(
+            checkpoint_path=str(repo / _CKPT_FULL),
+            pretrained_encoder=False,
+        )
+        policy = PolicyDiT(
+            bridge=bridge,
+            ac_dim=AC_DIM,
+            proprio_dim=PROPRIO_DIM,
+            hidden_dim=D_MODEL,
+            T_obs=T_O,
+            T_pred=T_P,
+            num_blocks=2,
+            nhead=8,
+            num_views=K,
+            train_diffusion_steps=100,
+            eval_diffusion_steps=5,
+            p_view_drop=0.0,
+            lambda_recon=0.0,
+            use_lightning=True,
+        )
+        batch = _make_batch(b=1)
+        loss = policy.compute_loss(batch)
+        assert torch.isfinite(loss)
+
+    @pytest.mark.skipif(
+        not _ckpt_available(_CKPT_FULL),
+        reason=f"Checkpoint not found: {_CKPT_FULL}"
+    )
+    def test_cotrain_recon_with_real_decoder(self):
+        """Co-training with real decoder produces finite reconstruction loss."""
+        import pathlib
+        repo = pathlib.Path(__file__).resolve().parents[2]
+        bridge = Stage1Bridge(
+            checkpoint_path=str(repo / _CKPT_FULL),
+            pretrained_encoder=False,
+            load_decoder=True,
+        )
+        images = torch.randn(1, T_O, K, 3, H, W)
+        targets = torch.rand(1, T_O, K, 3, H, W)
+        vp = torch.ones(1, K, dtype=torch.bool)
+        adapted = bridge.encode(images, vp)
+        recon_loss = bridge.compute_recon_loss(adapted, targets, vp)
+        assert torch.isfinite(recon_loss)
+        assert recon_loss.item() > 0
