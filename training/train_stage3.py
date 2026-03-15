@@ -399,7 +399,7 @@ def train_stage3(
     if distributed:
         policy = nn.parallel.DistributedDataParallel(
             policy, device_ids=[local_rank],
-            find_unused_parameters=True,
+            find_unused_parameters=(config.lambda_recon > 0),  # only needed when decoder is conditionally used
         )
 
     # Dataset + DataLoader
