@@ -12,7 +12,17 @@ import torch.nn as nn
 
 
 class BasePolicy(nn.Module):
-    """Abstract base class for diffusion-based manipulation policies."""
+    """Abstract base class for diffusion-based manipulation policies.
+
+    Accepts **kwargs so subclasses like DiffusionTransformerAgent can pass
+    visual encoder config (features, feat_dim, n_cams, etc.) without crashing.
+    These are stored in self._base_config for introspection but not used here —
+    Stage1Bridge handles encoding in our pipeline.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__()
+        self._base_config = kwargs
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
         """Compute training loss for a batch.
