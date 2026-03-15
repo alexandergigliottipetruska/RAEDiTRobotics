@@ -165,7 +165,7 @@ def train_step(
     }
 
     with torch.amp.autocast(device_type, dtype=torch.bfloat16, enabled=use_amp):
-        loss = policy.compute_loss(batch_dev)
+        loss = policy(batch_dev)
 
     # Backward + optimizer step
     optimizer.zero_grad()

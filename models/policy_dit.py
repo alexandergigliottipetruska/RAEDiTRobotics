@@ -125,6 +125,10 @@ class PolicyDiT(BasePolicy):
 
         return obs_tokens, adapted_clean, vp_after
 
+    def forward(self, batch: dict) -> torch.Tensor:
+        """Forward pass for DDP compatibility. Delegates to compute_loss."""
+        return self.compute_loss(batch)
+
     def compute_loss(self, batch: dict) -> torch.Tensor:
         """Compute DDPM noise prediction loss.
 
