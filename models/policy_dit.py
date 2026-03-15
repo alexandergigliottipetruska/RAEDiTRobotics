@@ -97,17 +97,27 @@ class PolicyDiT(BasePolicy):
         )
 
     def _encode_and_assemble(
-        self, images_enc, proprio, view_present
+        self, batch, proprio, view_present
     ):
-        """Encode images, apply view dropout, assemble tokens.
+        """Encode images (or use cached tokens), apply view dropout, assemble.
+
+        Args:
+            batch: Full batch dict. Uses 'cached_tokens' if present,
+                   otherwise 'images_enc'.
+            proprio: (B, T_o, D_prop) normalized proprio.
+            view_present: (B, K) bool.
 
         Returns:
             obs_tokens: (B, S_obs, d') for the encoder.
             adapted_clean: (B, T_o, K, N, d') for optional recon loss.
             view_present_after: (B, K) after dropout.
         """
-        # Stage 1 encode: frozen encoder -> LN -> adapter
-        adapted = self.bridge.encode(images_enc, view_present)
+        if "cached_tokens" in batch:
+            # Fast path: skip encoder+LN, just run adapter
+            adapted = self.bridge.adapt(batch["cached_tokens"], view_present)
+        else:
+            # Standard path: frozen encoder -> LN -> adapter
+            adapted = self.bridge.encode(batch["images_enc"], view_present)
         adapted_clean = adapted  # save pre-dropout for recon loss
 
         # View dropout: (B, T_o, K, N, d') -> per-timestep dropout
@@ -134,7 +144,8 @@ class PolicyDiT(BasePolicy):
 
         Args:
             batch: Dict with keys:
-                images_enc: (B, T_o, K, 3, H, W) ImageNet-normalized
+                images_enc: (B, T_o, K, 3, H, W) ImageNet-normalized  [standard]
+                cached_tokens: (B, T_o, K, 196, 1024) precomputed     [cached]
                 proprio: (B, T_o, D_prop) normalized
                 actions: (B, T_p, D_act) normalized
                 view_present: (B, K) bool
@@ -143,14 +154,13 @@ class PolicyDiT(BasePolicy):
         Returns:
             Scalar total loss.
         """
-        images_enc = batch["images_enc"]
         proprio = batch["proprio"]
         actions = batch["actions"]
         view_present = batch["view_present"]
 
         # Encode + assemble
         obs_tokens, adapted_clean, vp_after = self._encode_and_assemble(
-            images_enc, proprio, view_present
+            batch, proprio, view_present
         )
 
         # DDPM forward
@@ -189,15 +199,19 @@ class PolicyDiT(BasePolicy):
         Returns:
             actions: (B, T_pred, ac_dim) predicted action chunk.
         """
-        images_enc = obs["images_enc"]
         proprio = obs["proprio"]
         view_present = obs["view_present"]
-        B = images_enc.shape[0]
-        device = images_enc.device
+        # Get batch size and device from whatever input is available
+        if "cached_tokens" in obs:
+            B = obs["cached_tokens"].shape[0]
+            device = obs["cached_tokens"].device
+        else:
+            B = obs["images_enc"].shape[0]
+            device = obs["images_enc"].device
 
         # Encode + assemble (no dropout at eval)
         obs_tokens, _, _ = self._encode_and_assemble(
-            images_enc, proprio, view_present
+            obs, proprio, view_present
         )
 
         # Cache encoder outputs

@@ -4,12 +4,18 @@ Samples (T_obs observation frames + T_pred action targets) from unified HDF5.
 Unlike Stage 1 (single timestep), Stage 3 needs temporal context for the
 observation encoder and action chunks for DDPM noise prediction.
 
+Supports two modes:
+  1. Standard: loads images, returns images_enc for encoder at train time.
+  2. Cached: loads precomputed encoder tokens (from precompute_tokens.py),
+     skips the expensive encoder forward pass entirely.
+
 Output per sample (dict):
-  images_enc:    (T_obs, K, 3, H, W)  float32, ImageNet-normalized
-  images_target: (T_obs, K, 3, H, W)  float32, [0, 1] range (for co-training L_recon)
-  actions:       (T_pred, D_act)       float32, normalized (zscore or minmax)
-  proprio:       (T_obs, D_prop)       float32, normalized (zscore or minmax)
-  view_present:  (K,)                  bool
+  images_enc:      (T_obs, K, 3, H, W)     float32, ImageNet-normalized  [standard mode]
+  cached_tokens:   (T_obs, K, 196, 1024)   float32, post-encoder/LN      [cached mode]
+  images_target:   (T_obs, K, 3, H, W)     float32, [0, 1] range         [standard mode only]
+  actions:         (T_pred, D_act)          float32, normalized
+  proprio:         (T_obs, D_prop)          float32, normalized
+  view_present:    (K,)                     bool
 
 Supports single or multiple HDF5 files for per-task or multi-task training.
 
@@ -38,6 +44,8 @@ class Stage3Dataset(Dataset):
 
     Args:
         hdf5_paths: Path or list of paths to unified HDF5 files.
+            Can be original (with images) or cached (with tokens).
+            Cached files are auto-detected via 'has_cached_tokens' attr.
         split:      "train" or "valid".
         T_obs:      Observation horizon (number of past frames).
         T_pred:     Prediction horizon (number of future actions).
@@ -66,6 +74,7 @@ class Stage3Dataset(Dataset):
         self._index = []  # list of (file_idx, demo_key, t)
         self._view_present_per_file = []
         self._norm_per_file = []  # per-file norm stats (action/proprio dims may differ)
+        self._cached_per_file = []  # bool per file: True if tokens are precomputed
 
         for file_idx, path in enumerate(self._hdf5_paths):
             # Load norm stats
@@ -86,6 +95,10 @@ class Stage3Dataset(Dataset):
             self._norm_per_file.append(file_norm)
 
             with h5py.File(path, "r") as f:
+                # Auto-detect cached tokens
+                is_cached = bool(f.attrs.get("has_cached_tokens", False))
+                self._cached_per_file.append(is_cached)
+
                 demo_keys = read_mask(f, split)
                 if len(demo_keys) == 0:
                     self._view_present_per_file.append(np.zeros(4, dtype=bool))
@@ -105,66 +118,94 @@ class Stage3Dataset(Dataset):
                     f[f"data/{demo_keys[0]}/view_present"][:]
                 )
 
+        # Log mode
+        n_cached = sum(self._cached_per_file)
+        if n_cached > 0:
+            import logging
+            logging.getLogger(__name__).info(
+                "Using precomputed tokens for %d/%d files", n_cached, len(self._hdf5_paths)
+            )
+
     def __len__(self) -> int:
         return len(self._index)
 
     def __getitem__(self, idx: int) -> dict:
         file_idx, demo_key, t = self._index[idx]
         T_obs, T_pred = self.T_obs, self.T_pred
+        is_cached = self._cached_per_file[file_idx]
 
         with h5py.File(self._hdf5_paths[file_idx], "r") as f:
             grp = f[f"data/{demo_key}"]
 
             # --- Observations: frames [t - T_obs + 1, ..., t] ---
             obs_start = max(0, t - T_obs + 1)
-            imgs_slice    = grp["images"][obs_start : t + 1]    # (<=T_obs, K, H, W, 3)
             proprio_slice = grp["proprio"][obs_start : t + 1]   # (<=T_obs, D_prop)
 
+            if is_cached:
+                tokens_slice = grp["tokens"][obs_start : t + 1]  # (<=T_obs, K, 196, 1024) float16
+            else:
+                imgs_slice = grp["images"][obs_start : t + 1]    # (<=T_obs, K, H, W, 3)
+
             # Start padding: repeat first available frame
-            pad_before = T_obs - imgs_slice.shape[0]
+            actual_len = proprio_slice.shape[0]
+            pad_before = T_obs - actual_len
             if pad_before > 0:
-                imgs_raw = np.concatenate(
-                    [np.repeat(imgs_slice[:1], pad_before, axis=0), imgs_slice],
-                    axis=0,
-                )
                 proprio_raw = np.concatenate(
                     [np.repeat(proprio_slice[:1], pad_before, axis=0), proprio_slice],
                     axis=0,
                 )
+                if is_cached:
+                    tokens_raw = np.concatenate(
+                        [np.repeat(tokens_slice[:1], pad_before, axis=0), tokens_slice],
+                        axis=0,
+                    )
+                else:
+                    imgs_raw = np.concatenate(
+                        [np.repeat(imgs_slice[:1], pad_before, axis=0), imgs_slice],
+                        axis=0,
+                    )
             else:
-                imgs_raw    = imgs_slice
                 proprio_raw = proprio_slice
+                if is_cached:
+                    tokens_raw = tokens_slice
+                else:
+                    imgs_raw = imgs_slice
 
             # --- Actions: frames [t, ..., t + T_pred - 1] ---
-            # No end padding needed — index construction guarantees T_pred actions
             actions_raw = grp["actions"][t : t + T_pred]  # (T_pred, D_act)
-
-        # --- Image processing ---
-        # Convert to float32 [0, 1]
-        if imgs_raw.dtype == np.uint8:
-            imgs_01 = imgs_raw.astype(np.float32) / 255.0
-        else:
-            imgs_01 = imgs_raw.astype(np.float32)
-
-        # Raw target: HWC -> CHW for co-training L_recon
-        images_target = np.moveaxis(imgs_01, -1, -3)  # (T_obs, K, 3, H, W)
-
-        # ImageNet-normalized: for frozen encoder input
-        images_enc = (imgs_01 - _IMAGENET_MEAN) / _IMAGENET_STD
-        images_enc = np.moveaxis(images_enc, -1, -3)  # (T_obs, K, 3, H, W)
 
         # --- Normalize actions and proprio ---
         norm = self._norm_per_file[file_idx]
         actions = self._normalize(actions_raw, norm["actions"])
         proprio = self._normalize(proprio_raw, norm["proprio"])
 
-        return {
-            "images_enc":    torch.from_numpy(images_enc),
-            "images_target": torch.from_numpy(images_target),
-            "actions":       torch.from_numpy(actions.astype(np.float32)),
-            "proprio":       torch.from_numpy(proprio.astype(np.float32)),
-            "view_present":  torch.from_numpy(self._view_present_per_file[file_idx]),
+        result = {
+            "actions":      torch.from_numpy(actions.astype(np.float32)),
+            "proprio":      torch.from_numpy(proprio.astype(np.float32)),
+            "view_present": torch.from_numpy(self._view_present_per_file[file_idx]),
         }
+
+        if is_cached:
+            # Return precomputed tokens (cast float16 -> float32)
+            result["cached_tokens"] = torch.from_numpy(tokens_raw.astype(np.float32))
+        else:
+            # Process images
+            if imgs_raw.dtype == np.uint8:
+                imgs_01 = imgs_raw.astype(np.float32) / 255.0
+            else:
+                imgs_01 = imgs_raw.astype(np.float32)
+
+            # Raw target: HWC -> CHW for co-training L_recon
+            images_target = np.moveaxis(imgs_01, -1, -3)  # (T_obs, K, 3, H, W)
+
+            # ImageNet-normalized: for frozen encoder input
+            images_enc = (imgs_01 - _IMAGENET_MEAN) / _IMAGENET_STD
+            images_enc = np.moveaxis(images_enc, -1, -3)  # (T_obs, K, 3, H, W)
+
+            result["images_enc"] = torch.from_numpy(images_enc)
+            result["images_target"] = torch.from_numpy(images_target)
+
+        return result
 
     def _normalize(self, x: np.ndarray, stats: dict) -> np.ndarray:
         """Normalize using zscore or minmax."""

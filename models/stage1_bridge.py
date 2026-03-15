@@ -151,6 +151,45 @@ class Stage1Bridge(nn.Module):
 
         return adapted
 
+    def adapt(
+        self,
+        cached_tokens: torch.Tensor,
+        view_present: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run adapter on precomputed encoder tokens (skips encoder + LN).
+
+        Args:
+            cached_tokens: (B, T_o, K, 196, 1024) precomputed post-encoder/LN tokens.
+            view_present: (B, K) bool mask of real cameras.
+
+        Returns:
+            adapted: (B, T_o, K, N, d') adapted tokens.
+        """
+        B, T_o, K, N, d_enc = cached_tokens.shape
+        d_prime = 512
+        device = cached_tokens.device
+
+        adapted = None
+
+        for t in range(T_o):
+            for k in range(K):
+                mask = view_present[:, k]
+                if not mask.any():
+                    continue
+
+                tokens_k = cached_tokens[mask, t, k]  # (B_real, 196, 1024)
+                tokens = self.adapter(tokens_k)  # (B_real, 196, 512)
+
+                if adapted is None:
+                    adapted = torch.zeros(B, T_o, K, N, d_prime,
+                                          device=device, dtype=tokens.dtype)
+                adapted[mask, t, k] = tokens
+
+        if adapted is None:
+            adapted = torch.zeros(B, T_o, K, N, d_prime, device=device)
+
+        return adapted
+
     def compute_recon_loss(
         self,
         adapted: torch.Tensor,
