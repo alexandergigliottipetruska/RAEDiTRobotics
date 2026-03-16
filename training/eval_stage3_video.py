@@ -141,6 +141,8 @@ def main():
     parser.add_argument("--num_episodes", type=int, default=3)
     parser.add_argument("--max_steps", type=int, default=400)
     parser.add_argument("--exec_horizon", type=int, default=8)
+    parser.add_argument("--eval_steps", type=int, default=10,
+                        help="DDIM denoising steps (try 100 for diagnostic)")
     parser.add_argument("--norm_mode", default="minmax")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output_dir", default="eval_videos")
@@ -154,6 +156,12 @@ def main():
     # Load policy
     log.info("Loading policy from %s", args.checkpoint)
     policy = load_policy(args.checkpoint, args.stage1_checkpoint, device)
+
+    # Override eval diffusion steps if requested
+    if args.eval_steps != policy._eval_steps:
+        log.info("Overriding eval_diffusion_steps: %d -> %d", policy._eval_steps, args.eval_steps)
+        policy._eval_steps = args.eval_steps
+
     wrapper = Stage3PolicyWrapper(policy, ema=None, device=device)
 
     # Load norm stats
