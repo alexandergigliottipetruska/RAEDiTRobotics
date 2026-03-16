@@ -1,8 +1,7 @@
 """Robosuite environment wrapper for evaluation.
 
 Wraps a robosuite environment to implement the BaseManipulationEnv interface.
-Extracts agentview + wrist images, resizes to 224x224, applies ImageNet
-normalization, and pads to 4 camera slots.
+Extracts agentview + wrist images, resizes to 224x224, and pads to 4 camera slots.
 
 Gripper action is continuous [-1, 1] and passed through as-is.
 """
@@ -11,10 +10,6 @@ import numpy as np
 from PIL import Image
 
 from data_pipeline.envs.base_env import BaseManipulationEnv
-
-# ImageNet normalization constants
-_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 # Camera mapping: robomimic uses 2 of 4 slots
 # slot 0: agentview, slot 1: empty, slot 2: empty, slot 3: wrist
@@ -105,7 +100,7 @@ class RobomimicWrapper(BaseManipulationEnv):
         return obs, reward, done, info
 
     def get_multiview_images(self) -> np.ndarray:
-        """Return [1, 4, 3, 224, 224] with slots 0,3 filled, 1,2 zeroed."""
+        """Return [1, 4, 3, 224, 224] float32 [0,1] with slots 0,3 filled, 1,2 zeroed."""
         result = np.zeros(
             (1, 4, 3, self._image_size, self._image_size), dtype=np.float32
         )
