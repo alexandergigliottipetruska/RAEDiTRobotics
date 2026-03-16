@@ -49,9 +49,21 @@ def _make_policy(**kwargs):
         p_view_drop=0.0,
         lambda_recon=0.0,
         use_lightning=True,
+        policy_type="ddpm",
     )
     defaults.update(kwargs)
     return PolicyDiT(**defaults)
+
+
+def _make_fm_policy(**kwargs):
+    """Create a flow matching PolicyDiT with mock encoder."""
+    defaults = dict(
+        policy_type="flow_matching",
+        num_flow_steps=5,
+        fm_timestep_scale=1000.0,
+    )
+    defaults.update(kwargs)
+    return _make_policy(**defaults)
 
 
 def _make_batch(b=B, t_o=T_O, k=K, t_p=T_P, ac_dim=AC_DIM, d_prop=D_PROP):
@@ -348,3 +360,195 @@ class TestEdgeCases:
         batch = _make_batch(ac_dim=8, k=4)
         loss = policy.compute_loss(batch)
         assert torch.isfinite(loss)
+
+
+# ============================================================
+# Flow matching tests
+# ============================================================
+
+class TestFlowMatchingInterpolation:
+    def test_at_tau_zero_gives_noise(self):
+        """At tau=0, x_tau = 0*a_0 + 1*eps = eps (pure noise)."""
+        a_0 = torch.randn(2, T_P, AC_DIM)
+        eps = torch.randn_like(a_0)
+        tau = torch.zeros(2)
+        tau_expand = tau[:, None, None]
+        x_tau = tau_expand * a_0 + (1.0 - tau_expand) * eps
+        assert torch.allclose(x_tau, eps)
+
+    def test_at_tau_one_gives_clean(self):
+        """At tau=1, x_tau = 1*a_0 + 0*eps = a_0 (clean actions)."""
+        a_0 = torch.randn(2, T_P, AC_DIM)
+        eps = torch.randn_like(a_0)
+        tau = torch.ones(2)
+        tau_expand = tau[:, None, None]
+        x_tau = tau_expand * a_0 + (1.0 - tau_expand) * eps
+        assert torch.allclose(x_tau, a_0)
+
+    def test_velocity_target_independent_of_tau(self):
+        """Velocity target v = a_0 - eps does not depend on tau."""
+        a_0 = torch.randn(2, T_P, AC_DIM)
+        eps = torch.randn_like(a_0)
+        v = a_0 - eps
+        assert v.shape == a_0.shape
+        # Verify it's just a_0 - eps regardless
+        assert torch.allclose(v, a_0 - eps)
+
+
+class TestFlowMatchingTimestepSampling:
+    def test_beta_stays_in_range(self):
+        """Beta distribution samples stay in [0, s]."""
+        policy = _make_fm_policy()
+        tau = policy._sample_flow_timestep(1000, torch.device("cpu"))
+        assert tau.min() >= 0.0
+        assert tau.max() <= policy.fm_cutoff + 1e-6
+
+    def test_uniform_stays_in_range(self):
+        """Uniform samples stay in [0, 1)."""
+        policy = _make_fm_policy(fm_timestep_dist="uniform")
+        tau = policy._sample_flow_timestep(1000, torch.device("cpu"))
+        assert tau.min() >= 0.0
+        assert tau.max() < 1.0
+
+    def test_beta_biases_low(self):
+        """Beta(1.5, 1) distribution biases toward low tau (near noise)."""
+        policy = _make_fm_policy()
+        tau = policy._sample_flow_timestep(10000, torch.device("cpu"))
+        # Median should be below 0.5 since beta(1.5,1) is left-skewed after 1-u transform
+        assert tau.median() < 0.5
+
+
+class TestFlowMatchingComputeLoss:
+    def test_returns_scalar(self):
+        """Flow matching compute_loss returns a scalar."""
+        policy = _make_fm_policy()
+        batch = _make_batch()
+        loss = policy.compute_loss(batch)
+        assert loss.dim() == 0
+        assert loss.requires_grad
+
+    def test_loss_is_finite(self):
+        """Loss is finite."""
+        policy = _make_fm_policy()
+        batch = _make_batch()
+        loss = policy.compute_loss(batch)
+        assert torch.isfinite(loss)
+
+    def test_loss_positive(self):
+        """MSE velocity loss is always positive."""
+        policy = _make_fm_policy()
+        batch = _make_batch()
+        loss = policy.compute_loss(batch)
+        assert loss.item() > 0
+
+    def test_backward_runs(self):
+        """Backward pass completes."""
+        policy = _make_fm_policy()
+        batch = _make_batch()
+        loss = policy.compute_loss(batch)
+        loss.backward()
+
+    def test_8d_actions(self):
+        """Works with 8D RLBench actions."""
+        policy = _make_fm_policy(ac_dim=8)
+        batch = _make_batch(ac_dim=8)
+        loss = policy.compute_loss(batch)
+        assert torch.isfinite(loss)
+
+    def test_uniform_timestep_dist(self):
+        """Works with uniform timestep distribution."""
+        policy = _make_fm_policy(fm_timestep_dist="uniform")
+        batch = _make_batch()
+        loss = policy.compute_loss(batch)
+        assert torch.isfinite(loss)
+
+
+class TestFlowMatchingPredictAction:
+    def test_output_shape(self):
+        """predict_action returns (B, T_pred, ac_dim)."""
+        policy = _make_fm_policy()
+        policy.eval()
+        obs = _make_obs()
+        actions = policy.predict_action(obs)
+        assert actions.shape == (B, T_P, AC_DIM)
+
+    def test_output_finite(self):
+        """Predicted actions are finite."""
+        policy = _make_fm_policy()
+        policy.eval()
+        obs = _make_obs()
+        actions = policy.predict_action(obs)
+        assert torch.isfinite(actions).all()
+
+    def test_deterministic_with_seed(self):
+        """Same seed produces same actions."""
+        policy = _make_fm_policy()
+        policy.eval()
+        obs = _make_obs()
+        torch.manual_seed(42)
+        a1 = policy.predict_action(obs)
+        torch.manual_seed(42)
+        a2 = policy.predict_action(obs)
+        assert torch.equal(a1, a2)
+
+    def test_no_grad_during_inference(self):
+        """predict_action does not accumulate gradients."""
+        policy = _make_fm_policy()
+        policy.eval()
+        obs = _make_obs()
+        actions = policy.predict_action(obs)
+        assert not actions.requires_grad
+
+
+class TestFlowMatchingGradientFlow:
+    def test_encoder_frozen(self):
+        """Encoder receives no gradients in flow matching."""
+        policy = _make_fm_policy()
+        batch = _make_batch()
+        loss = policy.compute_loss(batch)
+        loss.backward()
+        for p in policy.bridge.encoder.parameters():
+            assert p.grad is None or torch.all(p.grad == 0)
+
+    def test_noise_net_receives_grad(self):
+        """Noise net receives gradients in flow matching."""
+        policy = _make_fm_policy()
+        batch = _make_batch()
+        loss = policy.compute_loss(batch)
+        loss.backward()
+        has_grad = any(
+            p.grad is not None and not torch.all(p.grad == 0)
+            for p in policy.noise_net.parameters()
+        )
+        assert has_grad, "Noise net should receive gradients"
+
+
+class TestFlowMatchingCoTraining:
+    def test_recon_loss_added(self):
+        """With lambda_recon > 0, flow matching includes reconstruction."""
+        policy = _make_fm_policy(lambda_recon=0.1, load_decoder=True)
+        batch = _make_batch()
+        loss = policy.compute_loss(batch)
+        assert torch.isfinite(loss)
+
+
+class TestFlowMatchingEulerConvergence:
+    def test_perfect_velocity_single_step(self):
+        """With a perfect velocity predictor, single Euler step recovers a_0.
+
+        If v(x, tau) = a_0 - eps (constant), then:
+          x_0 = eps
+          x_1 = eps + 1.0 * (a_0 - eps) = a_0
+        """
+        a_0 = torch.randn(1, T_P, AC_DIM)
+        eps = torch.randn_like(a_0)
+        # Single step: x = eps + dt * (a_0 - eps), dt = 1.0
+        x = eps + 1.0 * (a_0 - eps)
+        assert torch.allclose(x, a_0, atol=1e-6)
+
+
+class TestPolicyTypeValidation:
+    def test_invalid_policy_type_raises(self):
+        """Invalid policy_type raises AssertionError."""
+        with pytest.raises(AssertionError, match="policy_type"):
+            _make_policy(policy_type="invalid")

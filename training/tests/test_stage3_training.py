@@ -49,7 +49,7 @@ NUM_BLOCKS = 1
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_policy(p_view_drop=0.0, lambda_recon=0.0):
+def _make_policy(p_view_drop=0.0, lambda_recon=0.0, policy_type="ddpm"):
     """Create a PolicyDiT with mock encoder (no HuggingFace download)."""
     bridge = Stage1Bridge(
         pretrained_encoder=False,
@@ -69,6 +69,8 @@ def _make_policy(p_view_drop=0.0, lambda_recon=0.0):
         eval_diffusion_steps=10,
         p_view_drop=p_view_drop,
         lambda_recon=lambda_recon,
+        policy_type=policy_type,
+        num_flow_steps=5,
     )
 
 
@@ -697,3 +699,79 @@ class TestFullPipeline:
 
         for p1, p2 in zip(decoder.parameters(), decoder2.parameters()):
             assert torch.equal(p1, p2)
+
+
+# ============================================================
+# Flow matching training tests
+# ============================================================
+
+class TestFlowMatchingTrainStep:
+    def test_loss_is_finite(self):
+        """Flow matching training step produces finite loss."""
+        policy = _make_policy(policy_type="flow_matching")
+        config = _make_config()
+        optimizer = _make_optimizer(policy)
+
+        batch = _make_batch()
+        losses = train_step(batch, policy, optimizer, config, global_step=0)
+        assert "policy" in losses
+        assert np.isfinite(losses["policy"])
+        assert losses["policy"] > 0
+
+    def test_loss_decreasing_overfit(self):
+        """Flow matching loss decreases when overfitting on a single batch."""
+        torch.manual_seed(42)
+        policy = _make_policy(policy_type="flow_matching")
+        config = _make_config(lr=5e-3, lr_adapter=5e-3)
+        optimizer = _make_optimizer(policy, lr=5e-3)
+
+        batch = _make_batch()
+        losses_list = []
+        for step in range(150):
+            losses = train_step(batch, policy, optimizer, config, global_step=step)
+            losses_list.append(losses["policy"])
+
+        n = len(losses_list)
+        avg_first = np.mean(losses_list[:n // 3])
+        avg_last = np.mean(losses_list[-n // 3:])
+        assert avg_last < avg_first, (
+            f"FM loss did not decrease: first_third={avg_first:.4f} -> last_third={avg_last:.4f}"
+        )
+
+    def test_with_view_dropout(self):
+        """Flow matching works with view dropout enabled."""
+        policy = _make_policy(p_view_drop=0.3, policy_type="flow_matching")
+        config = _make_config(p=0.3)
+        optimizer = _make_optimizer(policy)
+
+        batch = _make_batch()
+        losses = train_step(batch, policy, optimizer, config, global_step=0)
+        assert np.isfinite(losses["policy"])
+
+    def test_co_training(self):
+        """Flow matching co-training with lambda_recon > 0."""
+        policy = _make_policy(lambda_recon=0.1, policy_type="flow_matching")
+        config = _make_config(lambda_recon=0.1)
+        optimizer = _make_optimizer(policy)
+
+        batch = _make_batch(include_target=True)
+        losses = train_step(batch, policy, optimizer, config, global_step=0)
+        assert np.isfinite(losses["policy"])
+        assert losses["policy"] > 0
+
+
+class TestFlowMatchingConfig:
+    def test_default_is_flow_matching(self):
+        """Default policy_type is flow_matching."""
+        config = Stage3Config()
+        assert config.policy_type == "flow_matching"
+
+    def test_fm_config_fields(self):
+        """Flow matching config fields have expected defaults."""
+        config = Stage3Config()
+        assert config.fm_timestep_dist == "beta"
+        assert config.fm_timestep_scale == 1000.0
+        assert config.fm_beta_a == 1.5
+        assert config.fm_beta_b == 1.0
+        assert config.fm_cutoff == 0.999
+        assert config.num_flow_steps == 10

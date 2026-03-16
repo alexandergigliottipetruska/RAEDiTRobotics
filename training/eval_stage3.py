@@ -48,6 +48,8 @@ def load_policy(
     )
 
     # Create policy with default architecture
+    # NOTE: policy_type should match what the checkpoint was trained with.
+    # Existing checkpoints use DDPM; new ones may use flow_matching.
     policy = PolicyDiT(
         bridge=bridge,
         ac_dim=7,
@@ -60,6 +62,7 @@ def load_policy(
         num_views=4,
         train_diffusion_steps=100,
         eval_diffusion_steps=10,
+        policy_type="ddpm",
     )
 
     # Load Stage 3 checkpoint (noise_net + adapter weights)

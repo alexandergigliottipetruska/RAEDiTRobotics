@@ -126,6 +126,7 @@ def _make_policy(**kwargs):
         p_view_drop=0.0,
         lambda_recon=0.0,
         use_lightning=True,
+        policy_type="ddpm",
     )
     defaults.update(kwargs)
     return PolicyDiT(**defaults)
@@ -524,6 +525,7 @@ class TestRealCheckpoint:
             p_view_drop=0.0,
             lambda_recon=0.0,
             use_lightning=True,
+            policy_type="ddpm",
         )
         batch = _make_batch(b=1)
         loss = policy.compute_loss(batch)

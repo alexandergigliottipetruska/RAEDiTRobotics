@@ -64,6 +64,22 @@ def main():
     parser.add_argument("--train_diffusion_steps", type=int, default=100)
     parser.add_argument("--eval_diffusion_steps", type=int, default=10)
 
+    # Policy type
+    parser.add_argument("--policy_type", default="flow_matching",
+                        choices=["ddpm", "flow_matching"],
+                        help="Policy formulation: ddpm or flow_matching (default)")
+
+    # Flow matching
+    parser.add_argument("--fm_timestep_dist", default="beta",
+                        choices=["uniform", "beta"],
+                        help="Timestep distribution for flow matching")
+    parser.add_argument("--fm_timestep_scale", type=float, default=1000.0)
+    parser.add_argument("--fm_beta_a", type=float, default=1.5)
+    parser.add_argument("--fm_beta_b", type=float, default=1.0)
+    parser.add_argument("--fm_cutoff", type=float, default=0.999)
+    parser.add_argument("--num_flow_steps", type=int, default=10,
+                        help="Euler integration steps for flow matching inference")
+
     # Co-training & regularization
     parser.add_argument("--lambda_recon", type=float, default=0.0)
     parser.add_argument("--p_view_drop", type=float, default=0.15)
@@ -130,6 +146,13 @@ def main():
         eval_video_episodes=args.eval_video_episodes,
         eval_video_steps=args.eval_video_steps,
         eval_video_dir=args.eval_video_dir,
+        policy_type=args.policy_type,
+        fm_timestep_dist=args.fm_timestep_dist,
+        fm_timestep_scale=args.fm_timestep_scale,
+        fm_beta_a=args.fm_beta_a,
+        fm_beta_b=args.fm_beta_b,
+        fm_cutoff=args.fm_cutoff,
+        num_flow_steps=args.num_flow_steps,
     )
 
     train_stage3(config, resume_from=args.resume)

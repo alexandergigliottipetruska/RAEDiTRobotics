@@ -39,6 +39,7 @@ def _make_policy():
         train_diffusion_steps=100,
         eval_diffusion_steps=5,
         p_view_drop=0.0,
+        policy_type="ddpm",
     )
 
 

@@ -158,12 +158,22 @@ class TestFinalLayerShape:
         out = fl(x, t, cond)
         assert out.shape == (B, T_P, AC_DIM)
 
-    def test_zero_init_all_params(self):
-        """FinalLayer zero-initializes all parameters."""
+    def test_zero_init_modulation_params(self):
+        """FinalLayer zero-initializes adaLN modulation (not linear projection).
+
+        reset_parameters() zeros the modulation (shift=0, scale=0 for identity init)
+        but keeps linear.weight at default init so gradients flow from step 1.
+        """
         fl = _FinalLayer(D, AC_DIM)
-        for name, p in fl.named_parameters():
-            assert torch.allclose(p, torch.zeros_like(p)), \
-                f"Parameter {name} not zero-initialized"
+        # Modulation params should be zero
+        mod_linear = fl.adaLN_modulation[-1]
+        assert torch.allclose(mod_linear.weight, torch.zeros_like(mod_linear.weight)), \
+            "adaLN modulation weight should be zero-initialized"
+        assert torch.allclose(mod_linear.bias, torch.zeros_like(mod_linear.bias)), \
+            "adaLN modulation bias should be zero-initialized"
+        # Output linear should NOT be zero (default init)
+        assert not torch.allclose(fl.linear.weight, torch.zeros_like(fl.linear.weight)), \
+            "linear.weight should keep default init, not be zero"
 
 
 class TestTimeNetworkShape:

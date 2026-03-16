@@ -92,6 +92,17 @@ class Stage3Config:
     train_diffusion_steps: int = 100
     eval_diffusion_steps: int = 10
 
+    # Policy type: "ddpm" or "flow_matching"
+    policy_type: str = "flow_matching"
+
+    # Flow matching hyperparameters (ignored when policy_type="ddpm")
+    fm_timestep_dist: str = "beta"       # "uniform" or "beta" (pi0)
+    fm_timestep_scale: float = 1000.0    # scale tau before time_net
+    fm_beta_a: float = 1.5              # Beta distribution param
+    fm_beta_b: float = 1.0
+    fm_cutoff: float = 0.999            # max tau (pi0: s=0.999)
+    num_flow_steps: int = 10            # Euler integration steps
+
     # Training
     lr: float = 1e-4
     lr_adapter: float = 1e-5    # 10x lower to prevent drift
@@ -444,6 +455,13 @@ def train_stage3(
         p_view_drop=config.p,
         lambda_recon=config.lambda_recon,
         use_lightning=config.use_lightning,
+        policy_type=config.policy_type,
+        fm_timestep_dist=config.fm_timestep_dist,
+        fm_timestep_scale=config.fm_timestep_scale,
+        fm_beta_a=config.fm_beta_a,
+        fm_beta_b=config.fm_beta_b,
+        fm_cutoff=config.fm_cutoff,
+        num_flow_steps=config.num_flow_steps,
     )
     policy = policy.to(device)
 

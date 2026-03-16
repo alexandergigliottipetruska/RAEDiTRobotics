@@ -3,6 +3,10 @@
 Top-level policy module that composes Stage1Bridge + ViewDropout +
 TokenAssembly + _DiTNoiseNet into the BasePolicy interface.
 
+Supports two policy types:
+  - "ddpm":          DDPM training + DDIM inference (Chi et al. 2023)
+  - "flow_matching":  Flow matching training + Euler inference (Lipman et al. 2023, pi0)
+
 Training:  policy.compute_loss(batch) -> scalar loss
 Inference: policy.predict_action(obs) -> (B, T_p, D_act)
 """
@@ -37,6 +41,13 @@ class PolicyDiT(BasePolicy):
         p_view_drop: View dropout probability.
         lambda_recon: Reconstruction co-training weight (0 = no co-training).
         use_lightning: Use LightningDiTBlock (adaLN-Zero) vs standard.
+        policy_type: "ddpm" or "flow_matching".
+        fm_timestep_dist: "uniform" or "beta" (pi0 distribution).
+        fm_timestep_scale: Scale tau before time network (default 1000).
+        fm_beta_a: Beta distribution alpha parameter.
+        fm_beta_b: Beta distribution beta parameter.
+        fm_cutoff: Maximum tau for pi0 distribution (s=0.999).
+        num_flow_steps: Euler integration steps for flow matching inference.
     """
 
     def __init__(
@@ -55,8 +66,19 @@ class PolicyDiT(BasePolicy):
         p_view_drop: float = 0.15,
         lambda_recon: float = 0.0,
         use_lightning: bool = True,
+        policy_type: str = "flow_matching",
+        fm_timestep_dist: str = "beta",
+        fm_timestep_scale: float = 1000.0,
+        fm_beta_a: float = 1.5,
+        fm_beta_b: float = 1.0,
+        fm_cutoff: float = 0.999,
+        num_flow_steps: int = 10,
     ):
         super().__init__()
+
+        assert policy_type in ("ddpm", "flow_matching"), (
+            f"policy_type must be 'ddpm' or 'flow_matching', got '{policy_type}'"
+        )
 
         self.bridge = bridge
         self.T_obs = T_obs
@@ -65,6 +87,15 @@ class PolicyDiT(BasePolicy):
         self.lambda_recon = lambda_recon
         self._train_steps = train_diffusion_steps
         self._eval_steps = eval_diffusion_steps
+        self.policy_type = policy_type
+
+        # Flow matching config
+        self.fm_timestep_dist = fm_timestep_dist
+        self.fm_timestep_scale = fm_timestep_scale
+        self.fm_beta_a = fm_beta_a
+        self.fm_beta_b = fm_beta_b
+        self.fm_cutoff = fm_cutoff
+        self.num_flow_steps = num_flow_steps
 
         # View dropout
         self.view_dropout = ViewDropout(d_model=hidden_dim, p=p_view_drop)
@@ -78,7 +109,7 @@ class PolicyDiT(BasePolicy):
             proprio_dim=proprio_dim,
         )
 
-        # Noise prediction network (from existing diffusion.py)
+        # Noise prediction / velocity prediction network (same architecture)
         self.noise_net = _DiTNoiseNet(
             ac_dim=ac_dim,
             ac_chunk=T_pred,
@@ -88,7 +119,7 @@ class PolicyDiT(BasePolicy):
             use_lightning=use_lightning,
         )
 
-        # DDIM scheduler
+        # DDIM scheduler (only used in DDPM mode)
         self.scheduler = DDIMScheduler(
             num_train_timesteps=train_diffusion_steps,
             beta_schedule="squaredcos_cap_v2",
@@ -135,12 +166,35 @@ class PolicyDiT(BasePolicy):
 
         return obs_tokens, adapted_clean, vp_after
 
+    # ------------------------------------------------------------------
+    # Flow matching helpers
+    # ------------------------------------------------------------------
+
+    def _sample_flow_timestep(self, batch_size: int, device: torch.device) -> torch.Tensor:
+        """Sample tau from pi0's shifted Beta distribution or uniform.
+
+        Returns:
+            tau: (B,) float in [0, s] where s = fm_cutoff.
+        """
+        if self.fm_timestep_dist == "beta":
+            u = torch.distributions.Beta(
+                self.fm_beta_a, self.fm_beta_b
+            ).sample((batch_size,)).to(device)
+            tau = self.fm_cutoff * (1.0 - u)
+        else:  # uniform
+            tau = torch.rand(batch_size, device=device)
+        return tau
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
     def forward(self, batch: dict) -> torch.Tensor:
         """Forward pass for DDP compatibility. Delegates to compute_loss."""
         return self.compute_loss(batch)
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
-        """Compute DDPM noise prediction loss.
+        """Compute policy loss (dispatches to DDPM or flow matching).
 
         Args:
             batch: Dict with keys:
@@ -154,6 +208,12 @@ class PolicyDiT(BasePolicy):
         Returns:
             Scalar total loss.
         """
+        if self.policy_type == "flow_matching":
+            return self._compute_loss_flow_matching(batch)
+        return self._compute_loss_ddpm(batch)
+
+    def _compute_loss_ddpm(self, batch: dict) -> torch.Tensor:
+        """DDPM noise prediction loss (Chi et al. 2023)."""
         proprio = batch["proprio"]
         actions = batch["actions"]
         view_present = batch["view_present"]
@@ -186,9 +246,58 @@ class PolicyDiT(BasePolicy):
 
         return loss
 
+    def _compute_loss_flow_matching(self, batch: dict) -> torch.Tensor:
+        """Flow matching velocity prediction loss (Lipman et al. 2023, pi0)."""
+        proprio = batch["proprio"]
+        actions = batch["actions"]
+        view_present = batch["view_present"]
+        B = actions.shape[0]
+
+        # Encode + assemble (identical to DDPM)
+        obs_tokens, adapted_clean, vp_after = self._encode_and_assemble(
+            batch, proprio, view_present
+        )
+
+        # Sample noise
+        eps = torch.randn_like(actions)
+
+        # Sample continuous timestep tau in [0, s]
+        tau = self._sample_flow_timestep(B, actions.device)
+
+        # Linear interpolation: x_tau = tau * a_0 + (1 - tau) * eps
+        tau_expand = tau[:, None, None]  # (B, 1, 1) for broadcasting
+        x_tau = tau_expand * actions + (1.0 - tau_expand) * eps
+
+        # Velocity target: v = a_0 - eps
+        target_velocity = actions - eps
+
+        # Scale tau for the time network (sinusoidal encoding)
+        tau_scaled = tau * self.fm_timestep_scale
+
+        # Forward through noise net (same network, velocity semantics)
+        enc_cache = self.noise_net.forward_enc(obs_tokens)
+        v_pred = self.noise_net.forward_dec(x_tau, tau_scaled, enc_cache)
+
+        # MSE loss on velocity
+        loss = F.mse_loss(v_pred, target_velocity)
+
+        # Optional reconstruction co-training (identical to DDPM)
+        if self.lambda_recon > 0 and self.bridge.decoder is not None:
+            images_target = batch["images_target"]
+            loss_recon = self.bridge.compute_recon_loss(
+                adapted_clean, images_target, view_present
+            )
+            loss = loss + self.lambda_recon * loss_recon
+
+        return loss
+
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
+
     @torch.no_grad()
     def predict_action(self, obs: dict) -> torch.Tensor:
-        """Run DDIM inference to generate an action chunk.
+        """Generate an action chunk (dispatches to DDIM or Euler).
 
         Args:
             obs: Dict with keys:
@@ -199,9 +308,14 @@ class PolicyDiT(BasePolicy):
         Returns:
             actions: (B, T_pred, ac_dim) predicted action chunk.
         """
+        if self.policy_type == "flow_matching":
+            return self._predict_action_flow_matching(obs)
+        return self._predict_action_ddpm(obs)
+
+    def _predict_action_ddpm(self, obs: dict) -> torch.Tensor:
+        """DDIM inference (Chi et al. 2023)."""
         proprio = obs["proprio"]
         view_present = obs["view_present"]
-        # Get batch size and device from whatever input is available
         if "cached_tokens" in obs:
             B = obs["cached_tokens"].shape[0]
             device = obs["cached_tokens"].device
@@ -230,3 +344,36 @@ class PolicyDiT(BasePolicy):
             ).prev_sample
 
         return noise_actions
+
+    def _predict_action_flow_matching(self, obs: dict) -> torch.Tensor:
+        """Euler ODE integration for flow matching inference."""
+        proprio = obs["proprio"]
+        view_present = obs["view_present"]
+        if "cached_tokens" in obs:
+            B = obs["cached_tokens"].shape[0]
+            device = obs["cached_tokens"].device
+        else:
+            B = obs["images_enc"].shape[0]
+            device = obs["images_enc"].device
+
+        # Encode + assemble (no dropout at eval)
+        obs_tokens, _, _ = self._encode_and_assemble(
+            obs, proprio, view_present
+        )
+
+        # Cache encoder outputs (reused across all integration steps)
+        enc_cache = self.noise_net.forward_enc(obs_tokens)
+
+        # Start from pure noise at tau=0
+        x = torch.randn(B, self.T_pred, self.ac_dim, device=device)
+
+        # Euler integration from tau=0 to tau=1
+        N = self.num_flow_steps
+        dt = 1.0 / N
+        for i in range(N):
+            tau = torch.full((B,), i * dt, device=device)
+            tau_scaled = tau * self.fm_timestep_scale
+            v_pred = self.noise_net.forward_dec(x, tau_scaled, enc_cache)
+            x = x + dt * v_pred
+
+        return x
