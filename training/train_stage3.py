@@ -110,6 +110,7 @@ class Stage3Config:
     num_epochs: int = 300
     grad_clip: float = 1.0
     warmup_steps: int = 1000
+    lr_schedule: str = "cosine"  # "cosine" or "constant"
 
     # Co-training (reconstruction alongside policy)
     lambda_recon: float = 0.0   # ablate {0, 0.1, 0.25, 0.5}
@@ -260,13 +261,21 @@ def _create_lr_scheduler(
     optimizer: torch.optim.Optimizer,
     warmup_steps: int,
     total_steps: int,
+    schedule: str = "cosine",
 ) -> torch.optim.lr_scheduler.LambdaLR:
-    """Cosine schedule with linear warmup."""
+    """LR schedule with linear warmup.
+
+    Args:
+        schedule: "cosine" (decay to 0) or "constant" (warmup then flat).
+    """
     import math
 
     def lr_lambda(step):
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
+        if schedule == "constant":
+            return 1.0
+        # cosine decay
         progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
@@ -547,7 +556,9 @@ def train_stage3(
     )
 
     total_steps = config.num_epochs * len(train_loader)
-    lr_scheduler = _create_lr_scheduler(optimizer, config.warmup_steps, total_steps)
+    lr_scheduler = _create_lr_scheduler(
+        optimizer, config.warmup_steps, total_steps, schedule=config.lr_schedule,
+    )
 
     # Fast-forward scheduler to match resumed global_step
     if global_step > 0:

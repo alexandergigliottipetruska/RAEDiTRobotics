@@ -58,6 +58,8 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_steps", type=int, default=1000)
+    parser.add_argument("--lr_schedule", default="cosine", choices=["cosine", "constant"],
+                        help="LR schedule: cosine (decay to 0) or constant (flat after warmup)")
     parser.add_argument("--norm_mode", default="minmax", choices=["minmax", "zscore"])
 
     # Diffusion
@@ -136,6 +138,7 @@ def main():
         weight_decay=args.weight_decay,
         grad_clip=args.grad_clip,
         warmup_steps=args.warmup_steps,
+        lr_schedule=args.lr_schedule,
         lambda_recon=args.lambda_recon,
         p=args.p_view_drop,
         ema_decay=args.ema_decay,
