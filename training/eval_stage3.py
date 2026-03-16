@@ -27,6 +27,7 @@ from data_pipeline.conversion.compute_norm_stats import load_norm_stats
 from data_pipeline.envs.robomimic_wrapper import RobomimicWrapper
 from data_pipeline.evaluation.rollout import evaluate_policy
 from data_pipeline.evaluation.stage3_eval import Stage3PolicyWrapper
+from models.ema import EMA
 from models.policy_dit import PolicyDiT
 from models.stage1_bridge import Stage1Bridge
 
@@ -41,8 +42,13 @@ def load_policy(
     policy_type: str = "ddpm",
     num_flow_steps: int = 10,
     eval_diffusion_steps: int = 10,
-) -> PolicyDiT:
-    """Load a trained PolicyDiT from checkpoint."""
+    use_ema: bool = True,
+):
+    """Load a trained PolicyDiT from checkpoint.
+
+    Returns:
+        (policy, ema) tuple. ema is None if use_ema=False or checkpoint has no EMA.
+    """
     # Load Stage 1 bridge (encoder + adapter)
     bridge = Stage1Bridge(
         checkpoint_path=stage1_checkpoint,
@@ -82,7 +88,18 @@ def load_policy(
 
     policy.to(device)
     policy.eval()
-    return policy
+
+    # Load EMA if available and requested
+    ema = None
+    if use_ema and "ema" in ckpt:
+        log.info("Loading EMA weights (decay=%.4f, step=%d)",
+                 ckpt["ema"].get("decay", 0), ckpt["ema"].get("_step", 0))
+        ema = EMA(policy, decay=ckpt["ema"].get("decay", 0.9999))
+        ema.load_state_dict(ckpt["ema"])
+    elif use_ema:
+        log.warning("EMA requested but not found in checkpoint — using raw weights")
+
+    return policy, ema
 
 
 def main():
@@ -102,6 +119,8 @@ def main():
                         help="Euler integration steps for flow matching inference")
     parser.add_argument("--eval_steps", type=int, default=10,
                         help="DDIM denoising steps (for DDPM policy_type)")
+    parser.add_argument("--no_ema", action="store_true",
+                        help="Use raw weights instead of EMA")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -109,15 +128,16 @@ def main():
 
     # Load policy
     log.info("Loading policy from %s", args.checkpoint)
-    policy = load_policy(
+    policy, ema = load_policy(
         args.checkpoint, args.stage1_checkpoint, device,
         policy_type=args.policy_type,
         num_flow_steps=args.num_flow_steps,
         eval_diffusion_steps=args.eval_steps,
+        use_ema=not args.no_ema,
     )
 
     # Wrap for eval harness
-    wrapper = Stage3PolicyWrapper(policy, ema=None, device=device)
+    wrapper = Stage3PolicyWrapper(policy, ema=ema, device=device)
 
     # Load norm stats from HDF5
     norm = load_norm_stats(args.hdf5)

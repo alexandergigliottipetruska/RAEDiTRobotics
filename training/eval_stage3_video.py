@@ -150,6 +150,8 @@ def main():
     parser.add_argument("--policy_type", default="ddpm", choices=["ddpm", "flow_matching"])
     parser.add_argument("--num_flow_steps", type=int, default=10,
                         help="Euler integration steps for flow matching inference")
+    parser.add_argument("--no_ema", action="store_true",
+                        help="Use raw weights instead of EMA")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -158,14 +160,15 @@ def main():
 
     # Load policy
     log.info("Loading policy from %s", args.checkpoint)
-    policy = load_policy(
+    policy, ema = load_policy(
         args.checkpoint, args.stage1_checkpoint, device,
         policy_type=args.policy_type,
         num_flow_steps=args.num_flow_steps,
         eval_diffusion_steps=args.eval_steps,
+        use_ema=not args.no_ema,
     )
 
-    wrapper = Stage3PolicyWrapper(policy, ema=None, device=device)
+    wrapper = Stage3PolicyWrapper(policy, ema=ema, device=device)
 
     # Load norm stats
     norm = load_norm_stats(args.hdf5)
