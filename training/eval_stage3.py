@@ -38,6 +38,9 @@ def load_policy(
     checkpoint_path: str,
     stage1_checkpoint: str,
     device: str = "cuda",
+    policy_type: str = "ddpm",
+    num_flow_steps: int = 10,
+    eval_diffusion_steps: int = 10,
 ) -> PolicyDiT:
     """Load a trained PolicyDiT from checkpoint."""
     # Load Stage 1 bridge (encoder + adapter)
@@ -48,8 +51,6 @@ def load_policy(
     )
 
     # Create policy with default architecture
-    # NOTE: policy_type should match what the checkpoint was trained with.
-    # Existing checkpoints use DDPM; new ones may use flow_matching.
     policy = PolicyDiT(
         bridge=bridge,
         ac_dim=7,
@@ -61,8 +62,9 @@ def load_policy(
         nhead=8,
         num_views=4,
         train_diffusion_steps=100,
-        eval_diffusion_steps=10,
-        policy_type="ddpm",
+        eval_diffusion_steps=eval_diffusion_steps,
+        policy_type=policy_type,
+        num_flow_steps=num_flow_steps,
     )
 
     # Load Stage 3 checkpoint (noise_net + adapter weights)
@@ -95,6 +97,11 @@ def main():
     parser.add_argument("--norm_mode", default="minmax", choices=["zscore", "minmax"])
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--policy_type", default="ddpm", choices=["ddpm", "flow_matching"])
+    parser.add_argument("--num_flow_steps", type=int, default=10,
+                        help="Euler integration steps for flow matching inference")
+    parser.add_argument("--eval_steps", type=int, default=10,
+                        help="DDIM denoising steps (for DDPM policy_type)")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -102,7 +109,12 @@ def main():
 
     # Load policy
     log.info("Loading policy from %s", args.checkpoint)
-    policy = load_policy(args.checkpoint, args.stage1_checkpoint, device)
+    policy = load_policy(
+        args.checkpoint, args.stage1_checkpoint, device,
+        policy_type=args.policy_type,
+        num_flow_steps=args.num_flow_steps,
+        eval_diffusion_steps=args.eval_steps,
+    )
 
     # Wrap for eval harness
     wrapper = Stage3PolicyWrapper(policy, ema=None, device=device)

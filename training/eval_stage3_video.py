@@ -147,6 +147,9 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--output_dir", default="eval_videos")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--policy_type", default="ddpm", choices=["ddpm", "flow_matching"])
+    parser.add_argument("--num_flow_steps", type=int, default=10,
+                        help="Euler integration steps for flow matching inference")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -155,12 +158,12 @@ def main():
 
     # Load policy
     log.info("Loading policy from %s", args.checkpoint)
-    policy = load_policy(args.checkpoint, args.stage1_checkpoint, device)
-
-    # Override eval diffusion steps if requested
-    if args.eval_steps != policy._eval_steps:
-        log.info("Overriding eval_diffusion_steps: %d -> %d", policy._eval_steps, args.eval_steps)
-        policy._eval_steps = args.eval_steps
+    policy = load_policy(
+        args.checkpoint, args.stage1_checkpoint, device,
+        policy_type=args.policy_type,
+        num_flow_steps=args.num_flow_steps,
+        eval_diffusion_steps=args.eval_steps,
+    )
 
     wrapper = Stage3PolicyWrapper(policy, ema=None, device=device)
 
