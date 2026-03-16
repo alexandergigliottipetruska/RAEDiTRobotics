@@ -115,6 +115,13 @@ class Stage3Config:
     eval_every_epoch: int = 50
     save_dir: str = "checkpoints/stage3"
 
+    # Inline eval video (set eval_video_task="" to disable)
+    eval_video_task: str = ""           # e.g. "lift"
+    eval_video_episodes: int = 1
+    eval_video_steps: int = 100         # DDIM steps for eval video
+    eval_video_dir: str = "eval_videos"
+    eval_video_hdf5: str = ""           # unified HDF5 for norm stats
+
 
 # ---------------------------------------------------------------------------
 # DDPM noise schedule
@@ -317,6 +324,64 @@ def load_checkpoint(
     log.info("Loaded checkpoint from epoch %d, step %d: %s",
              ckpt["epoch"], ckpt["global_step"], path)
     return ckpt["epoch"] + 1, ckpt["global_step"]
+
+
+# ---------------------------------------------------------------------------
+# Inline eval video recording
+# ---------------------------------------------------------------------------
+
+def _run_eval_video(policy, config, epoch, device):
+    """Run 1 eval episode with video recording. Called every save_every_epoch."""
+    import warnings
+    import numpy as np
+    warnings.filterwarnings("ignore", module="robosuite")
+
+    from data_pipeline.conversion.compute_norm_stats import load_norm_stats
+    from data_pipeline.envs.robomimic_wrapper import RobomimicWrapper
+    from data_pipeline.evaluation.stage3_eval import Stage3PolicyWrapper
+    from data_pipeline.evaluation.visualization import (
+        plot_action_trajectory, save_rollout_video,
+    )
+    from training.eval_stage3_video import run_episode_with_recording
+
+    out_dir = os.path.join(config.eval_video_dir, f"epoch_{epoch:04d}")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # Override eval diffusion steps for video
+    orig_eval_steps = policy._eval_steps
+    policy._eval_steps = config.eval_video_steps
+
+    wrapper = Stage3PolicyWrapper(policy, ema=None, device=str(device))
+
+    norm = load_norm_stats(config.eval_video_hdf5)
+    action_stats = norm["actions"]
+    proprio_stats = norm["proprio"]
+
+    env = RobomimicWrapper(task=config.eval_video_task, seed=42)
+
+    for ep in range(config.eval_video_episodes):
+        result = run_episode_with_recording(
+            wrapper, env, config.norm_mode, action_stats, proprio_stats,
+            max_steps=400, exec_horizon=config.T_act,
+        )
+        status = "success" if result["success"] else "fail"
+        log.info("Eval video epoch %d ep %d: %s (%d steps)",
+                 epoch, ep, status.upper(), result["steps"])
+
+        save_rollout_video(
+            result["frames"],
+            os.path.join(out_dir, f"ep{ep:02d}_{status}.mp4"),
+            fps=20,
+        )
+        plot_action_trajectory(
+            result["actions"],
+            action_labels=["dx", "dy", "dz", "drx", "dry", "drz", "grip"],
+            title=f"Epoch {epoch} — {status.upper()} ({result['steps']} steps)",
+            output_path=os.path.join(out_dir, f"ep{ep:02d}_{status}_actions.png"),
+        )
+
+    env.close()
+    policy._eval_steps = orig_eval_steps
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +624,16 @@ def train_stage3(
                     epoch, global_step, pu.noise_net, pu.bridge.adapter,
                     optimizer, ema, avg, decoder=pu.bridge.decoder,
                 )
+
+                # Inline eval video
+                if config.eval_video_task:
+                    try:
+                        pu_eval = _unwrap(policy)
+                        pu_eval.eval()
+                        _run_eval_video(pu_eval, config, epoch, device)
+                        pu_eval.train()
+                    except Exception as e:
+                        log.warning("Eval video failed at epoch %d: %s", epoch, e)
 
             # Best checkpoint
             if avg.get("policy", float("inf")) < best_val_loss:

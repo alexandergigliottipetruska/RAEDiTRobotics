@@ -74,6 +74,16 @@ def main():
     parser.add_argument("--save_every_epoch", type=int, default=10)
     parser.add_argument("--resume", default=None, help="Stage 3 checkpoint to resume from")
 
+    # Inline eval video
+    parser.add_argument("--eval_video_task", default="",
+                        help="Task for eval video (e.g. 'lift'). Empty = disabled.")
+    parser.add_argument("--eval_video_hdf5", default="",
+                        help="Unified HDF5 for eval norm stats (NOT the tokens file)")
+    parser.add_argument("--eval_video_episodes", type=int, default=1)
+    parser.add_argument("--eval_video_steps", type=int, default=100,
+                        help="DDIM steps for eval video")
+    parser.add_argument("--eval_video_dir", default="eval_videos")
+
     args = parser.parse_args()
 
     # Initialize distributed if launched with torchrun
@@ -115,6 +125,11 @@ def main():
         ema_decay=args.ema_decay,
         save_dir=args.save_dir,
         save_every_epoch=args.save_every_epoch,
+        eval_video_task=args.eval_video_task,
+        eval_video_hdf5=args.eval_video_hdf5,
+        eval_video_episodes=args.eval_video_episodes,
+        eval_video_steps=args.eval_video_steps,
+        eval_video_dir=args.eval_video_dir,
     )
 
     train_stage3(config, resume_from=args.resume)
