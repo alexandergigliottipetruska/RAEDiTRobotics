@@ -456,6 +456,13 @@ def train_stage3(
     total_steps = config.num_epochs * len(train_loader)
     lr_scheduler = _create_lr_scheduler(optimizer, config.warmup_steps, total_steps)
 
+    # Fast-forward scheduler to match resumed global_step
+    if global_step > 0:
+        for _ in range(global_step):
+            lr_scheduler.step()
+        log.info("LR scheduler fast-forwarded to step %d (lr=%.2e)",
+                 global_step, optimizer.param_groups[0]["lr"])
+
     # --- Logging (rank 0 only) ---
     metrics_path = None
     if is_main:
