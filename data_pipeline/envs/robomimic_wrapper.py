@@ -33,13 +33,13 @@ TASK_TO_ENV = {
 
 
 def _process_image(img_hwc: np.ndarray, target_size: int = 224) -> np.ndarray:
-    """Resize + ImageNet normalize + HWC->CHW.
+    """Resize + HWC->CHW. Returns float32 [0,1] (no ImageNet normalization).
 
     Args:
         img_hwc: uint8 [H, W, 3] image from robosuite.
 
     Returns:
-        float32 [3, H, W] ImageNet-normalized.
+        float32 [3, H, W] in [0, 1] range.
     """
     if img_hwc.shape[0] != target_size or img_hwc.shape[1] != target_size:
         img_hwc = np.array(
@@ -48,8 +48,7 @@ def _process_image(img_hwc: np.ndarray, target_size: int = 224) -> np.ndarray:
             )
         )
     img_float = img_hwc.astype(np.float32) / 255.0
-    normalized = (img_float - _IMAGENET_MEAN) / _IMAGENET_STD
-    return np.moveaxis(normalized, -1, -3)  # [3, H, W]
+    return np.moveaxis(img_float, -1, -3)  # [3, H, W]
 
 
 class RobomimicWrapper(BaseManipulationEnv):
