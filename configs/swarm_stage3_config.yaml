@@ -1,6 +1,6 @@
 # NOTE we no longer check out to a branch or pull automatically
 project:
-  study_name: "robotics_stage3_lift"
+  study_name: "robotics_stage3_lift_dropout_change"
   domain: "utm.utoronto.ca" #important for lab pc distribution
   project_root: "/student/denassau/CSC415/Project/RAEDiTRobotics"
   venv_path: "~/sweep_env/bin/activate"
@@ -90,9 +90,9 @@ training_static:
   T_pred: 16
   T_act: 8
   hidden_dim: 512
+  p: 0.0
   
   # Policy & Diffusion Formulation (Locked to Flow Matching by default)
-  policy_type: "flow_matching"
   train_diffusion_steps: 100
   eval_diffusion_steps: 10
   fm_timestep_dist: "beta"
@@ -117,6 +117,11 @@ training_static:
 # DYNAMIC VARIABLES (Optuna Search Space - 9 Variables)
 # ---------------------------------------------------------------------------
 hyperparameters_search:
+  policy_type:
+    method: "suggest_categorical"
+    kwargs:
+      choices: ["flow_matching", "diffusion"]
+
   # 1. Learning Rates
   lr:
     method: "suggest_float"
@@ -141,13 +146,7 @@ hyperparameters_search:
     method: "suggest_categorical"
     kwargs:
       choices: [4, 8]
-      
-  # 3. Regularization & Co-training
-  p:  
-    method: "suggest_float"
-    kwargs:
-      low: 0.0
-      high: 0.3                   # View dropout probability
+
   weight_decay:
     method: "suggest_float"
     kwargs:
