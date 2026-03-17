@@ -117,6 +117,7 @@ class PolicyDiT(BasePolicy):
             num_blocks=num_blocks,
             nhead=nhead,
             use_lightning=use_lightning,
+            dropout=0.0,
         )
 
         # DDIM scheduler (only used in DDPM mode)

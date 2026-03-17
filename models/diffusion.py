@@ -184,11 +184,13 @@ class _FinalLayer(nn.Module):
         return x   # (B, ac_chunk, ac_dim)
 
     def reset_parameters(self):
-        # Zero only the modulation — so the final layer starts as identity
-        # (shift=0, scale=0 → x * 0 + 0, but linear has real weights).
-        # The linear projection keeps its default init so gradients can flow.
+        # Zero everything: adaLN modulation AND output linear projection.
+        # At init, model predicts zero noise/velocity everywhere ("I don't know").
+        # This matches DiT (Peebles & Xie 2023) original initialization.
         nn.init.zeros_(self.adaLN_modulation[-1].weight)
         nn.init.zeros_(self.adaLN_modulation[-1].bias)
+        nn.init.zeros_(self.linear.weight)
+        nn.init.zeros_(self.linear.bias)
 
 
 class _TransformerEncoder(nn.Module):
