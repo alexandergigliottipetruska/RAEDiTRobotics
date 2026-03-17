@@ -410,6 +410,142 @@ def _run_eval_video(policy, config, epoch, device):
 
 
 # ---------------------------------------------------------------------------
+# Enhanced diagnostics
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def _run_diagnostics(policy, valid_loader, config, epoch, device, use_amp, metrics_path=None):
+    """Run detailed diagnostics every eval_every_epoch.
+
+    Reports:
+      1. Per-timestep diffusion loss (t=0, 25, 50, 75, 99)
+      2. Action prediction quality (DDIM denoise → compare to GT)
+      3. Multi-episode rollout success rate (if eval_video_task is set)
+    """
+    import numpy as np
+    pu = _unwrap(policy)
+    pu.eval()
+
+    # Grab one val batch for diagnostics
+    val_batch = next(iter(valid_loader))
+    batch_dev = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in val_batch.items()
+    }
+
+    # --- 1. Per-timestep diffusion loss ---
+    proprio = batch_dev["proprio"]
+    actions = batch_dev["actions"]
+    view_present = batch_dev["view_present"]
+    obs_tokens, _, _ = pu._encode_and_assemble(batch_dev, proprio, view_present)
+
+    timestep_losses = {}
+    for t_val in [0, 25, 50, 75, 99]:
+        torch.manual_seed(42)
+        noise = torch.randn_like(actions)
+        timesteps = torch.full(
+            (actions.shape[0],), t_val, device=actions.device, dtype=torch.long
+        )
+        noisy = pu.scheduler.add_noise(actions, noise, timesteps)
+        with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
+            _, eps_pred = pu.noise_net(noisy, timesteps, obs_tokens)
+        loss_t = nn.functional.mse_loss(eps_pred, noise).item()
+        timestep_losses[f"t{t_val}"] = loss_t
+
+    ts_str = " | ".join(f"t{k}={v:.4f}" for k, v in sorted(timestep_losses.items()))
+    log.info("  Diagnostics epoch %d — per-timestep: %s", epoch, ts_str)
+
+    # --- 2. Action prediction quality (denoise → compare to GT) ---
+    # Run full predict_action on the val batch observations
+    obs_dict = {
+        "proprio": proprio,
+        "view_present": view_present,
+    }
+    if "cached_tokens" in batch_dev:
+        obs_dict["cached_tokens"] = batch_dev["cached_tokens"]
+    else:
+        obs_dict["images_enc"] = batch_dev["images_enc"]
+
+    with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
+        pred_actions = pu.predict_action(obs_dict)  # (B, T_pred, ac_dim)
+
+    gt_actions = actions  # (B, T_pred, ac_dim)
+    action_mse = nn.functional.mse_loss(pred_actions, gt_actions).item()
+
+    # Per-dimension stats
+    pred_np = pred_actions.float().cpu().numpy()
+    gt_np = gt_actions.float().cpu().numpy()
+    pred_mean = np.mean(pred_np, axis=(0, 1))
+    pred_std = np.std(pred_np, axis=(0, 1))
+    gt_mean = np.mean(gt_np, axis=(0, 1))
+    gt_std = np.std(gt_np, axis=(0, 1))
+
+    log.info("  Diagnostics epoch %d — action MSE: %.4f", epoch, action_mse)
+    log.info("  Diagnostics epoch %d — pred mean: %s", epoch,
+             np.array2string(pred_mean, precision=3, suppress_small=True))
+    log.info("  Diagnostics epoch %d — GT   mean: %s", epoch,
+             np.array2string(gt_mean, precision=3, suppress_small=True))
+    log.info("  Diagnostics epoch %d — pred std:  %s", epoch,
+             np.array2string(pred_std, precision=3, suppress_small=True))
+    log.info("  Diagnostics epoch %d — GT   std:  %s", epoch,
+             np.array2string(gt_std, precision=3, suppress_small=True))
+
+    # --- 3. Multi-episode rollout (if configured) ---
+    n_success = 0
+    n_episodes = 0
+    if config.eval_video_task:
+        import warnings
+        warnings.filterwarnings("ignore", module="robosuite")
+        from data_pipeline.conversion.compute_norm_stats import load_norm_stats
+        from data_pipeline.envs.robomimic_wrapper import RobomimicWrapper
+        from data_pipeline.evaluation.rollout import evaluate_policy
+        from data_pipeline.evaluation.stage3_eval import Stage3PolicyWrapper
+
+        wrapper = Stage3PolicyWrapper(pu, ema=None, device=str(device))
+        norm = load_norm_stats(config.eval_video_hdf5)
+        action_stats = norm["actions"]
+        proprio_stats = norm["proprio"]
+
+        env = RobomimicWrapper(task=config.eval_video_task, seed=42)
+        n_eval = 10  # 10 episodes per eval
+        success_rate, results = evaluate_policy(
+            wrapper, env, num_episodes=n_eval, max_steps=400,
+            norm_mode=config.norm_mode,
+            action_mean=action_stats["mean"], action_std=action_stats["std"],
+            action_min=action_stats.get("min"), action_max=action_stats.get("max"),
+            proprio_mean=proprio_stats["mean"], proprio_std=proprio_stats["std"],
+            proprio_min=proprio_stats.get("min"), proprio_max=proprio_stats.get("max"),
+            exec_horizon=config.T_act, obs_horizon=config.T_obs,
+        )
+        n_success = sum(1 for r in results if r["success"])
+        n_episodes = n_eval
+        env.close()
+
+        log.info("  Diagnostics epoch %d — rollout: %d/%d (%.0f%%)",
+                 epoch, n_success, n_episodes, success_rate * 100)
+
+    # Log to metrics JSONL
+    if metrics_path:
+        import json as _json
+        with open(metrics_path, "a") as mf:
+            mf.write(_json.dumps({
+                "epoch": epoch,
+                "diagnostics": {
+                    "per_timestep_loss": timestep_losses,
+                    "action_mse": action_mse,
+                    "pred_action_mean": pred_mean.tolist(),
+                    "pred_action_std": pred_std.tolist(),
+                    "gt_action_mean": gt_mean.tolist(),
+                    "gt_action_std": gt_std.tolist(),
+                    "rollout_success": n_success,
+                    "rollout_episodes": n_episodes,
+                },
+            }) + "\n")
+
+    pu.train()
+
+
+# ---------------------------------------------------------------------------
 # Main training loop
 # ---------------------------------------------------------------------------
 
@@ -689,15 +825,25 @@ def train_stage3(
                     obs_proj=getattr(pu, "obs_proj", None),
                 )
 
-            # Inline eval video (separate schedule from checkpointing)
-            if config.eval_video_task and (epoch + 1) % config.eval_every_epoch == 0:
+            # Enhanced diagnostics (separate schedule from checkpointing)
+            if (epoch + 1) % config.eval_every_epoch == 0:
                 try:
-                    pu_eval = _unwrap(policy)
-                    pu_eval.eval()
-                    _run_eval_video(pu_eval, config, epoch, device)
-                    pu_eval.train()
+                    _run_diagnostics(
+                        policy, valid_loader, config, epoch, device,
+                        use_amp, metrics_path,
+                    )
                 except Exception as e:
-                    log.warning("Eval video failed at epoch %d: %s", epoch, e)
+                    log.warning("Diagnostics failed at epoch %d: %s", epoch, e)
+
+                # Also save eval video if configured
+                if config.eval_video_task:
+                    try:
+                        pu_eval = _unwrap(policy)
+                        pu_eval.eval()
+                        _run_eval_video(pu_eval, config, epoch, device)
+                        pu_eval.train()
+                    except Exception as e:
+                        log.warning("Eval video failed at epoch %d: %s", epoch, e)
 
             # Best checkpoint (based on validation loss)
             if val_avg.get("policy", float("inf")) < best_val_loss:
