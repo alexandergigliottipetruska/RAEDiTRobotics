@@ -368,6 +368,194 @@ class _LightningDiTBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Dasari DiT block  [DiT-Block Policy — adaLN-Zero, NO cross-attention]
+# ---------------------------------------------------------------------------
+
+class _DasariDiTBlock(nn.Module):
+    """DiT-Block Policy decoder block (Dasari et al. 2024).
+
+    adaLN-Zero modulation from a conditioning VECTOR (not token sequence).
+    No cross-attention — Dasari found cross-attention "catastrophically
+    unstable" for diffusion policy training and removed it entirely.
+
+    Conditioning enters only through LayerNorm shift/scale/gate:
+        cond_vec = mean_pool(encoder_output_at_depth_d) + time_embedding
+
+    Two operations with adaLN-Zero:
+      1. Self-attention on action tokens
+      2. MLP
+
+    Both use zero-initialized gates for identity initialization.
+    """
+
+    def __init__(
+        self, d_model, nhead, dim_feedforward=1024, dropout=0.0, activation="gelu"
+    ):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(
+            d_model, nhead, dropout=dropout, batch_first=True
+        )
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+
+        # No affine params — adaLN-Zero supplies them
+        self.norm1 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+        self.norm2 = nn.LayerNorm(d_model, elementwise_affine=False, eps=1e-6)
+
+        # adaLN-Zero: one MLP → 6 params; zero-init → identity at init
+        self.adaLN = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_model, 6 * d_model, bias=True),
+        )
+        nn.init.zeros_(self.adaLN[-1].weight)
+        nn.init.zeros_(self.adaLN[-1].bias)
+
+        self.activation = _get_activation_fn(activation)
+
+    def forward(self, x, cond_vec):
+        """
+        Args:
+            x: (B, T_pred, d_model) action tokens.
+            cond_vec: (B, d_model) conditioning vector
+                      (mean_pool(encoder_output) + time_embedding).
+        """
+        shift1, scale1, gate1, shift2, scale2, gate2 = self.adaLN(cond_vec).chunk(6, dim=1)
+
+        # 1. Self-attention with adaLN-Zero
+        x2 = self.norm1(x) * (1 + scale1.unsqueeze(1)) + shift1.unsqueeze(1)
+        x2, _ = self.self_attn(x2, x2, x2, need_weights=False)
+        x = x + gate1.unsqueeze(1) * x2
+
+        # 2. MLP with adaLN-Zero (NO cross-attention)
+        x2 = self.norm2(x) * (1 + scale2.unsqueeze(1)) + shift2.unsqueeze(1)
+        x2 = self.linear2(self.activation(self.linear1(x2)))
+        x = x + gate2.unsqueeze(1) * x2
+        return x
+
+    def reset_parameters(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+        nn.init.zeros_(self.adaLN[-1].weight)
+        nn.init.zeros_(self.adaLN[-1].bias)
+
+
+# ---------------------------------------------------------------------------
+# Noise network V2  [Dasari-style: adaLN-Zero decoder, no cross-attention]
+# ---------------------------------------------------------------------------
+
+class _DiTNoiseNetV2(nn.Module):
+    """Diffusion Transformer noise network V2 — Dasari-style decoder.
+
+    Key difference from V1: decoder blocks use adaLN-Zero conditioning
+    from a mean-pooled vector, NOT cross-attention to encoder tokens.
+
+    Encoder: same self-attention encoder as V1, producing per-depth outputs.
+    Decoder: _DasariDiTBlock layers, each conditioned on:
+        cond_vec = mean_pool(enc_outputs[d]) + time_embedding
+
+    This matches Dasari et al. (2024) "DiT-Block Policy" which proved that
+    adaLN-Zero conditioning is far more stable than cross-attention for
+    robotic diffusion policy training.
+    """
+
+    def __init__(
+        self,
+        ac_dim,
+        ac_chunk,
+        time_dim=128,
+        hidden_dim=256,
+        num_blocks=4,
+        dropout=0.0,
+        dim_feedforward=1024,
+        nhead=8,
+        activation="gelu",
+    ):
+        super().__init__()
+
+        # Positional encodings
+        self.enc_pos = _PositionalEncoding(hidden_dim)
+        self.register_parameter(
+            "dec_pos",
+            nn.Parameter(torch.empty(1, ac_chunk, hidden_dim), requires_grad=True),
+        )
+        nn.init.xavier_uniform_(self.dec_pos.data)
+
+        # Input projections
+        self.time_net = _TimeNetwork(time_dim, hidden_dim)
+        self.ac_proj = nn.Sequential(
+            nn.Linear(ac_dim, ac_dim),
+            nn.GELU(approximate="tanh"),
+            nn.Linear(ac_dim, hidden_dim),
+        )
+
+        # Obs self-attention encoder (same as V1)
+        encoder_module = _SelfAttnEncoder(
+            hidden_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation=activation,
+        )
+        self.encoder = _TransformerEncoder(encoder_module, num_blocks)
+
+        # Dasari-style decoder: adaLN-Zero only, no cross-attention
+        decoder_module = _DasariDiTBlock(
+            hidden_dim,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            activation=activation,
+        )
+        self.decoder = nn.ModuleList(
+            [copy.deepcopy(decoder_module) for _ in range(num_blocks)]
+        )
+        for layer in self.decoder:
+            layer.reset_parameters()
+
+        self.eps_out = _FinalLayer(hidden_dim, ac_dim)
+
+        print(
+            "number of diffusion parameters: {:e}".format(
+                sum(p.numel() for p in self.parameters())
+            )
+        )
+
+    def forward(self, noise_actions, time, obs_enc, enc_cache=None):
+        if enc_cache is None:
+            enc_cache = self.forward_enc(obs_enc)
+        return enc_cache, self.forward_dec(noise_actions, time, enc_cache)
+
+    def forward_enc(self, obs_enc):
+        """Encode obs tokens. Returns list of per-depth tensors."""
+        pos = self.enc_pos(obs_enc)
+        return self.encoder(obs_enc, pos)
+
+    def forward_dec(self, noise_actions, time, enc_cache):
+        """Denoise action tokens with Dasari-style adaLN-Zero conditioning.
+
+        Each decoder layer d receives:
+            cond_vec = mean_pool(enc_cache[d]) + time_embedding
+        """
+        time_enc = self.time_net(time)
+        ac_tokens = self.ac_proj(noise_actions) + self.dec_pos
+        x = ac_tokens
+
+        if isinstance(enc_cache, list):
+            for layer, cond_tokens in zip(self.decoder, enc_cache):
+                cond_vec = torch.mean(cond_tokens, dim=1) + time_enc  # (B, d)
+                x = layer(x, cond_vec)
+            final_cond = enc_cache[-1]
+        else:
+            cond_vec = torch.mean(enc_cache, dim=1) + time_enc
+            for layer in self.decoder:
+                x = layer(x, cond_vec)
+            final_cond = enc_cache
+
+        return self.eps_out(x, time_enc, final_cond)
+
+
+# ---------------------------------------------------------------------------
 # Noise network
 # ---------------------------------------------------------------------------
 

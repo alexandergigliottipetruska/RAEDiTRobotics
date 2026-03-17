@@ -45,17 +45,17 @@ def main():
     parser.add_argument("--num_views", type=int, default=4)
     parser.add_argument("--T_obs", type=int, default=2)
     parser.add_argument("--T_pred", type=int, default=16)
-    parser.add_argument("--hidden_dim", type=int, default=512)
-    parser.add_argument("--num_blocks", type=int, default=6)
+    parser.add_argument("--hidden_dim", type=int, default=256)
+    parser.add_argument("--num_blocks", type=int, default=4)
     parser.add_argument("--nhead", type=int, default=8)
 
     # Training
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--num_epochs", type=int, default=300)
+    parser.add_argument("--num_epochs", type=int, default=3000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr_adapter", type=float, default=1e-5)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--lr_schedule", default="cosine", choices=["cosine", "constant"],
@@ -64,12 +64,12 @@ def main():
 
     # Diffusion
     parser.add_argument("--train_diffusion_steps", type=int, default=100)
-    parser.add_argument("--eval_diffusion_steps", type=int, default=10)
+    parser.add_argument("--eval_diffusion_steps", type=int, default=100)
 
     # Policy type
-    parser.add_argument("--policy_type", default="flow_matching",
+    parser.add_argument("--policy_type", default="ddpm",
                         choices=["ddpm", "flow_matching"],
-                        help="Policy formulation: ddpm or flow_matching (default)")
+                        help="Policy formulation: ddpm (default) or flow_matching")
 
     # Flow matching
     parser.add_argument("--fm_timestep_dist", default="beta",
@@ -84,7 +84,7 @@ def main():
 
     # Co-training & regularization
     parser.add_argument("--lambda_recon", type=float, default=0.0)
-    parser.add_argument("--p_view_drop", type=float, default=0.15)
+    parser.add_argument("--p_view_drop", type=float, default=0.0)
     parser.add_argument("--ema_decay", type=float, default=0.9999)
 
     # Checkpointing

@@ -83,17 +83,16 @@ class Stage3Config:
     T_obs: int = 2
     T_pred: int = 16
     T_act: int = 8              # execution horizon (eval only)
-    hidden_dim: int = 512
-    num_blocks: int = 6
+    hidden_dim: int = 256       # Chi transformer: 256
+    num_blocks: int = 4         # encoder + decoder layers (matched)
     nhead: int = 8
-    use_lightning: bool = True
 
     # Diffusion
     train_diffusion_steps: int = 100
-    eval_diffusion_steps: int = 10
+    eval_diffusion_steps: int = 100  # Chi: 100 (was 10!)
 
     # Policy type: "ddpm" or "flow_matching"
-    policy_type: str = "flow_matching"
+    policy_type: str = "ddpm"
 
     # Flow matching hyperparameters (ignored when policy_type="ddpm")
     fm_timestep_dist: str = "beta"       # "uniform" or "beta" (pi0)
@@ -106,8 +105,8 @@ class Stage3Config:
     # Training
     lr: float = 1e-4
     lr_adapter: float = 1e-5    # 10x lower to prevent drift
-    weight_decay: float = 1e-4
-    num_epochs: int = 300
+    weight_decay: float = 1e-3  # Chi transformer: 1e-3
+    num_epochs: int = 3000
     grad_clip: float = 1.0
     warmup_steps: int = 1000
     lr_schedule: str = "cosine"  # "cosine" or "constant"
@@ -116,7 +115,7 @@ class Stage3Config:
     lambda_recon: float = 0.0   # ablate {0, 0.1, 0.25, 0.5}
 
     # View dropout
-    p: float = 0.15
+    p: float = 0.0  # 0 for single-task, 0.15 for multi-task
 
     # EMA
     ema_decay: float = 0.9999
@@ -463,7 +462,6 @@ def train_stage3(
         eval_diffusion_steps=config.eval_diffusion_steps,
         p_view_drop=config.p,
         lambda_recon=config.lambda_recon,
-        use_lightning=config.use_lightning,
         policy_type=config.policy_type,
         fm_timestep_dist=config.fm_timestep_dist,
         fm_timestep_scale=config.fm_timestep_scale,

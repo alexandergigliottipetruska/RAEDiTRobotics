@@ -30,7 +30,7 @@ def _make_policy():
         bridge=bridge,
         ac_dim=AC_DIM,
         proprio_dim=D_PROP,
-        hidden_dim=512,
+        hidden_dim=256,
         T_obs=T_O,
         T_pred=T_P,
         num_blocks=2,

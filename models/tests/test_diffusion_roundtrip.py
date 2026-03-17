@@ -32,6 +32,8 @@ from models.diffusion import (
     _DiTCrossAttnBlock,
     _LightningDiTBlock,
     _DiTNoiseNet,
+    _DiTNoiseNetV2,
+    _DasariDiTBlock,
     _DDTHead,
     _DiTDHNoiseNet,
 )
@@ -158,11 +160,11 @@ class TestFinalLayerShape:
         out = fl(x, t, cond)
         assert out.shape == (B, T_P, AC_DIM)
 
-    def test_zero_init_modulation_params(self):
-        """FinalLayer zero-initializes adaLN modulation (not linear projection).
+    def test_zero_init_modulation_and_output(self):
+        """FinalLayer zero-initializes both adaLN modulation AND output linear.
 
-        reset_parameters() zeros the modulation (shift=0, scale=0 for identity init)
-        but keeps linear.weight at default init so gradients flow from step 1.
+        DiT (Peebles & Xie 2023): zero-init everything in the final layer so
+        the model predicts zero noise/velocity at initialization ("I don't know").
         """
         fl = _FinalLayer(D, AC_DIM)
         # Modulation params should be zero
@@ -171,9 +173,11 @@ class TestFinalLayerShape:
             "adaLN modulation weight should be zero-initialized"
         assert torch.allclose(mod_linear.bias, torch.zeros_like(mod_linear.bias)), \
             "adaLN modulation bias should be zero-initialized"
-        # Output linear should NOT be zero (default init)
-        assert not torch.allclose(fl.linear.weight, torch.zeros_like(fl.linear.weight)), \
-            "linear.weight should keep default init, not be zero"
+        # Output linear should ALSO be zero (DiT full zero-init)
+        assert torch.allclose(fl.linear.weight, torch.zeros_like(fl.linear.weight)), \
+            "linear.weight should be zero-initialized (DiT identity init)"
+        assert torch.allclose(fl.linear.bias, torch.zeros_like(fl.linear.bias)), \
+            "linear.bias should be zero-initialized (DiT identity init)"
 
 
 class TestTimeNetworkShape:
@@ -594,3 +598,232 @@ class TestEdgeCases:
         time = torch.randint(0, 100, (B,))
         _, eps = net(noise_ac, time, obs)
         assert eps.shape == (B, 50, AC_DIM)
+
+
+# =====================================================================
+# 6. _DasariDiTBlock Tests (V2 component)
+# =====================================================================
+
+class TestDasariDiTBlockShape:
+    def test_output_shape(self):
+        """Dasari block outputs (B, T_P, D)."""
+        block = _DasariDiTBlock(D, nhead=NHEAD, dim_feedforward=FFN)
+        x = torch.randn(B, T_P, D)
+        cond_vec = torch.randn(B, D)
+        out = block(x, cond_vec)
+        assert out.shape == (B, T_P, D)
+
+    def test_adaln_zero_init(self):
+        """adaLN output layer is zero-initialized."""
+        block = _DasariDiTBlock(D, nhead=NHEAD, dim_feedforward=FFN)
+        cond_vec = torch.zeros(B, D)
+        ada_out = block.adaLN(cond_vec)
+        assert torch.allclose(ada_out, torch.zeros_like(ada_out), atol=1e-7)
+
+    def test_no_cross_attention(self):
+        """Dasari block has no cross_attn attribute (by design)."""
+        block = _DasariDiTBlock(D, nhead=NHEAD, dim_feedforward=FFN)
+        assert not hasattr(block, "cross_attn")
+
+    def test_cond_vec_not_sequence(self):
+        """Dasari block takes (B, D) conditioning VECTOR, not (B, S, D) sequence."""
+        block = _DasariDiTBlock(D, nhead=NHEAD, dim_feedforward=FFN)
+        x = torch.randn(B, T_P, D)
+        cond_vec = torch.randn(B, D)  # vector, not sequence
+        out = block(x, cond_vec)
+        assert out.shape == (B, T_P, D)
+
+
+class TestDasariDiTBlockBatchIndependence:
+    def test_batch_independence(self):
+        torch.manual_seed(42)
+        block = _DasariDiTBlock(D, nhead=NHEAD, dim_feedforward=FFN)
+        block.eval()
+
+        x = torch.randn(8, T_P, D)
+        cond_vec = torch.randn(8, D)
+
+        out_8 = block(x, cond_vec)
+        out_4 = block(x[:4], cond_vec[:4])
+
+        assert torch.allclose(out_8[:4], out_4, atol=1e-5), \
+            "DasariDiTBlock output depends on other batch elements!"
+
+
+# =====================================================================
+# 7. _DiTNoiseNetV2 Tests (Dasari-style decoder)
+# =====================================================================
+
+def _make_noise_net_v2(**overrides):
+    """Helper to create a small _DiTNoiseNetV2 with test defaults."""
+    defaults = dict(
+        ac_dim=AC_DIM, ac_chunk=T_P, hidden_dim=D,
+        num_blocks=NUM_BLOCKS, nhead=NHEAD, dim_feedforward=FFN,
+    )
+    defaults.update(overrides)
+    return _DiTNoiseNetV2(**defaults)
+
+
+class TestDiTNoiseNetV2Shape:
+    def test_forward_shapes(self):
+        net = _make_noise_net_v2()
+        obs = torch.randn(B, S_OBS, D)
+        noise_ac = torch.randn(B, T_P, AC_DIM)
+        time = torch.randint(0, 100, (B,))
+        enc_cache, eps = net(noise_ac, time, obs)
+        assert eps.shape == (B, T_P, AC_DIM)
+        assert isinstance(enc_cache, list)
+        assert len(enc_cache) == NUM_BLOCKS
+        for e in enc_cache:
+            assert e.shape == (B, S_OBS, D)
+
+    def test_forward_enc_shape(self):
+        net = _make_noise_net_v2()
+        obs = torch.randn(B, S_OBS, D)
+        enc_cache = net.forward_enc(obs)
+        assert isinstance(enc_cache, list)
+        assert len(enc_cache) == NUM_BLOCKS
+        for e in enc_cache:
+            assert e.shape == (B, S_OBS, D)
+
+    def test_forward_dec_shape(self):
+        net = _make_noise_net_v2()
+        obs = torch.randn(B, S_OBS, D)
+        enc_cache = net.forward_enc(obs)
+        noise_ac = torch.randn(B, T_P, AC_DIM)
+        time = torch.randint(0, 100, (B,))
+        eps = net.forward_dec(noise_ac, time, enc_cache)
+        assert eps.shape == (B, T_P, AC_DIM)
+
+    def test_external_conditioning_single_tensor(self):
+        """Single tensor (not list) as enc_cache."""
+        net = _make_noise_net_v2()
+        ext_cond = torch.randn(B, 32, D)
+        noise_ac = torch.randn(B, T_P, AC_DIM)
+        time = torch.randint(0, 100, (B,))
+        enc_cache, eps = net(noise_ac, time, None, enc_cache=ext_cond)
+        assert eps.shape == (B, T_P, AC_DIM)
+        assert enc_cache is ext_cond
+
+
+class TestDiTNoiseNetV2BatchIndependence:
+    def test_batch_independence(self):
+        torch.manual_seed(42)
+        net = _make_noise_net_v2()
+        net.eval()
+
+        obs = torch.randn(8, S_OBS, D)
+        noise_ac = torch.randn(8, T_P, AC_DIM)
+        time = torch.randint(0, 100, (8,))
+
+        _, eps_8 = net(noise_ac, time, obs)
+        _, eps_4 = net(noise_ac[:4], time[:4], obs[:4])
+
+        assert torch.allclose(eps_8[:4], eps_4, atol=1e-5), \
+            "NoiseNetV2 output depends on other batch elements!"
+
+    def test_equal_batch_and_seq_dims(self):
+        """B == S is the MOST DANGEROUS case for transposed dims."""
+        torch.manual_seed(42)
+        net = _make_noise_net_v2()
+        net.eval()
+
+        obs_16 = torch.randn(16, 16, D)
+        noise_ac = torch.randn(16, T_P, AC_DIM)
+        time = torch.randint(0, 100, (16,))
+
+        _, eps_16 = net(noise_ac, time, obs_16)
+        _, eps_4 = net(noise_ac[:4], time[:4], obs_16[:4])
+
+        assert torch.allclose(eps_16[:4], eps_4, atol=1e-5), \
+            "Batch independence fails when B == S_obs!"
+
+
+class TestDiTNoiseNetV2Consistency:
+    def test_enc_dec_equals_forward(self):
+        """forward_enc + forward_dec should match full forward."""
+        torch.manual_seed(42)
+        net = _make_noise_net_v2()
+        net.eval()
+
+        obs = torch.randn(B, S_OBS, D)
+        noise_ac = torch.randn(B, T_P, AC_DIM)
+        time = torch.randint(0, 100, (B,))
+
+        enc_cache_1, eps_1 = net(noise_ac, time, obs)
+        enc_cache_2 = net.forward_enc(obs)
+        eps_2 = net.forward_dec(noise_ac, time, enc_cache_2)
+
+        assert torch.allclose(eps_1, eps_2, atol=1e-5)
+        for e1, e2 in zip(enc_cache_1, enc_cache_2):
+            assert torch.allclose(e1, e2, atol=1e-5)
+
+
+class TestDiTNoiseNetV2GradientFlow:
+    def test_all_params_receive_gradient(self):
+        """All params get nonzero gradients after perturbing zero-init layers."""
+        net = _make_noise_net_v2()
+        with torch.no_grad():
+            for p in net.parameters():
+                if p.requires_grad and torch.all(p == 0):
+                    p.add_(torch.randn_like(p) * 0.01)
+
+        obs = torch.randn(2, 8, D)
+        noise_ac = torch.randn(2, T_P, AC_DIM)
+        time = torch.randint(0, 100, (2,))
+        _, eps = net(noise_ac, time, obs)
+        eps.sum().backward()
+
+        for name, p in net.named_parameters():
+            if p.requires_grad:
+                assert p.grad is not None, f"No gradient for {name}"
+                assert not torch.all(p.grad == 0), f"Zero gradient for {name}"
+
+    def test_obs_input_receives_gradient(self):
+        """Gradients flow back through encoder to observation input."""
+        net = _make_noise_net_v2()
+        obs = torch.randn(2, 8, D, requires_grad=True)
+        noise_ac = torch.randn(2, T_P, AC_DIM)
+        time = torch.randint(0, 100, (2,))
+        _, eps = net(noise_ac, time, obs)
+        eps.sum().backward()
+        assert obs.grad is not None
+        assert torch.isfinite(obs.grad).all()
+
+
+class TestDiTNoiseNetV2EdgeCases:
+    def test_batch_size_one(self):
+        net = _make_noise_net_v2()
+        obs = torch.randn(1, S_OBS, D)
+        noise_ac = torch.randn(1, T_P, AC_DIM)
+        time = torch.randint(0, 100, (1,))
+        _, eps = net(noise_ac, time, obs)
+        assert eps.shape == (1, T_P, AC_DIM)
+
+    def test_single_obs_token(self):
+        net = _make_noise_net_v2()
+        obs = torch.randn(B, 1, D)
+        noise_ac = torch.randn(B, T_P, AC_DIM)
+        time = torch.randint(0, 100, (B,))
+        _, eps = net(noise_ac, time, obs)
+        assert eps.shape == (B, T_P, AC_DIM)
+
+    def test_8d_actions_rlbench(self):
+        """RLBench uses 8D actions."""
+        net = _make_noise_net_v2(ac_dim=8)
+        obs = torch.randn(B, S_OBS, D)
+        noise_ac = torch.randn(B, T_P, 8)
+        time = torch.randint(0, 100, (B,))
+        _, eps = net(noise_ac, time, obs)
+        assert eps.shape == (B, T_P, 8)
+
+    def test_outputs_finite(self):
+        """No NaN or Inf in any output."""
+        net = _make_noise_net_v2()
+        obs = torch.randn(B, S_OBS, D)
+        noise_ac = torch.randn(B, T_P, AC_DIM)
+        time = torch.randint(0, 100, (B,))
+        enc_cache, eps = net(noise_ac, time, obs)
+        assert torch.isfinite(eps).all(), "NaN or Inf in eps output"
+        for i, e in enumerate(enc_cache):
+            assert torch.isfinite(e).all(), f"NaN or Inf in enc_cache[{i}]"

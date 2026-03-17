@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 
 from models.base_policy import BasePolicy
-from models.diffusion import _DiTNoiseNet
+from models.diffusion import _DiTNoiseNet, _DiTNoiseNetV2
 from models.ema import EMA
 from models.policy_dit import PolicyDiT
 from models.stage1_bridge import Stage1Bridge
@@ -41,9 +41,11 @@ from training.train_stage3 import (
 # ---------------------------------------------------------------------------
 B = 2
 K = 4
-N = 196         # tokens per view (14x14 patches)
+N_RAW = 196     # raw tokens per view (14x14 patches, from Stage1Bridge)
+N = 49          # pooled tokens per view (7x7 spatial pool in PolicyDiT)
 D_ENC = 1024    # DINOv3 output dim
-D_MODEL = 512   # adapter / hidden dim
+D_ADAPTER = 512 # adapter output dim (fixed by Stage 1)
+D_MODEL = 256   # hidden dim (V2 default, after obs_proj)
 H = W = 224
 T_O = 2
 T_P = 16
@@ -125,7 +127,6 @@ def _make_policy(**kwargs):
         eval_diffusion_steps=5,
         p_view_drop=0.0,
         lambda_recon=0.0,
-        use_lightning=True,
         policy_type="ddpm",
     )
     defaults.update(kwargs)
@@ -183,13 +184,13 @@ class TestStage1Bridge:
         assert hasattr(Stage1Bridge, "compute_recon_loss")
 
     def test_encode_output_shape(self):
-        """encode() returns (B, T_o, K, N, d') adapted tokens."""
+        """encode() returns (B, T_o, K, N_RAW, D_ADAPTER) adapted tokens."""
         bridge = _make_bridge()
         images = torch.randn(B, T_O, K, 3, H, W)
         vp = torch.ones(B, K, dtype=torch.bool)
         adapted = bridge.encode(images, vp)
-        assert adapted.shape == (B, T_O, K, N, D_MODEL), (
-            f"Expected ({B}, {T_O}, {K}, {N}, {D_MODEL}), got {adapted.shape}"
+        assert adapted.shape == (B, T_O, K, N_RAW, D_ADAPTER), (
+            f"Expected ({B}, {T_O}, {K}, {N_RAW}, {D_ADAPTER}), got {adapted.shape}"
         )
 
     def test_encode_partial_views(self):
@@ -198,7 +199,7 @@ class TestStage1Bridge:
         images = torch.randn(B, T_O, K, 3, H, W)
         vp = torch.tensor([[True, True, False, False]] * B)
         adapted = bridge.encode(images, vp)
-        assert adapted.shape == (B, T_O, K, N, D_MODEL)
+        assert adapted.shape == (B, T_O, K, N_RAW, D_ADAPTER)
         # Absent views should be zero
         assert torch.all(adapted[:, :, 2:] == 0)
 
@@ -233,17 +234,21 @@ class TestStage1Bridge:
 # ============================================================
 
 class TestTokenAssembly:
-    """Tests for C.4 TokenAssembly embeddings and assembly."""
+    """Tests for C.4 TokenAssembly embeddings and assembly.
+
+    In V2 architecture, PolicyDiT pools 14x14 -> 7x7 (49 patches) and
+    projects 512 -> hidden_dim (256) before feeding into TokenAssembly.
+    """
 
     def test_output_shape_all_views(self):
-        """All views present: S_obs = T_o * K * N + T_o = 2*4*196+2 = 1570."""
+        """All views present: S_obs = T_o * K * N + T_o = 2*4*49+2 = 394."""
         ta = TokenAssembly(d_model=D_MODEL, num_patches=N, num_views=K,
                            num_obs_steps=T_O, proprio_dim=PROPRIO_DIM)
         adapted = torch.randn(B, T_O, K, N, D_MODEL)
         proprio = torch.randn(B, T_O, PROPRIO_DIM)
         vp = torch.ones(B, K, dtype=torch.bool)
         out = ta(adapted, proprio, vp)
-        expected_S = T_O * K * N + T_O  # 1570
+        expected_S = T_O * K * N + T_O  # 394
         assert out.shape == (B, expected_S, D_MODEL)
 
     def test_output_shape_fixed_length(self):
@@ -255,7 +260,7 @@ class TestTokenAssembly:
         vp = torch.tensor([[True, True, False, False]] * B)
         out = ta(adapted, proprio, vp)
         # Fixed length regardless of view_present
-        expected_S = T_O * K * N + T_O  # 1570
+        expected_S = T_O * K * N + T_O  # 394
         assert out.shape == (B, expected_S, D_MODEL)
 
     def test_output_is_batch_first(self):
@@ -349,7 +354,11 @@ class TestCrossComponentWiring:
     """Tests that verify correct wiring between components."""
 
     def test_bridge_to_assembly_shapes(self):
-        """Stage1Bridge output feeds into TokenAssembly without shape errors."""
+        """Stage1Bridge -> pool -> proj -> TokenAssembly feeds without shape errors.
+
+        In V2 architecture, PolicyDiT pools (196 -> 49 patches) and projects
+        (512 -> hidden_dim) between bridge.encode() and token_assembly().
+        """
         bridge = _make_bridge()
         ta = TokenAssembly(d_model=D_MODEL, num_patches=N, num_views=K,
                            num_obs_steps=T_O, proprio_dim=PROPRIO_DIM)
@@ -358,16 +367,27 @@ class TestCrossComponentWiring:
         vp = torch.ones(B, K, dtype=torch.bool)
         proprio = torch.randn(B, T_O, PROPRIO_DIM)
 
-        adapted = bridge.encode(images, vp)  # (B, T_o, K, N, d')
-        obs_tokens = ta(adapted, proprio, vp)
+        adapted = bridge.encode(images, vp)  # (B, T_o, K, 196, 512)
+        assert adapted.shape == (B, T_O, K, N_RAW, D_ADAPTER)
+
+        # Simulate spatial pool + obs_proj (as PolicyDiT does internally)
+        pool = nn.AdaptiveAvgPool2d((7, 7))
+        proj = nn.Linear(D_ADAPTER, D_MODEL)
+        B_, T_o, K_, _, d_ = adapted.shape
+        x = adapted.reshape(B_ * T_o * K_, 14, 14, d_).permute(0, 3, 1, 2)
+        x = pool(x).permute(0, 2, 3, 1).reshape(B_, T_o, K_, N, -1)
+        x = proj(x)  # (B, T_o, K, 49, 256)
+        assert x.shape == (B, T_O, K, N, D_MODEL)
+
+        obs_tokens = ta(x, proprio, vp)
         expected_S = T_O * K * N + T_O
         assert obs_tokens.shape == (B, expected_S, D_MODEL)
 
     def test_assembly_to_noise_net_shapes(self):
-        """TokenAssembly output feeds into noise_net.forward_enc without errors."""
+        """TokenAssembly output feeds into _DiTNoiseNetV2.forward_enc without errors."""
         ta = TokenAssembly(d_model=D_MODEL, num_patches=N, num_views=K,
                            num_obs_steps=T_O, proprio_dim=PROPRIO_DIM)
-        noise_net = _DiTNoiseNet(
+        noise_net = _DiTNoiseNetV2(
             ac_dim=AC_DIM, ac_chunk=T_P, hidden_dim=D_MODEL,
             num_blocks=2, nhead=8,
         )
@@ -382,8 +402,14 @@ class TestCrossComponentWiring:
         assert enc_cache[0].shape[0] == B  # batch dim first
 
     def test_bridge_viewdrop_assembly_pipeline(self):
-        """Bridge → ViewDropout → TokenAssembly produces correct shapes."""
+        """Bridge -> pool -> proj -> ViewDropout -> TokenAssembly produces correct shapes.
+
+        In V2 architecture, spatial pooling and projection happen between
+        bridge.encode() and view dropout / token assembly.
+        """
         bridge = _make_bridge()
+        pool = nn.AdaptiveAvgPool2d((7, 7))
+        proj = nn.Linear(D_ADAPTER, D_MODEL)
         vd = ViewDropout(d_model=D_MODEL, p=0.5)
         ta = TokenAssembly(d_model=D_MODEL, num_patches=N, num_views=K,
                            num_obs_steps=T_O, proprio_dim=PROPRIO_DIM)
@@ -392,14 +418,19 @@ class TestCrossComponentWiring:
         vp = torch.ones(B, K, dtype=torch.bool)
         proprio = torch.randn(B, T_O, PROPRIO_DIM)
 
-        adapted = bridge.encode(images, vp)  # (B, T_o, K, N, d')
+        adapted = bridge.encode(images, vp)  # (B, T_o, K, 196, 512)
+        B_, T_o, K_, N_raw, d_ = adapted.shape
 
-        # ViewDropout expects (B, K, N, d') — reshape per timestep
-        B_, T_o, K_, N_, d_ = adapted.shape
-        flat = adapted.reshape(B_ * T_o, K_, N_, d_)
+        # Simulate spatial pool + obs_proj
+        x = adapted.reshape(B_ * T_o * K_, 14, 14, d_).permute(0, 3, 1, 2)
+        x = pool(x).permute(0, 2, 3, 1).reshape(B_ * T_o * K_, N, -1)
+        x = proj(x).reshape(B_, T_o, K_, N, D_MODEL)
+
+        # ViewDropout expects (B*T_o, K, N, d')
+        flat = x.reshape(B_ * T_o, K_, N, D_MODEL)
         flat_vp = vp.unsqueeze(1).expand(-1, T_o, -1).reshape(B_ * T_o, K_)
         dropped, new_vp = vd(flat, flat_vp)
-        dropped = dropped.reshape(B_, T_o, K_, N_, d_)
+        dropped = dropped.reshape(B_, T_o, K_, N, D_MODEL)
 
         obs_tokens = ta(dropped, proprio, vp)
         expected_S = T_O * K * N + T_O
@@ -494,7 +525,7 @@ class TestRealCheckpoint:
         images = torch.randn(1, T_O, K, 3, H, W)
         vp = torch.ones(1, K, dtype=torch.bool)
         adapted = bridge.encode(images, vp)
-        assert adapted.shape == (1, T_O, K, N, D_MODEL)
+        assert adapted.shape == (1, T_O, K, N_RAW, D_ADAPTER)
         # Should be non-zero (trained adapter transforms random encoder output)
         assert adapted.abs().mean() > 0.01
 
@@ -524,7 +555,6 @@ class TestRealCheckpoint:
             eval_diffusion_steps=5,
             p_view_drop=0.0,
             lambda_recon=0.0,
-            use_lightning=True,
             policy_type="ddpm",
         )
         batch = _make_batch(b=1)

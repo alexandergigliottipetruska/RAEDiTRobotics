@@ -41,7 +41,7 @@ def load_policy(
     device: str = "cuda",
     policy_type: str = "ddpm",
     num_flow_steps: int = 10,
-    eval_diffusion_steps: int = 10,
+    eval_diffusion_steps: int = 100,
     use_ema: bool = True,
 ):
     """Load a trained PolicyDiT from checkpoint.
@@ -61,10 +61,10 @@ def load_policy(
         bridge=bridge,
         ac_dim=7,
         proprio_dim=9,
-        hidden_dim=512,
+        hidden_dim=256,
         T_obs=2,
         T_pred=16,
-        num_blocks=6,
+        num_blocks=4,
         nhead=8,
         num_views=4,
         train_diffusion_steps=100,
@@ -118,8 +118,8 @@ def main():
     parser.add_argument("--policy_type", default="ddpm", choices=["ddpm", "flow_matching"])
     parser.add_argument("--num_flow_steps", type=int, default=10,
                         help="Euler integration steps for flow matching inference")
-    parser.add_argument("--eval_steps", type=int, default=10,
-                        help="DDIM denoising steps (for DDPM policy_type)")
+    parser.add_argument("--eval_steps", type=int, default=100,
+                        help="DDIM denoising steps (Chi uses 100)")
     parser.add_argument("--no_ema", action="store_true",
                         help="Use raw weights instead of EMA")
     args = parser.parse_args()
