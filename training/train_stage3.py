@@ -641,10 +641,28 @@ def train_stage3(
         # Average epoch losses
         avg = {k: v / max(n_steps, 1) for k, v in epoch_losses.items()}
 
-        # Validation + logging (rank 0 only)
+        # --- Validation loop ---
+        policy.eval()
+        val_losses: dict[str, float] = {}
+        val_steps = 0
+        with torch.no_grad():
+            for val_batch in valid_loader:
+                val_batch_dev = {
+                    k: v.to(device) if isinstance(v, torch.Tensor) else v
+                    for k, v in val_batch.items()
+                }
+                with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
+                    val_loss = _unwrap(policy)(val_batch_dev)
+                val_losses["policy"] = val_losses.get("policy", 0.0) + val_loss.item()
+                val_steps += 1
+        val_avg = {k: v / max(val_steps, 1) for k, v in val_losses.items()}
+        policy.train()
+
+        # Logging (rank 0 only)
         if is_main:
             train_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(avg.items()))
-            log.info("Epoch %d  %s  (lr=%.2e)", epoch, train_str,
+            val_str = " | ".join(f"val_{k}={v:.4f}" for k, v in sorted(val_avg.items()))
+            log.info("Epoch %d  %s | %s  (lr=%.2e)", epoch, train_str, val_str,
                      optimizer.param_groups[0]["lr"])
 
             if metrics_path:
@@ -653,6 +671,7 @@ def train_stage3(
                         "epoch": epoch, "global_step": global_step,
                         "lr": optimizer.param_groups[0]["lr"],
                         "train": avg,
+                        "valid": val_avg,
                     }) + "\n")
 
             # Periodic checkpointing
@@ -674,9 +693,9 @@ def train_stage3(
                     except Exception as e:
                         log.warning("Eval video failed at epoch %d: %s", epoch, e)
 
-            # Best checkpoint
-            if avg.get("policy", float("inf")) < best_val_loss:
-                best_val_loss = avg["policy"]
+            # Best checkpoint (based on validation loss)
+            if val_avg.get("policy", float("inf")) < best_val_loss:
+                best_val_loss = val_avg["policy"]
                 pu = _unwrap(policy)
                 save_checkpoint(
                     os.path.join(config.save_dir, "best.pt"),
@@ -688,6 +707,6 @@ def train_stage3(
             torch.distributed.barrier()
 
     if is_main:
-        log.info("Training complete. Best policy loss=%.4f", best_val_loss)
+        log.info("Training complete. Best val loss=%.4f", best_val_loss)
         log.removeHandler(fh)
         fh.close()
