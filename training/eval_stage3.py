@@ -85,6 +85,8 @@ def load_policy(
     policy.noise_net.load_state_dict(_strip(ckpt["noise_net"]))
     if "adapter" in ckpt:
         policy.bridge.adapter.load_state_dict(_strip(ckpt["adapter"]))
+    if "obs_proj" in ckpt and hasattr(policy, "obs_proj"):
+        policy.obs_proj.load_state_dict(_strip(ckpt["obs_proj"]))
 
     policy.to(device)
     policy.eval()

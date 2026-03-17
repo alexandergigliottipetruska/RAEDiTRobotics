@@ -295,6 +295,7 @@ def save_checkpoint(
     ema: EMA | None,
     val_metrics: dict,
     decoder: nn.Module | None = None,
+    obs_proj: nn.Module | None = None,
 ):
     """Save Stage 3 training checkpoint."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -310,6 +311,8 @@ def save_checkpoint(
         ckpt["ema"] = ema.state_dict()
     if decoder is not None:
         ckpt["decoder"] = _unwrap(decoder).state_dict()
+    if obs_proj is not None:
+        ckpt["obs_proj"] = _unwrap(obs_proj).state_dict()
     torch.save(ckpt, path)
     log.info("Saved checkpoint: %s (epoch %d, step %d)", path, epoch, global_step)
 
@@ -321,6 +324,7 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     ema: EMA | None = None,
     decoder: nn.Module | None = None,
+    obs_proj: nn.Module | None = None,
 ) -> tuple[int, int]:
     """Load Stage 3 checkpoint. Returns (start_epoch, global_step)."""
     ckpt = torch.load(path, weights_only=False, map_location="cpu")
@@ -339,6 +343,8 @@ def load_checkpoint(
         ema.load_state_dict(ckpt["ema"])
     if decoder is not None and "decoder" in ckpt:
         decoder.load_state_dict(_strip_compile_prefix(ckpt["decoder"]))
+    if obs_proj is not None and "obs_proj" in ckpt:
+        obs_proj.load_state_dict(_strip_compile_prefix(ckpt["obs_proj"]))
 
     log.info("Loaded checkpoint from epoch %d, step %d: %s",
              ckpt["epoch"], ckpt["global_step"], path)
@@ -505,6 +511,7 @@ def train_stage3(
         start_epoch, global_step = load_checkpoint(
             resume_from, policy.noise_net, policy.bridge.adapter,
             optimizer, ema, policy.bridge.decoder,
+            obs_proj=getattr(policy, "obs_proj", None),
         )
 
     # torch.compile for faster training
@@ -679,6 +686,7 @@ def train_stage3(
                     os.path.join(config.save_dir, f"epoch_{epoch:03d}.pt"),
                     epoch, global_step, pu.noise_net, pu.bridge.adapter,
                     optimizer, ema, avg, decoder=pu.bridge.decoder,
+                    obs_proj=getattr(pu, "obs_proj", None),
                 )
 
             # Inline eval video (separate schedule from checkpointing)
@@ -699,6 +707,7 @@ def train_stage3(
                     os.path.join(config.save_dir, "best.pt"),
                     epoch, global_step, pu.noise_net, pu.bridge.adapter,
                     optimizer, ema, avg, decoder=pu.bridge.decoder,
+                    obs_proj=getattr(pu, "obs_proj", None),
                 )
 
         if distributed:

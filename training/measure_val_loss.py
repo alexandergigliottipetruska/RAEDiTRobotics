@@ -77,14 +77,6 @@ def main():
         bridge=bridge,
         ac_dim=7,
         proprio_dim=9,
-        hidden_dim=512,
-        T_obs=2,
-        T_pred=16,
-        num_blocks=6,
-        nhead=8,
-        num_views=4,
-        train_diffusion_steps=100,
-        eval_diffusion_steps=10,
         policy_type=args.policy_type,
         p_view_drop=0.0,
     )
@@ -102,6 +94,8 @@ def main():
     policy.noise_net.load_state_dict(_strip(ckpt["noise_net"]))
     if "adapter" in ckpt:
         policy.bridge.adapter.load_state_dict(_strip(ckpt["adapter"]))
+    if "obs_proj" in ckpt and hasattr(policy, "obs_proj"):
+        policy.obs_proj.load_state_dict(_strip(ckpt["obs_proj"]))
 
     policy.to(device)
     policy.eval()
@@ -167,9 +161,7 @@ def main():
         load_decoder=False,
     )
     policy_rand = PolicyDiT(
-        bridge=bridge_rand, ac_dim=7, proprio_dim=9, hidden_dim=512,
-        T_obs=2, T_pred=16, num_blocks=6, nhead=8, num_views=4,
-        train_diffusion_steps=100, eval_diffusion_steps=10,
+        bridge=bridge_rand, ac_dim=7, proprio_dim=9,
         policy_type=args.policy_type, p_view_drop=0.0,
     )
     policy_rand.to(device)
