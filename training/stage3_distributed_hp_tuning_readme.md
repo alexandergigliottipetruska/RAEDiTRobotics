@@ -146,4 +146,3 @@ for node in dh2026pc06 dh2026pc08 dh2026pc09 dh2026pc10; do
     echo ""
 done
 ```
-Charlotte200@
