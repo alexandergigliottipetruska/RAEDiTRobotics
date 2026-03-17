@@ -1,6 +1,6 @@
 # NOTE we no longer check out to a branch or pull automatically
 project:
-  study_name: "robotics_stage3_lift_test"
+  study_name: "robotics_stage3_lift"
   domain: "utm.utoronto.ca" #important for lab pc distribution
   project_root: "/student/denassau/CSC415/Project/RAEDiTRobotics"
   venv_path: "~/sweep_env/bin/activate"
@@ -38,7 +38,7 @@ nodes:
   - dh2020pc09
   # - dh2020pc10
   - dh2020pc11
-  - dh2020pc12
+  # - dh2020pc12
   - dh2020pc13
   - dh2020pc14
   - dh2020pc15
@@ -46,10 +46,14 @@ nodes:
   - dh2020pc17
   # - dh2020pc18
   - dh2020pc19
+  - dh2020pc20
+  # - dh2020pc21
+  - dh2020pc22
+  - dh2020pc23
 
   # - dh2026pc05
   - dh2026pc06
-  - dh2026pc07
+  # - dh2026pc07
   - dh2026pc08
   - dh2026pc09
   - dh2026pc10
@@ -62,6 +66,9 @@ nodes:
   - dh2026pc17
   - dh2026pc18
   - dh2026pc19
+  - dh2026pc20
+  - dh2026pc21
+
 
 # ---------------------------------------------------------------------------
 # FIXED VARIABLES (Passed directly to Stage3Config)
@@ -73,7 +80,7 @@ training_static:
     - "/student/denassau/CSC415/Project/RAEDiTRobotics/data/stage3_decompressed_tokens/lift_tokens_fast.hdf5"
     
   # Hardware & Horizon Locks
-  batch_size: 42
+  batch_size: 36
   num_workers: 10
   norm_mode: "minmax"
   ac_dim: 7
