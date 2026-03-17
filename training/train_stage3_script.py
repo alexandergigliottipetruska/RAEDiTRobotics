@@ -90,6 +90,8 @@ def main():
     # Checkpointing
     parser.add_argument("--save_dir", default="checkpoints/stage3")
     parser.add_argument("--save_every_epoch", type=int, default=10)
+    parser.add_argument("--eval_every_epoch", type=int, default=50,
+                        help="Eval video frequency (independent of checkpoint saves)")
     parser.add_argument("--resume", default=None, help="Stage 3 checkpoint to resume from")
 
     # Inline eval video
@@ -144,6 +146,7 @@ def main():
         ema_decay=args.ema_decay,
         save_dir=args.save_dir,
         save_every_epoch=args.save_every_epoch,
+        eval_every_epoch=args.eval_every_epoch,
         eval_video_task=args.eval_video_task,
         eval_video_hdf5=args.eval_video_hdf5,
         eval_video_episodes=args.eval_video_episodes,

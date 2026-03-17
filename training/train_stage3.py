@@ -683,15 +683,15 @@ def train_stage3(
                     optimizer, ema, avg, decoder=pu.bridge.decoder,
                 )
 
-                # Inline eval video
-                if config.eval_video_task:
-                    try:
-                        pu_eval = _unwrap(policy)
-                        pu_eval.eval()
-                        _run_eval_video(pu_eval, config, epoch, device)
-                        pu_eval.train()
-                    except Exception as e:
-                        log.warning("Eval video failed at epoch %d: %s", epoch, e)
+            # Inline eval video (separate schedule from checkpointing)
+            if config.eval_video_task and (epoch + 1) % config.eval_every_epoch == 0:
+                try:
+                    pu_eval = _unwrap(policy)
+                    pu_eval.eval()
+                    _run_eval_video(pu_eval, config, epoch, device)
+                    pu_eval.train()
+                except Exception as e:
+                    log.warning("Eval video failed at epoch %d: %s", epoch, e)
 
             # Best checkpoint (based on validation loss)
             if val_avg.get("policy", float("inf")) < best_val_loss:
