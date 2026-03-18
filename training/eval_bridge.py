@@ -44,7 +44,7 @@ def main():
         TrainDiffusionTransformerHybridWorkspace,
     )
     workspace = TrainDiffusionTransformerHybridWorkspace(cfg, output_dir="/tmp/eval_bridge")
-    workspace.load_payload(payload, exclude_keys=None, include_keys=['global_step', 'epoch'])
+    workspace.load_payload(payload, exclude_keys=['optimizer'], include_keys=['global_step', 'epoch'])
 
     # Get EMA policy
     if cfg.training.use_ema:
@@ -98,9 +98,10 @@ def main():
                         # Flip vertically: robosuite returns bottom-up,
                         # robomimic's EnvRobosuite flips to top-up.
                         img = o[key][::-1].copy()
-                        # HWC→CHW (obs_encoder expects CHW), but keep uint8 [0,255]
-                        # — normalizer handles the value scaling.
-                        img = np.moveaxis(img, -1, 0)  # (3, H, W) uint8
+                        # Convert to float [0,1] — normalizer was fitted on [0,1] data
+                        img = img.astype(np.float32) / 255.0
+                        # HWC→CHW (obs_encoder expects CHW)
+                        img = np.moveaxis(img, -1, 0)  # (3, H, W) float [0,1]
                         imgs.append(img)
                     obs_dict[key] = torch.from_numpy(
                         np.stack(imgs)  # (T_o, 3, H, W) uint8
@@ -147,3 +148,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+W
