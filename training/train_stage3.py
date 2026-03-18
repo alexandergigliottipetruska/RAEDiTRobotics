@@ -389,6 +389,7 @@ def _run_eval_video(policy, config, epoch, device):
         result = run_episode_with_recording(
             wrapper, env, config.norm_mode, action_stats, proprio_stats,
             max_steps=400, exec_horizon=config.T_act,
+            rot6d=(config.abs_action and config.ac_dim == 10),
         )
         status = "success" if result["success"] else "fail"
         log.info("Eval video epoch %d ep %d: %s (%d steps)",

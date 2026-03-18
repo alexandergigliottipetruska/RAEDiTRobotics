@@ -53,6 +53,7 @@ def run_episode_with_recording(
     max_steps=400,
     exec_horizon=8,
     obs_horizon=2,
+    rot6d=False,
 ):
     """Run one episode, recording frames and actions."""
     env.reset()
@@ -102,6 +103,11 @@ def run_episode_with_recording(
                 raw = (raw + 1.0) / 2.0 * a_range + action_stats["min"]
             else:
                 raw = raw * action_stats["std"] + action_stats["mean"]
+
+            # Convert 10D rot6d -> 7D axis-angle for robosuite
+            if rot6d:
+                from data_pipeline.utils.rotation import convert_actions_from_rot6d
+                raw = convert_actions_from_rot6d(raw)
 
             action_queue = list(raw[:exec_horizon])
 
