@@ -125,8 +125,8 @@ def main():
                         help="DDIM denoising steps (Chi uses 100)")
     parser.add_argument("--no_ema", action="store_true",
                         help="Use raw weights instead of EMA")
-    parser.add_argument("--abs_action", action="store_true",
-                        help="Use absolute EE pose actions (Chi-style)")
+    parser.add_argument("--abs_action", default="",
+                        help="Path to raw HDF5 with env_args for absolute action eval")
     parser.add_argument("--ac_dim", type=int, default=7,
                         help="Action dimension (7 for delta/abs, 10 for abs+rot6d)")
     args = parser.parse_args()
@@ -156,7 +156,7 @@ def main():
     # Create environment
     log.info("Creating %s environment", args.task)
     env = RobomimicWrapper(task=args.task, seed=args.seed,
-                           abs_action=getattr(args, 'abs_action', False))
+                           abs_action=args.abs_action or None)
 
     # Run evaluation
     log.info("Running %d episodes...", args.num_episodes)
@@ -176,7 +176,7 @@ def main():
         proprio_max=proprio_stats.get("max"),
         exec_horizon=args.exec_horizon,
         obs_horizon=2,
-        rot6d=getattr(args, 'abs_action', False),
+        rot6d=bool(args.abs_action) and args.ac_dim == 10,
     )
 
     # Report
