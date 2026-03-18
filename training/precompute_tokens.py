@@ -40,17 +40,22 @@ _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 def precompute(
     hdf5_path: str,
     output_path: str,
-    batch_size: int = 32,
+    batch_size: int = 128,
     device: str = "cuda",
+    fast: bool = True,
 ):
     """Precompute encoder tokens and save to cache HDF5.
 
     The output HDF5 has the same structure as the input but with
     `tokens` (T, K, 196, 1024) float16 instead of `images`.
     Actions, proprio, view_present, masks, and norm_stats are copied over.
+
+    Args:
+        fast: If True, write uncompressed (no gzip). Larger file but
+              much faster DataLoader reads. No need for separate decompress step.
     """
     device = torch.device(device if torch.cuda.is_available() else "cpu")
-    log.info("Using device: %s", device)
+    log.info("Using device: %s (batch_size=%d, fast=%s)", device, batch_size, fast)
 
     # Load encoder
     encoder = FrozenMultiViewEncoder(pretrained=True)
@@ -112,13 +117,16 @@ def precompute(
 
                 tokens_all[:, k] = np.concatenate(view_tokens, axis=0)
 
-            # Save to output (gzip compresses zero-padded absent views well)
+            # Save to output
             dst_grp = dst.create_group(f"data/{key}")
-            dst_grp.create_dataset(
-                "tokens", data=tokens_all,
-                chunks=(min(T, 16), K, 196, 1024),
-                compression="gzip", compression_opts=1,
-            )
+            if fast:
+                dst_grp.create_dataset("tokens", data=tokens_all)
+            else:
+                dst_grp.create_dataset(
+                    "tokens", data=tokens_all,
+                    chunks=(min(T, 16), K, 196, 1024),
+                    compression="gzip", compression_opts=1,
+                )
             # Copy actions, proprio, view_present
             for ds_name in ["actions", "proprio", "view_present"]:
                 dst_grp.create_dataset(ds_name, data=grp[ds_name][:])
@@ -134,15 +142,18 @@ def main():
     parser.add_argument("--hdf5", required=True, help="Input unified HDF5")
     parser.add_argument("--output", default=None,
                         help="Output cache HDF5 (default: <input>_tokens.hdf5)")
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--no_fast", action="store_true",
+                        help="Use gzip compression (slower reads, smaller file)")
     args = parser.parse_args()
 
     if args.output is None:
         base, ext = os.path.splitext(args.hdf5)
-        args.output = f"{base}_tokens{ext}"
+        suffix = "_tokens" if args.no_fast else "_tokens_fast"
+        args.output = f"{base}{suffix}{ext}"
 
-    precompute(args.hdf5, args.output, args.batch_size, args.device)
+    precompute(args.hdf5, args.output, args.batch_size, args.device, fast=not args.no_fast)
 
 
 if __name__ == "__main__":
