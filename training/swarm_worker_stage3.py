@@ -7,6 +7,9 @@ import shutil
 from huggingface_hub import HfApi
 from datetime import datetime
 
+import os
+os.environ["PYOPENGL_PLATFORM"] = "egl"
+
 # 1. THE PROJECT ROOT FIX
 # Ensures 'models' and 'training' imports work from the 'training/' subdir
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))

@@ -128,7 +128,7 @@ If you need to wipe the study and start over:
 
 **1. Delete the Optuna Study:**
 ```bash
-python3 -c "import optuna, yaml; db_url = yaml.safe_load(open('configs/secrets.yaml'))['db_url']; optuna.delete_study(study_name='robotics_stage3_lift_dropout_change', storage=db_url)"
+python3 -c "import optuna, yaml; db_url = yaml.safe_load(open('configs/secrets.yaml'))['db_url']; optuna.delete_study(study_name='robotics_stage3_lift_with_success_rate', storage=db_url)"
 ```
 
 **2. Clear Zombie Processes & Temp Files:**
@@ -140,7 +140,7 @@ done
 
 **3. Check Specific Worker Logs:**
 ```bash
-for node in dh2026pc06 dh2026pc08 dh2026pc09 dh2026pc10; do
+for node in dh2026pc21 dh2020pc07 dh2020pc08 dh2020pc09; do
     echo "=== LOGS FOR $node ==="
     ssh -o ConnectTimeout=5 $node.utm.utoronto.ca "tail -n 50 /tmp/swarm_logs/worker_${node}_stage3.log"
     echo ""

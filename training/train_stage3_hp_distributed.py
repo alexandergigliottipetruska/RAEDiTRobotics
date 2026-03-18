@@ -200,6 +200,59 @@ def validate(
     }
 
 
+import robomimic.utils.file_utils as FileUtils
+import robomimic.utils.env_utils as EnvUtils
+from robomimic.envs.env_base import EnvBase
+
+def run_mini_eval(model, config, num_episodes=10):
+    """
+    Runs a small number of simulator rollouts to calculate Success Rate.
+    """
+    # 1. Create the environment from the HDF5 metadata
+    # We use the first path in your config's hdf5_paths
+    original_hdf5 = config.eval_video_hdf5 
+    
+    # Safety check: if for some reason it's empty, fall back or error out
+    if not original_hdf5 or not os.path.exists(original_hdf5):
+        log.error(f"Missing eval_video_hdf5: {original_hdf5}")
+        return 0.0
+
+    env_meta = FileUtils.get_env_metadata_from_dataset(original_hdf5)
+
+    # Force headless rendering for the lab PCs
+    env = EnvUtils.create_env_from_metadata(
+        env_meta=env_meta,
+        render=False, 
+        render_offscreen=True, 
+        use_image_obs=True
+    )
+
+    model.eval()
+    success_count = 0
+    
+    for _ in range(num_episodes):
+        obs = env.reset()
+        goal = None # Lift is typically not goal-conditioned
+        done = False
+        
+        # 'horizon' is usually 400 for Lift
+        for _ in range(400): 
+            with torch.no_grad():
+                # Ensure observations are on the right device and have batch dim
+                action = _unwrap(model).predict_action(obs)
+                
+            obs, reward, done, info = env.step(action)
+            
+            # robomimic environments have an is_success() check
+            if env.is_success()["task"]:
+                success_count += 1
+                break
+            if done:
+                break
+                
+    env.close()
+    return success_count / num_episodes
+
 # ---------------------------------------------------------------------------
 # LR scheduler with linear warmup
 # ---------------------------------------------------------------------------
@@ -420,7 +473,12 @@ def train_stage3(
 
     # --- Training loop ---
     best_val_loss = float("inf")
+    best_epoch_loss = -1
 
+    max_sr_found = -1.0
+    best_epoch_sr = -1
+
+    last_sim_epoch = -1
     for epoch in range(start_epoch, config.num_epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -453,6 +511,8 @@ def train_stage3(
         if is_main:
             # ACTUALLY RUN VALIDATION
             val = validate(valid_loader, policy, use_amp=use_amp)
+
+            pu = _unwrap(policy)
             
             train_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(avg.items()))
             val_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(val.items()))
@@ -473,12 +533,17 @@ def train_stage3(
             # Checkpointing
             if is_best:
                 best_val_loss = val["val_policy"]
-                pu = _unwrap(policy)
+                best_epoch_loss = epoch
+
                 save_checkpoint(
-                    os.path.join(config.save_dir, "best.pt"),
+                    os.path.join(config.save_dir, "best_loss.pt"),
                     epoch, global_step, pu.noise_net, pu.bridge.adapter,
                     optimizer, ema, val, decoder=pu.bridge.decoder,
                 )
+
+                # Sync to Optuna Table
+                trial.set_user_attr("best_loss", float(best_val_loss))
+                trial.set_user_attr("best_epoch_loss", int(best_epoch_loss))
 
             # OPTUNA PRUNING & EXTRA METRICS CHECK 
             if trial is not None:
@@ -487,16 +552,32 @@ def train_stage3(
                 
                 # 2. Record additional metrics to the Optuna Dashboard ONLY when we hit a new best
                 #    This creates new columns in the dashboard UI!
-                if is_best:
-                    trial.set_user_attr("best_epoch", epoch)
-                    trial.set_user_attr("lr_at_best", optimizer.param_groups[0]["lr"])
-                    
-                    # Dynamically unpack all train/val dictionary items as UI columns
-                    for k, v in avg.items():
-                        trial.set_user_attr(f"train_{k}", float(v))
-                    for k, v in val.items():
-                        if k != "val_policy": # Skip the main objective since it's already tracked
-                            trial.set_user_attr(f"{k}", float(v))
+                if is_best or (epoch > 0 and epoch % config.save_every_epoch == 0):
+                    if epoch - last_sim_epoch >= 10:
+                        last_sim_epoch = epoch
+                        success_rate = run_mini_eval(policy, config, num_episodes=10)
+
+                        trial.set_user_attr("current_success_rate", success_rate)
+                        trial.set_user_attr("policy_type", config.policy_type) # Helpful for sorting FM vs DDPM
+
+                        if success_rate > max_sr_found:
+                            max_sr_found = success_rate
+                            best_epoch_sr = epoch
+
+                            # These are the columns that stay pinned to the peak performance
+                            trial.set_user_attr("best_success_rate", float(max_sr_found))
+                            trial.set_user_attr("best_epoch_success_rate", epoch)
+
+                            save_checkpoint(os.path.join(config.save_dir, "best_success_rate.pt"), 
+                                            epoch, global_step, pu.noise_net, pu.bridge.adapter,
+                                            optimizer, ema, val, decoder=pu.bridge.decoder,)
+                        
+                        # Dynamically unpack all train/val dictionary items as UI columns
+                        for k, v in avg.items():
+                            trial.set_user_attr(f"train_{k}", float(v))
+                        for k, v in val.items():
+                            if k != "val_policy": # Skip the main objective since it's already tracked
+                                trial.set_user_attr(f"{k}", float(v))
 
                 # 3. Check if the trial is a dud
                 if trial.should_prune():

@@ -1,6 +1,6 @@
 # NOTE we no longer check out to a branch or pull automatically
 project:
-  study_name: "robotics_stage3_lift_dropout_change"
+  study_name: "robotics_stage3_lift_with_success_rate"
   domain: "utm.utoronto.ca" #important for lab pc distribution
   project_root: "/student/denassau/CSC415/Project/RAEDiTRobotics"
   venv_path: "~/sweep_env/bin/activate"
@@ -14,16 +14,16 @@ project:
   scratch_dir: "/tmp/denassau_stage3"
   hf_repo_id: "Denass04/RAEDiTRobotics-stage3-sweeps"
 
-  # # Add your eval video parameters right here!
+  # Add your eval video parameters right here!
   # eval_video_task: "lift"
-  # eval_video_hdf5: "/student/denassau/CSC415/Project/RAEDiTRobotics/data/complete_unified_data/lift.hdf5"
+  eval_video_hdf5: "/student/denassau/CSC415/Project/RAEDiTRobotics/data/complete_unified_data/lift.hdf5"
   # eval_video_episodes: 1
   # eval_video_steps: 100
   # eval_video_dir: "/tmp/eval_videos" # Keep it in /tmp to avoid quota issues
   
   # Optuna Pruning Settings
   n_startup_trials: 10
-  n_warmup_steps: 500     # Don't prune any trial before epoch 500 (warmup phase)
+  n_warmup_steps: 400     # Don't prune any trial before epoch 500 (warmup phase)
   pruning_percentile: 25.0   # Prune if in the worst 25% of trials
   n_trials_per_worker: 5
 
@@ -120,7 +120,7 @@ hyperparameters_search:
   policy_type:
     method: "suggest_categorical"
     kwargs:
-      choices: ["flow_matching", "ddpm"]
+      choices: ["ddpm"]
 
   # 1. Learning Rates
   lr:
@@ -129,12 +129,12 @@ hyperparameters_search:
       low: 1.0e-5
       high: 5.0e-4
       log: true
-  lr_adapter:
-    method: "suggest_float"
-    kwargs:
-      low: 1.0e-6
-      high: 1.0e-4
-      log: true
+  # lr_adapter:
+  #   method: "suggest_float"
+  #   kwargs:
+  #     low: 1.0e-6
+  #     high: 1.0e-4
+  #     log: true
 
   # 2. DiT Architecture (Capacity vs Overfitting)
   num_blocks:
