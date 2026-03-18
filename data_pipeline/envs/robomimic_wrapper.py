@@ -3,8 +3,13 @@
 Wraps a robosuite environment to implement the BaseManipulationEnv interface.
 Extracts agentview + wrist images, resizes to 224x224, and pads to 4 camera slots.
 
-Gripper action is continuous [-1, 1] and passed through as-is.
+Supports both delta and absolute action modes via the OSC_POSE controller.
+In absolute mode, actions are 7D [pos(3), axis_angle(3), gripper(1)] interpreted
+as target EE poses (no scaling). The rot6d->axis_angle conversion should happen
+upstream in the rollout code, not here.
 """
+
+import logging
 
 import numpy as np
 from PIL import Image
@@ -53,7 +58,9 @@ class RobomimicWrapper(BaseManipulationEnv):
         task: Task name (lift, can, square, tool_hang).
         image_size: Target image size (default 224).
         seed: Random seed for env reset.
-        abs_action: If True, use absolute EE pose actions instead of deltas.
+        abs_action: If True, use absolute EE pose actions (input_type="absolute").
+            Actions are still 7D [pos(3), axis_angle(3), gripper(1)] — the
+            controller interprets them as target poses instead of deltas.
     """
 
     def __init__(
@@ -63,11 +70,10 @@ class RobomimicWrapper(BaseManipulationEnv):
         seed: int | None = None,
         abs_action: bool = False,
     ):
-        import logging
         import robosuite as suite
         from robosuite.controllers import load_composite_controller_config
 
-        # Suppress noisy robosuite warnings about unused controller components
+        # Suppress noisy robosuite warnings
         logging.getLogger("robosuite").setLevel(logging.ERROR)
 
         self._task = task
@@ -75,21 +81,16 @@ class RobomimicWrapper(BaseManipulationEnv):
         self._seed = seed
         self._abs_action = abs_action
 
-        controller_config = load_composite_controller_config(controller="BASIC")
+        # Load the Panda-specific default controller config.
+        # Structure: {"type": "BASIC", "body_parts": {"arms": {"right": {OSC_POSE config}}}}
+        controller_config = load_composite_controller_config(robot="panda")
 
         if abs_action:
-            # For absolute actions: use the composite config but set
-            # input_type to "absolute" instead of "delta".
-            # Also remove input/output scaling to pass raw EE poses through.
-            for part in controller_config.get("body_parts", {}).values():
-                if part.get("type") == "OSC_POSE":
-                    part["input_type"] = "absolute"
-                    # In absolute mode, input is raw EE pose, not [-1,1] scaled.
-                    # Remove the clipping that would limit to ±0.05m.
-                    part["input_max"] = 1
-                    part["input_min"] = -1
-                    part["output_max"] = [1.0, 1.0, 1.0, 3.15, 3.15, 3.15]
-                    part["output_min"] = [-1.0, -1.0, -1.0, -3.15, -3.15, -3.15]
+            # Set the right arm's OSC_POSE controller to absolute mode.
+            # In absolute mode, the controller directly assigns goal_pos and
+            # goal_ori from the action — no input/output scaling is applied.
+            # See robosuite/controllers/parts/arm/osc.py set_goal() lines 265-269.
+            controller_config["body_parts"]["arms"]["right"]["input_type"] = "absolute"
 
         self._env = suite.make(
             env_name=TASK_TO_ENV[task],

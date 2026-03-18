@@ -111,6 +111,10 @@ def _convert_demo(
     parts = [src_grp[f"obs/{k}"][:].astype(np.float32) for k in cfg["proprio_keys"]]
     dst_grp["proprio"][:] = np.concatenate(parts, axis=1)
 
+    # --- States (for GT replay / deterministic eval) ---
+    if "states" in src_grp and "states" in dst_grp:
+        dst_grp["states"][:] = src_grp["states"][:].astype(np.float32)
+
 
 def convert_task(raw_hdf5_path: str, output_path: str, task: str = "lift", rot6d: bool = False) -> None:
     """Convert a single robomimic task HDF5 to unified format.
@@ -145,8 +149,13 @@ def convert_task(raw_hdf5_path: str, output_path: str, task: str = "lift", rot6d
         ]
         all_keys = train_keys + valid_keys
 
+        # Check if source has simulator states (for GT replay)
+        first_demo = src[f"data/{all_keys[0]}"]
+        state_dim = first_demo["states"].shape[1] if "states" in first_demo else None
+
         print(f"Converting {len(train_keys)} train + {len(valid_keys)} valid demos")
         print(f"  Task:    {task} (action_dim={action_dim}, proprio_dim={proprio_dim})")
+        print(f"  States:  {'yes (' + str(state_dim) + 'D)' if state_dim else 'no'}")
         print(f"  Source:  {raw_hdf5_path}")
         print(f"  Output:  {output_path}")
 
@@ -154,7 +163,11 @@ def convert_task(raw_hdf5_path: str, output_path: str, task: str = "lift", rot6d
             for i, demo_key in enumerate(all_keys):
                 src_grp = src[f"data/{demo_key}"]
                 T = src_grp["actions"].shape[0]
-                dst_grp = create_demo_group(dst, demo_key, T, proprio_dim, action_dim=action_dim, image_dtype=np.uint8)
+                dst_grp = create_demo_group(
+                    dst, demo_key, T, proprio_dim,
+                    action_dim=action_dim, image_dtype=np.uint8,
+                    state_dim=state_dim,
+                )
                 _convert_demo(src_grp, dst_grp, cfg)
                 if (i + 1) % 20 == 0 or (i + 1) == len(all_keys):
                     print(f"  [{i+1}/{len(all_keys)}] done")

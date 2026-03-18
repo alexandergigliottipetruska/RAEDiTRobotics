@@ -7,6 +7,7 @@ Schema per demo group (data/<demo_key>/):
   view_present bool    [K]                  True if camera slot has real data
   actions     float32  [T, 7]               delta-EE: [dx,dy,dz,drx,dry,drz,gripper]
   proprio     float32  [T, D_prop]          benchmark-specific (dim stored in attrs)
+  states      float32  [T, D_state]         (optional) simulator state for GT replay/eval
 
 File-level attrs:
   benchmark       str    e.g. "robomimic"
@@ -63,6 +64,7 @@ def create_demo_group(
     compress: bool = True,
     action_dim: int = ACTION_DIM,
     image_dtype: np.dtype = np.float32,
+    state_dim: int | None = None,
 ) -> h5py.Group:
     """Create a demo group with pre-allocated datasets of the correct shapes.
 
@@ -73,6 +75,7 @@ def create_demo_group(
         D_prop:      Proprio vector dimension.
         compress:    Whether to use gzip compression (recommended for images).
         image_dtype: np.float32 (robomimic/maniskill) or np.uint8 (rlbench).
+        state_dim:   If not None, create a states dataset [T, state_dim] for GT replay.
 
     Returns:
         The newly created h5py.Group at data/<demo_key>.
@@ -114,6 +117,14 @@ def create_demo_group(
         dtype=np.float32,
         **kwargs,
     )
+
+    # States (optional): simulator state for GT replay and deterministic eval
+    if state_dim is not None:
+        grp.create_dataset(
+            "states",
+            shape=(T, state_dim),
+            dtype=np.float32,
+        )
 
     return grp
 
