@@ -43,6 +43,7 @@ def load_policy(
     num_flow_steps: int = 10,
     eval_diffusion_steps: int = 100,
     use_ema: bool = True,
+    ac_dim: int = 7,
 ):
     """Load a trained PolicyDiT from checkpoint.
 
@@ -59,7 +60,7 @@ def load_policy(
     # Create policy with default architecture
     policy = PolicyDiT(
         bridge=bridge,
-        ac_dim=7,
+        ac_dim=ac_dim,
         proprio_dim=9,
         hidden_dim=256,
         T_obs=2,
@@ -126,6 +127,8 @@ def main():
                         help="Use raw weights instead of EMA")
     parser.add_argument("--abs_action", action="store_true",
                         help="Use absolute EE pose actions (Chi-style)")
+    parser.add_argument("--ac_dim", type=int, default=7,
+                        help="Action dimension (7 for delta/abs, 10 for abs+rot6d)")
     args = parser.parse_args()
 
     device = args.device if torch.cuda.is_available() else "cpu"
@@ -139,6 +142,7 @@ def main():
         num_flow_steps=args.num_flow_steps,
         eval_diffusion_steps=args.eval_steps,
         use_ema=not args.no_ema,
+        ac_dim=args.ac_dim,
     )
 
     # Wrap for eval harness
