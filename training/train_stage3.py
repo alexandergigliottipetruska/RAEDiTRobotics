@@ -78,7 +78,7 @@ class Stage3Config:
 
     # Architecture
     ac_dim: int = 7             # action dimension (7 for both delta and absolute robomimic)
-    abs_action: str = ""        # Path to raw HDF5 with env_args for absolute actions (empty = delta)
+    abs_action: bool = False    # True for absolute EE pose actions (Chi-style)
     proprio_dim: int = 9        # proprio dimension
     num_views: int = 4          # max camera slots
     T_obs: int = 2
@@ -383,7 +383,7 @@ def _run_eval_video(policy, config, epoch, device):
     action_stats = norm["actions"]
     proprio_stats = norm["proprio"]
 
-    env = RobomimicWrapper(task=config.eval_video_task, seed=42, abs_action=config.abs_action or None)
+    env = RobomimicWrapper(task=config.eval_video_task, seed=42, abs_action=config.abs_action)
 
     for ep in range(config.eval_video_episodes):
         result = run_episode_with_recording(
@@ -508,7 +508,7 @@ def _run_diagnostics(policy, valid_loader, config, epoch, device, use_amp, metri
         action_stats = norm["actions"]
         proprio_stats = norm["proprio"]
 
-        env = RobomimicWrapper(task=config.eval_video_task, seed=42, abs_action=config.abs_action or None)
+        env = RobomimicWrapper(task=config.eval_video_task, seed=42, abs_action=config.abs_action)
         n_eval = 10  # 10 episodes per eval
         success_rate, results = evaluate_policy(
             wrapper, env, num_episodes=n_eval, max_steps=400,

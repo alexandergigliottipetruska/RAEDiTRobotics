@@ -41,8 +41,8 @@ def main():
 
     # Architecture
     parser.add_argument("--ac_dim", type=int, default=7)
-    parser.add_argument("--abs_action", default="",
-                        help="Path to raw HDF5 with env_args for absolute action eval (empty = delta)")
+    parser.add_argument("--abs_action", action="store_true",
+                        help="Use absolute EE pose actions (Chi-style)")
     parser.add_argument("--proprio_dim", type=int, default=9)
     parser.add_argument("--num_views", type=int, default=4)
     parser.add_argument("--T_obs", type=int, default=2)

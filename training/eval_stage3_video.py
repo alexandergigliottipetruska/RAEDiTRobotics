@@ -158,8 +158,8 @@ def main():
                         help="Euler integration steps for flow matching inference")
     parser.add_argument("--no_ema", action="store_true",
                         help="Use raw weights instead of EMA")
-    parser.add_argument("--abs_action", default="",
-                        help="Path to raw HDF5 with env_args for absolute action eval")
+    parser.add_argument("--abs_action", action="store_true",
+                        help="Use absolute EE pose actions (Chi-style)")
     parser.add_argument("--ac_dim", type=int, default=7,
                         help="Action dimension (7 or 10 for rot6d)")
     args = parser.parse_args()

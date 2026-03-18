@@ -53,9 +53,7 @@ class RobomimicWrapper(BaseManipulationEnv):
         task: Task name (lift, can, square, tool_hang).
         image_size: Target image size (default 224).
         seed: Random seed for env reset.
-        abs_action: Path to the raw robomimic HDF5 file (e.g. image_abs.hdf5)
-            for absolute action mode. None or empty string for delta mode.
-            The HDF5 must contain env_args metadata.
+        abs_action: If True, use absolute EE pose actions instead of deltas.
     """
 
     def __init__(
@@ -63,7 +61,7 @@ class RobomimicWrapper(BaseManipulationEnv):
         task: str,
         image_size: int = 224,
         seed: int | None = None,
-        abs_action: str | None = None,
+        abs_action: bool = False,
     ):
         import logging
         import robosuite as suite
@@ -80,26 +78,18 @@ class RobomimicWrapper(BaseManipulationEnv):
         controller_config = load_composite_controller_config(controller="BASIC")
 
         if abs_action:
-            # For absolute actions: load env metadata from HDF5 and set
-            # control_delta=False. This is exactly what Chi does
-            # (robomimic_image_runner.py:86).
-            import robomimic.utils.file_utils as FileUtils
-            import robomimic.utils.env_utils as EnvUtils
-
-            env_meta = FileUtils.get_env_metadata_from_dataset(
-                dataset_path=abs_action)
-            env_meta['env_kwargs']['use_object_obs'] = False
-            env_meta['env_kwargs']['controller_configs']['control_delta'] = False
-
-            robomimic_env = EnvUtils.create_env_from_metadata(
-                env_meta=env_meta,
-                render=False,
-                render_offscreen=True,
-                use_image_obs=True,
-            )
-            self._env = robomimic_env.env
-            self._last_obs = None
-            return
+            # For absolute actions: use the composite config but set
+            # input_type to "absolute" instead of "delta".
+            # Also remove input/output scaling to pass raw EE poses through.
+            for part in controller_config.get("body_parts", {}).values():
+                if part.get("type") == "OSC_POSE":
+                    part["input_type"] = "absolute"
+                    # In absolute mode, input is raw EE pose, not [-1,1] scaled.
+                    # Remove the clipping that would limit to ±0.05m.
+                    part["input_max"] = 1
+                    part["input_min"] = -1
+                    part["output_max"] = [1.0, 1.0, 1.0, 3.15, 3.15, 3.15]
+                    part["output_min"] = [-1.0, -1.0, -1.0, -3.15, -3.15, -3.15]
 
         self._env = suite.make(
             env_name=TASK_TO_ENV[task],
