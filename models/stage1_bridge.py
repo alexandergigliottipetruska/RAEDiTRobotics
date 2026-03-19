@@ -16,6 +16,7 @@ import logging
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from models.encoder import FrozenMultiViewEncoder
 from models.adapter import TrainableAdapter
@@ -130,6 +131,12 @@ class Stage1Bridge(nn.Module):
                     continue
 
                 imgs_k = images_enc[mask, t, k]  # (B_real, 3, H, W)
+
+                # Resize to 224x224 if env returns smaller images (e.g. 84x84)
+                if imgs_k.shape[-1] != 224 or imgs_k.shape[-2] != 224:
+                    imgs_k = F.interpolate(
+                        imgs_k, size=(224, 224), mode='bilinear', align_corners=False
+                    )
 
                 with torch.no_grad():
                     raw = self.encoder(imgs_k)  # (B_real, 196, 1024)
