@@ -100,11 +100,17 @@ class PolicyDiTv3(nn.Module):
             clip_sample=True,
         )
 
-    def _encode_obs(self, batch: dict) -> dict:
+    def _encode_obs(self, batch: dict, pre_normalized: bool = True) -> dict:
         """Encode observations into conditioning dict.
 
         Handles both precomputed tokens (cached_tokens key) and
         online encoding (images_enc key via Stage1Bridge).
+
+        Args:
+            batch: dict with images_enc or cached_tokens, proprio, view_present.
+            pre_normalized: Whether images_enc is already ImageNet-normalized.
+                True during training (Stage3Dataset pre-normalizes).
+                False during eval (env returns float [0,1]).
 
         Returns:
             obs_cond: dict with 'tokens' (B, S_obs, d_model) and 'global' (B, d_model)
@@ -116,7 +122,9 @@ class PolicyDiTv3(nn.Module):
             adapted = self.bridge.adapt(batch["cached_tokens"], view_present)
         else:
             # Online: full encoder → LN → adapter
-            adapted = self.bridge.encode(batch["images_enc"], view_present)
+            adapted = self.bridge.encode(
+                batch["images_enc"], view_present, pre_normalized=pre_normalized
+            )
 
         # adapted: (B, T_o, K, 196, 512)
         obs_cond = self.obs_encoder(adapted, batch["proprio"], view_present)
@@ -139,8 +147,8 @@ class PolicyDiTv3(nn.Module):
         B = actions.shape[0]
         device = actions.device
 
-        # 1. Encode observations
-        obs_cond = self._encode_obs(batch)
+        # 1. Encode observations (training: images are pre-normalized by dataset)
+        obs_cond = self._encode_obs(batch, pre_normalized=True)
 
         # 2. Sample random timesteps
         timesteps = torch.randint(
@@ -174,8 +182,8 @@ class PolicyDiTv3(nn.Module):
         device = obs_dict["proprio"].device
         B = obs_dict["proprio"].shape[0]
 
-        # 1. Encode observations (cached across denoising steps)
-        obs_cond = self._encode_obs(obs_dict)
+        # 1. Encode observations (eval: images are raw [0,1], bridge normalizes)
+        obs_cond = self._encode_obs(obs_dict, pre_normalized=False)
 
         # 2. Create DDIM scheduler for inference
         scheduler = DDIMScheduler(

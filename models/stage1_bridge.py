@@ -40,6 +40,10 @@ class Stage1Bridge(nn.Module):
         trainable_adapter: Whether adapter receives gradients.
     """
 
+    # ImageNet normalization constants
+    _IMAGENET_MEAN = [0.485, 0.456, 0.406]
+    _IMAGENET_STD = [0.229, 0.224, 0.225]
+
     def __init__(
         self,
         checkpoint_path: str = "",
@@ -105,12 +109,18 @@ class Stage1Bridge(nn.Module):
         self,
         images_enc: torch.Tensor,
         view_present: torch.Tensor,
+        pre_normalized: bool = False,
     ) -> torch.Tensor:
-        """Full pipeline: frozen encoder -> cancel-affine LN -> adapter.
+        """Full pipeline: resize -> ImageNet norm -> frozen encoder -> LN -> adapter.
 
         Args:
-            images_enc: (B, T_o, K, 3, H, W) ImageNet-normalized images.
+            images_enc: (B, T_o, K, 3, H, W) images.
+                If pre_normalized=True: already ImageNet-normalized (from Stage3Dataset).
+                If pre_normalized=False: float [0,1] (from eval env wrapper).
             view_present: (B, K) bool mask of real cameras.
+            pre_normalized: Whether images are already ImageNet-normalized.
+                Stage3Dataset returns pre-normalized images (True).
+                Eval wrapper returns float [0,1] images (False).
 
         Returns:
             adapted: (B, T_o, K, N, d') adapted tokens.
@@ -132,11 +142,17 @@ class Stage1Bridge(nn.Module):
 
                 imgs_k = images_enc[mask, t, k]  # (B_real, 3, H, W)
 
-                # Resize to 224x224 if env returns smaller images (e.g. 84x84)
+                # Resize to 224x224 if needed (env returns 84x84)
                 if imgs_k.shape[-1] != 224 or imgs_k.shape[-2] != 224:
                     imgs_k = F.interpolate(
                         imgs_k, size=(224, 224), mode='bilinear', align_corners=False
                     )
+
+                # ImageNet normalize if not already done
+                if not pre_normalized:
+                    mean = torch.tensor(self._IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
+                    std = torch.tensor(self._IMAGENET_STD, device=device).view(1, 3, 1, 1)
+                    imgs_k = (imgs_k - mean) / std
 
                 with torch.no_grad():
                     raw = self.encoder(imgs_k)  # (B_real, 196, 1024)
