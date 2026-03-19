@@ -17,6 +17,7 @@ Usage:
 """
 
 import logging
+import threading
 
 import numpy as np
 import torch
@@ -47,6 +48,7 @@ class V3PolicyWrapper:
         self.device = torch.device(device)
         self.policy.to(self.device)
         self.policy.eval()
+        self._inference_lock = threading.Lock()  # for thread-safe parallel eval
 
     def predict(
         self,
@@ -78,16 +80,16 @@ class V3PolicyWrapper:
             "view_present": view_present,
         }
 
-        if self.ema_model is not None:
-            # Store current weights, load EMA, predict, restore
-            self.ema_model.store(self.policy.parameters())
-            self.ema_model.copy_to(self.policy.parameters())
-            try:
+        with self._inference_lock:
+            if self.ema_model is not None:
+                self.ema_model.store(self.policy.parameters())
+                self.ema_model.copy_to(self.policy.parameters())
+                try:
+                    actions = self.policy.predict_action(obs)
+                finally:
+                    self.ema_model.restore(self.policy.parameters())
+            else:
                 actions = self.policy.predict_action(obs)
-            finally:
-                self.ema_model.restore(self.policy.parameters())
-        else:
-            actions = self.policy.predict_action(obs)
 
         # Remove batch dim: (1, T_p, ac_dim) → (T_p, ac_dim)
         return actions[0]
@@ -153,5 +155,79 @@ def evaluate_v3(
     env.close()
     log.info("V3 eval: %.1f%% success (%d/%d episodes)",
              success_rate * 100, int(success_rate * num_episodes), num_episodes)
+
+    return success_rate, results
+
+
+def evaluate_v3_parallel(
+    wrapper: V3PolicyWrapper,
+    norm_stats: dict,
+    num_episodes: int = 50,
+    num_workers: int = 4,
+    task: str = "lift",
+    max_steps: int = 400,
+    seed_start: int = 100000,
+    exec_horizon: int = 8,
+    obs_horizon: int = 2,
+    image_size: int = 84,
+    use_rot6d: bool = True,
+) -> tuple:
+    """Run V3 evaluation with parallel episode execution.
+
+    Each thread gets its own RobomimicWrapper instance. GPU inference is
+    serialized via a lock in V3PolicyWrapper, but env steps (MuJoCo physics)
+    run truly in parallel since mj_step releases the GIL.
+
+    Args:
+        wrapper:      V3PolicyWrapper (thread-safe with inference lock).
+        norm_stats:   dict with 'actions' and 'proprio' stats.
+        num_episodes: Total episodes to run.
+        num_workers:  Number of parallel threads.
+        Other args:   Same as evaluate_v3.
+
+    Returns:
+        (success_rate, per_episode_results)
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from data_pipeline.envs.robomimic_wrapper import RobomimicWrapper
+
+    action_stats = norm_stats["actions"]
+    proprio_stats = norm_stats["proprio"]
+
+    def run_single_episode(ep_id):
+        env = RobomimicWrapper(task=task, abs_action=True, image_size=image_size)
+        env.seed(seed_start + ep_id)
+
+        _, ep_results = evaluate_policy(
+            policy=wrapper,
+            env=env,
+            num_episodes=1,
+            max_steps=max_steps,
+            norm_mode="minmax",
+            action_min=action_stats["min"],
+            action_max=action_stats["max"],
+            proprio_min=proprio_stats["min"],
+            proprio_max=proprio_stats["max"],
+            exec_horizon=exec_horizon,
+            obs_horizon=obs_horizon,
+            rot6d=use_rot6d,
+        )
+        env.close()
+        return ep_results[0]
+
+    results = []
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        futures = {pool.submit(run_single_episode, i): i for i in range(num_episodes)}
+        for future in as_completed(futures):
+            try:
+                results.append(future.result())
+            except Exception as e:
+                log.warning("Episode %d failed: %s", futures[future], e)
+                results.append({"success": False, "steps": 0, "reward": 0.0})
+
+    n_success = sum(1 for r in results if r["success"])
+    success_rate = n_success / max(len(results), 1)
+    log.info("V3 parallel eval: %d/%d (%.1f%%) with %d workers",
+             n_success, len(results), success_rate * 100, num_workers)
 
     return success_rate, results
