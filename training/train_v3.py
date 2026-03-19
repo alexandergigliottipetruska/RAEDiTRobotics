@@ -215,6 +215,7 @@ def train_v3(
         power=config.ema_power,
         max_value=config.ema_max_decay,
     )
+    ema_model.to(device)
 
     # --- Optimizer: Chi's transformer recipe ---
     # Three param groups with different weight decay
