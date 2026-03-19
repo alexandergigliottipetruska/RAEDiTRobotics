@@ -133,7 +133,7 @@ def _run_episodes(
         seeds = [seed_start + i for i in range(ep_start, ep_end)]
 
         # Create vectorized env for this chunk
-        env = AsyncVectorEnv([env_fn] * chunk_size)
+        env = AsyncVectorEnv([env_fn] * chunk_size, shared_memory=False)
 
         try:
             # Seed each env
