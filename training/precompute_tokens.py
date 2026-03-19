@@ -43,6 +43,7 @@ def precompute(
     batch_size: int = 128,
     device: str = "cuda",
     fast: bool = True,
+    rot6d: bool = False,
 ):
     """Precompute encoder tokens and save to cache HDF5.
 
@@ -131,6 +132,15 @@ def precompute(
             for ds_name in ["actions", "proprio", "view_present"]:
                 dst_grp.create_dataset(ds_name, data=grp[ds_name][:])
 
+    # Recompute norm_stats with rot6d if requested
+    if rot6d:
+        from data_pipeline.conversion.unified_schema import read_mask
+        from data_pipeline.conversion.compute_norm_stats import compute_and_save_norm_stats
+        with h5py.File(output_path, "a") as dst:
+            train_keys = read_mask(dst, "train")
+            compute_and_save_norm_stats(dst, train_keys, rot6d=True)
+        log.info("Recomputed 10D rot6d norm stats")
+
     # Report size
     src_size = os.path.getsize(hdf5_path) / (1024**3)
     dst_size = os.path.getsize(output_path) / (1024**3)
@@ -146,6 +156,8 @@ def main():
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--no_fast", action="store_true",
                         help="Use gzip compression (slower reads, smaller file)")
+    parser.add_argument("--rot6d", action="store_true",
+                        help="Recompute norm stats with 10D rot6d actions (for V3 training)")
     args = parser.parse_args()
 
     if args.output is None:
@@ -153,7 +165,8 @@ def main():
         suffix = "_tokens" if args.no_fast else "_tokens_fast"
         args.output = f"{base}{suffix}{ext}"
 
-    precompute(args.hdf5, args.output, args.batch_size, args.device, fast=not args.no_fast)
+    precompute(args.hdf5, args.output, args.batch_size, args.device,
+               fast=not args.no_fast, rot6d=args.rot6d)
 
 
 if __name__ == "__main__":
