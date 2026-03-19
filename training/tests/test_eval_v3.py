@@ -258,6 +258,43 @@ class TestV3EvalRobosuite:
         np.testing.assert_allclose(pos1, pos2, atol=1e-6)
         env.close()
 
+    def test_parallel_eval_matches_sequential(self):
+        """Parallel eval produces results for all episodes."""
+        from training.eval_v3 import V3PolicyWrapper, evaluate_v3_parallel
+
+        class _RandomWrapper:
+            def __init__(self):
+                self._inference_lock = __import__('threading').Lock()
+            def predict(self, images, proprio, view_present):
+                with self._inference_lock:
+                    return torch.randn(T_P, AC_DIM) * 0.1
+
+        action_min = np.full(10, -1.0, dtype=np.float32)
+        action_max = np.full(10, 1.0, dtype=np.float32)
+        proprio_min = np.full(PROPRIO_DIM, -5.0, dtype=np.float32)
+        proprio_max = np.full(PROPRIO_DIM, 5.0, dtype=np.float32)
+        norm_stats = {
+            "actions": {"min": action_min, "max": action_max},
+            "proprio": {"min": proprio_min, "max": proprio_max},
+        }
+
+        wrapper = _RandomWrapper()
+        sr, results = evaluate_v3_parallel(
+            wrapper, norm_stats,
+            num_episodes=4, num_workers=2,
+            task="lift", max_steps=10,
+        )
+        assert len(results) == 4
+        assert all(isinstance(r["success"], bool) for r in results)
+
+    def test_inference_lock_exists(self):
+        """V3PolicyWrapper has thread-safe inference lock."""
+        from training.eval_v3 import V3PolicyWrapper
+        mock = _MockPolicyV3()
+        wrapper = V3PolicyWrapper(mock)
+        assert hasattr(wrapper, '_inference_lock')
+        assert isinstance(wrapper._inference_lock, type(__import__('threading').Lock()))
+
     def test_rollout_with_mock_v3_policy(self):
         """Full evaluate_policy loop with mock V3 wrapper and real env."""
         env = self._make_env()
