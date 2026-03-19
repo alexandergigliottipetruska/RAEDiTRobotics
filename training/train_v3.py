@@ -420,10 +420,7 @@ def train_v3(
                 )
 
             # Eval rollout + per-timestep diagnostics
-            eval_freq = config.eval_every_epoch
-            if epoch >= 50:
-                eval_freq = 50  # less frequent after epoch 50
-            if (epoch + 1) % eval_freq == 0:
+            if (epoch + 1) % config.eval_every_epoch == 0:
                 # Per-timestep loss diagnostic
                 try:
                     _run_per_timestep_diagnostic(
