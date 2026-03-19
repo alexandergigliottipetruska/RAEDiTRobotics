@@ -504,23 +504,20 @@ def _run_per_timestep_diagnostic(policy, valid_loader, epoch, device, use_amp, m
 def _run_v3_eval(policy, ema_model, config, epoch, device) -> float:
     """Run V3 rollout evaluation during training. Returns success rate."""
     from data_pipeline.conversion.compute_norm_stats import load_norm_stats
-    from training.eval_v3_async import evaluate_v3_async
+    from training.eval_v3 import V3PolicyWrapper, evaluate_v3
 
     pu = _unwrap(policy)
     pu.eval()
 
+    wrapper = V3PolicyWrapper(pu, ema_model=ema_model, device=str(device))
     norm_stats = load_norm_stats(config.eval_hdf5)
 
-    success_rate, results = evaluate_v3_async(
-        policy=pu,
-        norm_stats=norm_stats,
+    success_rate, results = evaluate_v3(
+        wrapper, norm_stats,
         num_episodes=config.eval_episodes,
-        n_envs=2,
         task=config.eval_task,
         image_size=config.eval_image_size,
-        device=str(device),
         use_rot6d=config.use_rot6d,
-        ema_model=ema_model,
     )
 
     n_success = sum(1 for r in results if r["success"])
