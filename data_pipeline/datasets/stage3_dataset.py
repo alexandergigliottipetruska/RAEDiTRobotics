@@ -69,6 +69,7 @@ class Stage3Dataset(Dataset):
         norm_mode: str = "minmax",
         use_rot6d: bool = False,
         pad_after: int = 0,
+        demo_keys_override: "list[str] | None" = None,
     ):
         if isinstance(hdf5_paths, str):
             hdf5_paths = [hdf5_paths]
@@ -111,7 +112,7 @@ class Stage3Dataset(Dataset):
                 is_cached = bool(f.attrs.get("has_cached_tokens", False))
                 self._cached_per_file.append(is_cached)
 
-                demo_keys = read_mask(f, split)
+                demo_keys = demo_keys_override if demo_keys_override is not None else read_mask(f, split)
                 if len(demo_keys) == 0:
                     self._view_present_per_file.append(np.zeros(4, dtype=bool))
                     continue

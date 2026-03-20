@@ -96,6 +96,10 @@ class V3Config:
     eval_episodes: int = 50
     eval_image_size: int = 84
 
+    # Val split override (0 = use HDF5 mask, >0 = random split like Chi)
+    val_ratio: float = 0.0              # Chi uses 0.02 (4 val demos, seed=42)
+    val_seed: int = 42                  # seed for random val split
+
 
 # ---------------------------------------------------------------------------
 # V3 Checkpointing
@@ -275,17 +279,41 @@ def train_v3(
         )
 
     # --- Dataset ---
+    # If val_ratio > 0, create a random split (matching Chi's approach)
+    train_keys_override = None
+    valid_keys_override = None
+    if config.val_ratio > 0:
+        import h5py
+        import numpy as np
+        # Get all demo keys from the first HDF5 file
+        with h5py.File(config.hdf5_paths[0], "r") as f:
+            all_keys = sorted(f["data"].keys())
+        n_demos = len(all_keys)
+        n_val = min(max(1, round(n_demos * config.val_ratio)), n_demos - 1)
+        rng = np.random.default_rng(seed=config.val_seed)
+        val_idxs = rng.choice(n_demos, size=n_val, replace=False)
+        val_mask = np.zeros(n_demos, dtype=bool)
+        val_mask[val_idxs] = True
+        valid_keys_override = [all_keys[i] for i in range(n_demos) if val_mask[i]]
+        train_keys_override = [all_keys[i] for i in range(n_demos) if not val_mask[i]]
+        if _is_main():
+            log.info("Custom val split: %d train, %d valid (val_ratio=%.2f, seed=%d)",
+                     len(train_keys_override), len(valid_keys_override),
+                     config.val_ratio, config.val_seed)
+
     train_ds = Stage3Dataset(
         config.hdf5_paths, split="train",
         T_obs=config.T_obs, T_pred=config.T_pred,
         norm_mode=config.norm_mode, use_rot6d=config.use_rot6d,
         pad_after=config.pad_after,
+        demo_keys_override=train_keys_override,
     )
     valid_ds = Stage3Dataset(
         config.hdf5_paths, split="valid",
         T_obs=config.T_obs, T_pred=config.T_pred,
         norm_mode=config.norm_mode, use_rot6d=config.use_rot6d,
         pad_after=config.pad_after,
+        demo_keys_override=valid_keys_override,
     )
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if distributed else None
@@ -435,7 +463,8 @@ def train_v3(
                 # Per-timestep loss diagnostic
                 try:
                     _run_per_timestep_diagnostic(
-                        policy, valid_loader, epoch, device, use_amp, metrics_path,
+                        policy, train_loader, valid_loader, ema_model,
+                        epoch, device, use_amp, metrics_path,
                     )
                 except Exception as e:
                     log.warning("Per-timestep diagnostic failed at epoch %d: %s", epoch, e)
@@ -473,9 +502,18 @@ def train_v3(
 
 
 @torch.no_grad()
-def _run_per_timestep_diagnostic(policy, valid_loader, epoch, device, use_amp, metrics_path):
-    """Per-timestep diffusion loss diagnostic (t=0, 25, 50, 75, 99)."""
+def _run_per_timestep_diagnostic(
+    policy, train_loader, valid_loader, ema_model,
+    epoch, device, use_amp, metrics_path,
+):
+    """Per-timestep diffusion loss + denoised-action-MSE diagnostic.
+
+    Matches Chi's train_action_mse_error: run full DDIM sampling on a batch,
+    compare predicted actions to GT. Runs on both train and val data, and
+    with both training weights and EMA weights.
+    """
     import torch.nn.functional as F
+    from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 
     pu = _unwrap(policy)
     pu.eval()
@@ -489,6 +527,7 @@ def _run_per_timestep_diagnostic(policy, valid_loader, epoch, device, use_amp, m
     actions = batch_dev["actions"]
     obs_cond = pu._encode_obs(batch_dev)
 
+    # --- Per-timestep noise prediction loss (on val data) ---
     timestep_losses = {}
     for t_val in [0, 25, 50, 75, 99]:
         torch.manual_seed(42)
@@ -503,10 +542,63 @@ def _run_per_timestep_diagnostic(policy, valid_loader, epoch, device, use_amp, m
     ts_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(timestep_losses.items()))
     log.info("  Per-timestep epoch %d: %s", epoch, ts_str)
 
+    # --- Denoised-action-MSE (Chi's train_action_mse_error equivalent) ---
+    def _denoised_mse(batch_d, obs_c):
+        """Run DDIM sampling and compute MSE vs GT actions."""
+        scheduler = DDIMScheduler(
+            num_train_timesteps=pu.train_diffusion_steps,
+            beta_schedule="squaredcos_cap_v2",
+            prediction_type="epsilon",
+            clip_sample=True,
+        )
+        scheduler.set_timesteps(pu.eval_diffusion_steps, device=device)
+        B = batch_d["actions"].shape[0]
+        noisy_actions = torch.randn_like(batch_d["actions"])
+        for t in scheduler.timesteps:
+            ts = t.expand(B)
+            with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
+                noise_pred = pu.denoiser(noisy_actions, ts, obs_c)
+            noisy_actions = scheduler.step(noise_pred, t, noisy_actions).prev_sample
+        return F.mse_loss(noisy_actions, batch_d["actions"]).item()
+
+    # Val denoised-MSE (training weights)
+    torch.manual_seed(42)
+    val_action_mse = _denoised_mse(batch_dev, obs_cond)
+
+    # Train denoised-MSE (training weights)
+    train_batch = next(iter(train_loader))
+    train_dev = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in train_batch.items()
+    }
+    train_obs_cond = pu._encode_obs(train_dev)
+    torch.manual_seed(42)
+    train_action_mse = _denoised_mse(train_dev, train_obs_cond)
+
+    # EMA denoised-MSE (on val data)
+    ema_val_action_mse = None
+    if ema_model is not None:
+        ema_model.store(pu.parameters())
+        ema_model.copy_to(pu.parameters())
+        try:
+            ema_obs_cond = pu._encode_obs(batch_dev)
+            torch.manual_seed(42)
+            ema_val_action_mse = _denoised_mse(batch_dev, ema_obs_cond)
+        finally:
+            ema_model.restore(pu.parameters())
+
+    log.info("  Denoised-MSE epoch %d: train=%.4f | val=%.4f | ema_val=%s",
+             epoch, train_action_mse, val_action_mse,
+             f"{ema_val_action_mse:.4f}" if ema_val_action_mse is not None else "N/A")
+
     if metrics_path:
         with open(metrics_path, "a") as mf:
             mf.write(json.dumps({
-                "epoch": epoch, "per_timestep_loss": timestep_losses,
+                "epoch": epoch,
+                "per_timestep_loss": timestep_losses,
+                "train_action_mse": train_action_mse,
+                "val_action_mse": val_action_mse,
+                "ema_val_action_mse": ema_val_action_mse,
             }) + "\n")
 
     pu.train()

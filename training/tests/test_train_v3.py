@@ -478,9 +478,12 @@ class TestV3Checkpoint:
             assert start_epoch == 6  # epoch + 1
             assert global_step == 100
 
-            # Weights should match
-            for p1, p2 in zip(policy1.parameters(), policy2.parameters()):
-                assert torch.equal(p1, p2)
+            # Trainable weights should match (skip frozen encoder)
+            for (n1, p1), (n2, p2) in zip(
+                policy1.named_parameters(), policy2.named_parameters()
+            ):
+                if p1.requires_grad:
+                    assert torch.equal(p1, p2), f"Mismatch in {n1}"
 
     def test_save_load_with_ema(self):
         """EMA state survives checkpoint roundtrip."""
