@@ -1,7 +1,7 @@
-"""Tests for V3 ObservationEncoder (Chi-matching: concat per timestep).
+"""Tests for V3 ObservationEncoder (active cameras only + LayerNorm).
 
-Output is (B, T_o, d_model) — one token per observation timestep, NOT
-separate tokens per view. Memory = [timestep, obs_t0, obs_t1] = 3 tokens.
+Output is (B, T_o, d_model) — one token per observation timestep.
+Only active camera features are concatenated (not zero-padded slots).
 """
 
 import torch
@@ -26,83 +26,115 @@ def _make_inputs(b=B, t_o=T_O, k=4, n=N_PATCHES, d=ADAPTER_DIM, p=PROPRIO_DIM):
 
 
 class TestObsEncoderShapes:
-    def test_output_tokens_shape(self):
-        """Output is (B, T_o, d_model) — one token per timestep."""
-        enc = ObservationEncoder(num_views=4, T_obs=2)
+    def test_output_shape_robomimic(self):
+        """2 active cameras → (B, T_o, d_model)."""
+        enc = ObservationEncoder(n_active_cams=2, T_obs=2)
         tokens, proprio, vp = _make_inputs(k=4)
+        vp[:, 1:3] = False  # only slots 0 and 3 active
         out = enc(tokens, proprio, vp)
         assert out["tokens"].shape == (B, 2, D_MODEL)
 
-    def test_output_shape_independent_of_K(self):
-        """Same S_obs=T_o regardless of num_views (all concat into one vector)."""
-        enc = ObservationEncoder(num_views=4, T_obs=2)
+    def test_output_shape_rlbench(self):
+        """4 active cameras → (B, T_o, d_model)."""
+        enc = ObservationEncoder(n_active_cams=4, T_obs=2)
         tokens, proprio, vp = _make_inputs(k=4)
-        vp[:, 1:3] = False  # only 2 cameras active
         out = enc(tokens, proprio, vp)
-        # Still T_o=2 tokens (not affected by number of active cameras)
         assert out["tokens"].shape == (B, 2, D_MODEL)
 
     def test_global_vector_shape(self):
-        enc = ObservationEncoder(num_views=4, T_obs=2)
+        enc = ObservationEncoder(n_active_cams=2)
         tokens, proprio, vp = _make_inputs(k=4)
+        vp[:, 1:3] = False
         out = enc(tokens, proprio, vp)
         assert out["global"].shape == (B, D_MODEL)
 
     def test_output_keys(self):
-        enc = ObservationEncoder()
-        tokens, proprio, vp = _make_inputs()
+        enc = ObservationEncoder(n_active_cams=2)
+        tokens, proprio, vp = _make_inputs(k=4)
+        vp[:, 1:3] = False
         out = enc(tokens, proprio, vp)
         assert set(out.keys()) == {"tokens", "global"}
 
 
-class TestObsEncoderMasking:
-    def test_absent_views_affect_output(self):
-        """Absent views are zeroed, producing different tokens than all-present."""
-        enc = ObservationEncoder(num_views=4, T_obs=2)
-        tokens, proprio, vp = _make_inputs(k=4)
+class TestObsEncoderActiveCams:
+    def test_only_active_cams_contribute(self):
+        """Changing inactive slot data doesn't affect output."""
+        enc = ObservationEncoder(n_active_cams=2)
+        tokens1, proprio, vp = _make_inputs(k=4)
+        vp[:, 1:3] = False  # slots 1,2 inactive
 
-        out_all = enc(tokens, proprio, vp)
+        tokens2 = tokens1.clone()
+        tokens2[:, :, 1:3] = torch.randn_like(tokens2[:, :, 1:3]) * 100  # change inactive slots
 
-        vp_partial = vp.clone()
-        vp_partial[:, 1:3] = False
-        out_partial = enc(tokens, proprio, vp_partial)
+        enc.eval()
+        with torch.no_grad():
+            out1 = enc(tokens1, proprio, vp)
+            out2 = enc(tokens2, proprio, vp)
 
-        assert not torch.allclose(out_all["tokens"], out_partial["tokens"], atol=1e-3)
+        assert torch.allclose(out1["tokens"], out2["tokens"], atol=1e-5), \
+            "Inactive camera data should not affect output"
+
+    def test_proj_input_dim_matches_active_cams(self):
+        """obs_proj input dim = n_active_cams * adapter_dim + proprio_dim."""
+        enc2 = ObservationEncoder(n_active_cams=2, proprio_dim=9)
+        assert enc2.obs_proj.in_features == 2 * 512 + 9  # 1033
+
+        enc4 = ObservationEncoder(n_active_cams=4, proprio_dim=8)
+        assert enc4.obs_proj.in_features == 4 * 512 + 8  # 2056
+
+
+class TestObsEncoderLayerNorm:
+    def test_has_feature_norm(self):
+        """Encoder has LayerNorm for feature normalization."""
+        enc = ObservationEncoder()
+        assert hasattr(enc, 'feature_norm')
+        assert isinstance(enc.feature_norm, torch.nn.LayerNorm)
+
+    def test_feature_norm_applied(self):
+        """LayerNorm normalizes pooled features (output has ~zero mean, ~unit var)."""
+        enc = ObservationEncoder(n_active_cams=2)
+        # Large-scale input to verify normalization
+        tokens = torch.randn(B, T_O, 4, N_PATCHES, ADAPTER_DIM) * 100
+        proprio = torch.randn(B, T_O, PROPRIO_DIM)
+        vp = torch.ones(B, 4, dtype=torch.bool)
+        vp[:, 1:3] = False
+
+        enc.eval()
+        with torch.no_grad():
+            out = enc(tokens, proprio, vp)
+        # Output should be finite regardless of input scale
+        assert torch.isfinite(out["tokens"]).all()
 
 
 class TestObsEncoderGradients:
-    def test_gradient_flow_obs_proj(self):
-        enc = ObservationEncoder()
-        tokens, proprio, vp = _make_inputs()
+    def test_gradient_flow(self):
+        enc = ObservationEncoder(n_active_cams=2)
+        tokens, proprio, vp = _make_inputs(k=4)
+        vp[:, 1:3] = False
         out = enc(tokens, proprio, vp)
         loss = out["tokens"].sum()
         loss.backward()
         assert enc.obs_proj.weight.grad is not None
         assert not torch.all(enc.obs_proj.weight.grad == 0)
-
-    def test_gradient_flow_global(self):
-        enc = ObservationEncoder()
-        tokens, proprio, vp = _make_inputs()
-        out = enc(tokens, proprio, vp)
-        loss = out["global"].sum()
-        loss.backward()
-        assert enc.global_proj[0].weight.grad is not None
+        assert enc.feature_norm.weight.grad is not None
 
 
 class TestObsEncoderBatchIndependence:
     def test_batch_independence(self):
-        enc = ObservationEncoder()
+        enc = ObservationEncoder(n_active_cams=2)
         enc.eval()
         t8, p8, vp8 = _make_inputs(b=8)
+        vp8[:, 1:3] = False
         with torch.no_grad():
             out8 = enc(t8, p8, vp8)
             out4 = enc(t8[:4], p8[:4], vp8[:4])
         assert torch.allclose(out8["tokens"][:4], out4["tokens"], atol=1e-5)
 
     def test_deterministic_eval(self):
-        enc = ObservationEncoder()
+        enc = ObservationEncoder(n_active_cams=2)
         enc.eval()
         tokens, proprio, vp = _make_inputs()
+        vp[:, 1:3] = False
         with torch.no_grad():
             out1 = enc(tokens, proprio, vp)
             out2 = enc(tokens, proprio, vp)

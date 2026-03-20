@@ -39,6 +39,7 @@ class PolicyDiTv3(nn.Module):
         T_obs:                Observation horizon.
         T_pred:               Prediction horizon (action chunk length).
         num_views:            Maximum camera slots.
+        n_active_cams:        Number of ACTIVE cameras (2 for robomimic, 4 for RLBench).
         train_diffusion_steps: DDPM training timesteps.
         eval_diffusion_steps:  DDIM inference steps.
         p_drop_emb:           Embedding dropout.
@@ -56,10 +57,11 @@ class PolicyDiTv3(nn.Module):
         T_obs: int = 2,
         T_pred: int = 16,
         num_views: int = 4,
+        n_active_cams: int = 2,
         train_diffusion_steps: int = 100,
         eval_diffusion_steps: int = 100,
-        p_drop_emb: float = 0.01,
-        p_drop_attn: float = 0.01,
+        p_drop_emb: float = 0.0,
+        p_drop_attn: float = 0.3,
     ):
         super().__init__()
 
@@ -76,7 +78,7 @@ class PolicyDiTv3(nn.Module):
             d_model=d_model,
             proprio_dim=proprio_dim,
             T_obs=T_obs,
-            num_views=num_views,
+            n_active_cams=n_active_cams,
         )
 
         # Transformer denoiser: cross-attention to obs conditioning

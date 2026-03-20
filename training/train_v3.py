@@ -53,6 +53,7 @@ class V3Config:
     ac_dim: int = 10            # 10D for robomimic rot6d, 8 for RLBench
     proprio_dim: int = 9
     num_views: int = 4
+    n_active_cams: int = 2      # 2 for robomimic (agentview + wrist), 4 for RLBench
     T_obs: int = 2
     T_pred: int = 10            # Chi: horizon=10 (was 16)
     T_act: int = 8              # execution horizon (eval only)
@@ -198,6 +199,7 @@ def train_v3(
         T_obs=config.T_obs,
         T_pred=config.T_pred,
         num_views=config.num_views,
+        n_active_cams=config.n_active_cams,
         train_diffusion_steps=config.train_diffusion_steps,
         eval_diffusion_steps=config.eval_diffusion_steps,
         p_drop_emb=config.p_drop_emb,

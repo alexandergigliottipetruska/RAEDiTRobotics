@@ -30,7 +30,7 @@ def _make_policy(**kwargs):
     defaults = dict(
         ac_dim=AC_DIM, proprio_dim=PROPRIO_DIM, d_model=D_MODEL,
         n_head=4, n_layers=2, T_obs=T_O, T_pred=T_P, num_views=K,
-        train_diffusion_steps=100, eval_diffusion_steps=10,
+        n_active_cams=2, train_diffusion_steps=100, eval_diffusion_steps=10,
         p_drop_emb=0.0, p_drop_attn=0.3,
     )
     defaults.update(kwargs)
@@ -40,10 +40,14 @@ def _make_policy(**kwargs):
 
 def _make_batch(b=B, cached=False):
     """Create a training batch matching Stage3Dataset output."""
+    # Robomimic: slots 0 and 3 active, slots 1 and 2 zero-padded
+    vp = torch.zeros(b, K, dtype=torch.bool)
+    vp[:, 0] = True
+    vp[:, 3] = True
     batch = {
         "actions": torch.randn(b, T_P, AC_DIM),
         "proprio": torch.randn(b, T_O, PROPRIO_DIM),
-        "view_present": torch.ones(b, K, dtype=torch.bool),
+        "view_present": vp,
     }
     if cached:
         # Precomputed tokens: (B, T_o, K, 196, 1024) — post-encoder, pre-adapter
@@ -189,12 +193,12 @@ class TestPolicyV3Modes:
         assert torch.isfinite(loss)
 
     def test_rlbench_dims(self):
-        """Works with RLBench dimensions (ac_dim=8, proprio=8)."""
+        """Works with RLBench dimensions (ac_dim=8, proprio=8, 4 active cams)."""
         bridge = _make_bridge()
         policy = PolicyDiTv3(
             bridge=bridge, ac_dim=8, proprio_dim=8,
             d_model=D_MODEL, n_head=4, n_layers=2,
-            T_obs=T_O, T_pred=T_P, num_views=K,
+            T_obs=T_O, T_pred=T_P, num_views=K, n_active_cams=4,
             train_diffusion_steps=100, eval_diffusion_steps=10,
         )
         batch = {

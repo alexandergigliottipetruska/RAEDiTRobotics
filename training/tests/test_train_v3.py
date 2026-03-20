@@ -30,18 +30,21 @@ def _make_policy():
     return PolicyDiTv3(
         bridge=bridge, ac_dim=AC_DIM, proprio_dim=PROPRIO_DIM,
         d_model=D_MODEL, n_head=4, n_layers=2,
-        T_obs=T_O, T_pred=T_P, num_views=K,
+        T_obs=T_O, T_pred=T_P, num_views=K, n_active_cams=2,
         train_diffusion_steps=100, eval_diffusion_steps=10,
-        p_drop_emb=0.0, p_drop_attn=0.0,
+        p_drop_emb=0.0, p_drop_attn=0.3,
     )
 
 
 def _make_batch(b=B):
+    vp = torch.zeros(b, K, dtype=torch.bool)
+    vp[:, 0] = True
+    vp[:, 3] = True
     return {
         "cached_tokens": torch.randn(b, T_O, K, 196, 1024),
         "actions": torch.randn(b, T_P, AC_DIM),
         "proprio": torch.randn(b, T_O, PROPRIO_DIM),
-        "view_present": torch.ones(b, K, dtype=torch.bool),
+        "view_present": vp,
     }
 
 
@@ -361,7 +364,7 @@ class TestV3FullPipeline:
             f.attrs["image_size"] = 224
             f.attrs["num_cam_slots"] = K
 
-            vp = np.ones(K, dtype=bool)
+            vp = np.array([True, False, False, True], dtype=bool)  # robomimic: slots 0,3
             keys = []
             for i in range(2):
                 key = f"demo_{i}"

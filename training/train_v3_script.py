@@ -44,6 +44,8 @@ def main():
     parser.add_argument("--T_pred", type=int, default=16)
     parser.add_argument("--T_act", type=int, default=8)
     parser.add_argument("--num_views", type=int, default=4)
+    parser.add_argument("--n_active_cams", type=int, default=2,
+                        help="Active cameras (2 for robomimic, 4 for RLBench)")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=64)
@@ -110,6 +112,7 @@ def main():
         T_pred=args.T_pred,
         T_act=args.T_act,
         num_views=args.num_views,
+        n_active_cams=args.n_active_cams,
         train_diffusion_steps=args.train_diffusion_steps,
         eval_diffusion_steps=args.eval_diffusion_steps,
         lr=args.lr,
