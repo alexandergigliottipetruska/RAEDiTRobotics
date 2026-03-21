@@ -148,8 +148,9 @@ class Stage1Bridge(nn.Module):
                         imgs_k, size=(224, 224), mode='bilinear', align_corners=False
                     )
 
-                # ImageNet normalize if not already done
+                # Chi's normalization: [0,1] → [-1,1] → ImageNet norm
                 if not pre_normalized:
+                    imgs_k = imgs_k * 2.0 - 1.0  # [0,1] → [-1,1]
                     mean = torch.tensor(self._IMAGENET_MEAN, device=device).view(1, 3, 1, 1)
                     std = torch.tensor(self._IMAGENET_STD, device=device).view(1, 3, 1, 1)
                     imgs_k = (imgs_k - mean) / std

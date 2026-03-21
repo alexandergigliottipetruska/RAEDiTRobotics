@@ -99,9 +99,10 @@ def precompute(
                 # Load all T images for this view
                 imgs_raw = grp["images"][:, k]  # (T, H, W, 3) uint8
 
-                # Convert to float32 [0,1] and ImageNet normalize
+                # Convert to float32 [0,1], then Chi's norm: [0,1]→[-1,1]→ImageNet
                 imgs_float = imgs_raw.astype(np.float32) / 255.0
-                imgs_norm = (imgs_float - _IMAGENET_MEAN) / _IMAGENET_STD
+                imgs_neg11 = imgs_float * 2.0 - 1.0
+                imgs_norm = (imgs_neg11 - _IMAGENET_MEAN) / _IMAGENET_STD
                 imgs_chw = np.ascontiguousarray(
                     np.moveaxis(imgs_norm, -1, -3)
                 )  # (T, 3, H, W)

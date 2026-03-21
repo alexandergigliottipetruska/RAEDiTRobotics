@@ -224,8 +224,10 @@ class Stage3Dataset(Dataset):
             # Raw target: HWC -> CHW for co-training L_recon
             images_target = np.moveaxis(imgs_01, -1, -3)  # (T_obs, K, 3, H, W)
 
-            # ImageNet-normalized: for frozen encoder input
-            images_enc = (imgs_01 - _IMAGENET_MEAN) / _IMAGENET_STD
+            # Chi's normalization: [0,1] → [-1,1] → ImageNet norm
+            # LinearNormalizer maps to [-1,1] before ImageNet norm is applied
+            imgs_neg11 = imgs_01 * 2.0 - 1.0
+            images_enc = (imgs_neg11 - _IMAGENET_MEAN) / _IMAGENET_STD
             images_enc = np.moveaxis(images_enc, -1, -3)  # (T_obs, K, 3, H, W)
 
             result["images_enc"] = torch.from_numpy(images_enc)
