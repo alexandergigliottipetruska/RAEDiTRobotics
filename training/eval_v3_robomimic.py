@@ -105,8 +105,9 @@ def create_robomimic_env(hdf5_path, shape_meta=None, abs_action=True,
         render_offscreen=True,
         use_image_obs=True,
     )
-    # Disable hard reset to save memory (Chi's optimization)
-    robomimic_env.env.hard_reset = False
+    # NOTE: Chi uses hard_reset=False with AsyncVectorEnv (one episode per worker).
+    # For sequential eval, keep hard_reset=True to prevent renderer corruption.
+    # robomimic_env.env.hard_reset = False
 
     # Wrap with Chi's wrappers
     env = MultiStepWrapper(
