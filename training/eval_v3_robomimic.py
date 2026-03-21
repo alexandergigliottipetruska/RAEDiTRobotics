@@ -80,7 +80,23 @@ def create_robomimic_env(hdf5_path, shape_meta=None, abs_action=True,
     env_meta['env_kwargs']['use_object_obs'] = False
 
     if abs_action:
-        env_meta['env_kwargs']['controller_configs']['control_delta'] = False
+        # The env_args from data collection has delta-mode controller config
+        # (input_min/max=[-1,1], control_delta=True). For absolute actions we
+        # need to override these — matching our RobomimicWrapper's abs config.
+        ctrl = env_meta['env_kwargs']['controller_configs']
+        if 'body_parts' in ctrl:
+            # robosuite 1.5 composite controller format
+            for part in ctrl['body_parts'].values():
+                part['control_delta'] = False
+                part['input_type'] = 'absolute'
+                part['input_ref_frame'] = 'world'
+                part['input_min'] = -10
+                part['input_max'] = 10
+        else:
+            # robosuite 1.2 flat controller format
+            ctrl['control_delta'] = False
+            ctrl['input_min'] = -10
+            ctrl['input_max'] = 10
 
     # Create environment via robomimic (uses env_meta's controller config)
     robomimic_env = EnvUtils.create_env_from_metadata(
