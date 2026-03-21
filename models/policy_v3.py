@@ -205,7 +205,11 @@ class PolicyDiTv3(nn.Module):
             noise_pred = self.denoiser(actions, timestep, obs_cond)
             actions = scheduler.step(noise_pred, t, actions).prev_sample
 
-        return actions
+        # 5. Extract executable actions (Chi: start = T_obs - 1)
+        # The first T_obs-1 predicted actions correspond to "past" observation
+        # timesteps. Executable actions start at index T_obs-1.
+        start = self.T_obs - 1
+        return actions[:, start:]
 
     def forward(self, batch: dict) -> torch.Tensor:
         """Alias for compute_loss (used by training loop)."""

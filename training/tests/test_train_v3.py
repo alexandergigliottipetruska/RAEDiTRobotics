@@ -287,7 +287,8 @@ class TestV3DDIMInference:
             policy.eval_diffusion_steps = steps
             obs = _make_batch()
             actions = policy.predict_action(obs)
-            assert actions.shape == (B, T_P, AC_DIM)
+            # Chi extracts actions[T_obs-1:], so output is T_pred - (T_obs - 1)
+            assert actions.shape == (B, T_P - T_O + 1, AC_DIM)
             assert torch.isfinite(actions).all()
 
 
