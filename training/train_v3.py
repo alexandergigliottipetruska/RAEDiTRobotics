@@ -474,6 +474,16 @@ def train_v3(
                 if config.eval_task and config.eval_hdf5:
                     try:
                         sr = _run_v3_eval(policy, ema_model, config, epoch, device)
+
+                        # Log eval success rate to metrics jsonl
+                        if metrics_path:
+                            with open(metrics_path, "a") as mf:
+                                mf.write(json.dumps({
+                                    "epoch": epoch,
+                                    "eval_success_rate": sr,
+                                    "eval_episodes": config.eval_episodes,
+                                }) + "\n")
+
                         if sr > best_success_rate:
                             best_success_rate = sr
                             save_v3_checkpoint(
@@ -528,17 +538,26 @@ def _run_per_timestep_diagnostic(
     actions = batch_dev["actions"]
     obs_cond = pu._encode_obs(batch_dev)
 
-    # --- Per-timestep noise prediction loss (on val data) ---
+    # --- Per-timestep noise prediction loss (on val data, EMA weights) ---
+    # Use EMA weights to match Chi's diagnostic (monotonically decreasing t0)
+    if ema_model is not None:
+        ema_model.store(pu.parameters())
+        ema_model.copy_to(pu.parameters())
+
     timestep_losses = {}
+    obs_cond_for_ts = pu._encode_obs(batch_dev)  # re-encode with current weights (EMA if available)
     for t_val in [0, 25, 50, 75, 99]:
         torch.manual_seed(42)
         noise = torch.randn_like(actions)
         timesteps = torch.full((actions.shape[0],), t_val, device=device, dtype=torch.long)
         noisy = pu.noise_scheduler.add_noise(actions, noise, timesteps)
         with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
-            pred = pu.denoiser(noisy, timesteps, obs_cond)
+            pred = pu.denoiser(noisy, timesteps, obs_cond_for_ts)
         loss_t = F.mse_loss(pred, noise).item()
         timestep_losses[f"t{t_val}"] = loss_t
+
+    if ema_model is not None:
+        ema_model.restore(pu.parameters())
 
     ts_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(timestep_losses.items()))
     log.info("  Per-timestep epoch %d: %s", epoch, ts_str)
