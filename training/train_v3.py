@@ -57,6 +57,7 @@ class V3Config:
     T_obs: int = 2
     T_pred: int = 10            # Chi: horizon=10 (was 16)
     T_act: int = 8              # execution horizon (eval only)
+    pad_before: int = 0         # Chi: pad_before=1 (allow windows starting before episode)
     pad_after: int = 7          # Chi: pad_after=7 (repeat last action at demo end)
     d_model: int = 256          # Chi: 256
     n_head: int = 4             # Chi: 4
@@ -309,14 +310,14 @@ def train_v3(
         config.hdf5_paths, split="train",
         T_obs=config.T_obs, T_pred=config.T_pred,
         norm_mode=config.norm_mode, use_rot6d=config.use_rot6d,
-        pad_after=config.pad_after,
+        pad_before=config.pad_before, pad_after=config.pad_after,
         demo_keys_override=train_keys_override,
     )
     valid_ds = Stage3Dataset(
         config.hdf5_paths, split="valid",
         T_obs=config.T_obs, T_pred=config.T_pred,
         norm_mode=config.norm_mode, use_rot6d=config.use_rot6d,
-        pad_after=config.pad_after,
+        pad_before=config.pad_before, pad_after=config.pad_after,
         demo_keys_override=valid_keys_override,
     )
 
@@ -487,7 +488,7 @@ def train_v3(
                                     "epoch": epoch,
                                     "eval_success_rate": sr,
                                     "eval_episodes": n_eps,
-                                    "eval_full": is_full_eval,
+                                    "eval_full": True,
                                 }) + "\n")
 
                         if sr > best_success_rate:

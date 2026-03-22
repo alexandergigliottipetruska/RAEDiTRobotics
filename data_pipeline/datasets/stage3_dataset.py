@@ -68,6 +68,7 @@ class Stage3Dataset(Dataset):
         T_pred: int = 16,
         norm_mode: str = "minmax",
         use_rot6d: bool = False,
+        pad_before: int = 0,
         pad_after: int = 0,
         demo_keys_override: "list[str] | None" = None,
     ):
@@ -78,6 +79,7 @@ class Stage3Dataset(Dataset):
         self.T_pred = T_pred
         self.norm_mode = norm_mode
         self.use_rot6d = use_rot6d
+        self.pad_before = pad_before
         self.pad_after = pad_after
 
         if norm_mode not in ("zscore", "minmax", "chi"):
@@ -119,10 +121,12 @@ class Stage3Dataset(Dataset):
 
                 for key in demo_keys:
                     T = f[f"data/{key}/actions"].shape[0]
-                    # Valid range: t in [0, T - T_pred + pad_after)
-                    # With pad_after, actions beyond T are padded by repeating last action
-                    n_valid = max(0, T - T_pred + pad_after)
-                    for t in range(n_valid):
+                    # Valid range: t in [-pad_before, T - T_pred + pad_after)
+                    # Chi: pad_before=1 allows starting one step before episode
+                    # pad_after allows sampling near end by repeating last action
+                    min_start = -self.pad_before
+                    max_start = T - T_pred + self.pad_after
+                    for t in range(min_start, max_start):
                         self._index.append((file_idx, key, t))
 
                 # Cache view_present per file
@@ -151,12 +155,13 @@ class Stage3Dataset(Dataset):
 
             # --- Observations: frames [t - T_obs + 1, ..., t] ---
             obs_start = max(0, t - T_obs + 1)
-            proprio_slice = grp["proprio"][obs_start : t + 1]   # (<=T_obs, D_prop)
+            obs_end = max(0, t) + 1  # handle t < 0: clamp to frame 0
+            proprio_slice = grp["proprio"][obs_start : obs_end]   # (<=T_obs, D_prop)
 
             if is_cached:
-                tokens_slice = grp["tokens"][obs_start : t + 1]  # (<=T_obs, K, 196, 1024) float16
+                tokens_slice = grp["tokens"][obs_start : obs_end]  # (<=T_obs, K, 196, 1024) float16
             else:
-                imgs_slice = grp["images"][obs_start : t + 1]    # (<=T_obs, K, H, W, 3)
+                imgs_slice = grp["images"][obs_start : obs_end]    # (<=T_obs, K, H, W, 3)
 
             # Start padding: repeat first available frame
             actual_len = proprio_slice.shape[0]
@@ -185,8 +190,17 @@ class Stage3Dataset(Dataset):
 
             # --- Actions: frames [t, ..., t + T_pred - 1] ---
             T_demo = grp["actions"].shape[0]
+            act_start = max(0, t)
             end = min(t + T_pred, T_demo)
-            actions_raw = grp["actions"][t : end]  # (<=T_pred, D_act)
+            actions_raw = grp["actions"][act_start : end]  # (<=T_pred, D_act)
+
+            # Pad front if t < 0 (repeat first action)
+            if t < 0:
+                front_pad = min(-t, T_pred)
+                actions_raw = np.concatenate(
+                    [np.repeat(actions_raw[:1], front_pad, axis=0), actions_raw],
+                    axis=0,
+                )[:T_pred]
 
             # Pad with last action if beyond demo end (pad_after)
             if actions_raw.shape[0] < T_pred:

@@ -43,6 +43,8 @@ def main():
     parser.add_argument("--T_obs", type=int, default=2)
     parser.add_argument("--T_pred", type=int, default=10)
     parser.add_argument("--T_act", type=int, default=8)
+    parser.add_argument("--pad_before", type=int, default=0,
+                        help="Chi uses 1: allow windows starting before episode")
     parser.add_argument("--pad_after", type=int, default=7)
     parser.add_argument("--num_views", type=int, default=4)
     parser.add_argument("--n_active_cams", type=int, default=2,
@@ -137,6 +139,7 @@ def main():
         T_obs=args.T_obs,
         T_pred=args.T_pred,
         T_act=args.T_act,
+        pad_before=args.pad_before,
         pad_after=args.pad_after,
         num_views=args.num_views,
         n_active_cams=args.n_active_cams,
