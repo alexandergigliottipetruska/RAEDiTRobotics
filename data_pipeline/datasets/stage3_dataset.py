@@ -264,7 +264,7 @@ class Stage3Dataset(Dataset):
         result = {
             "actions":      torch.from_numpy(actions.astype(np.float32)),
             "proprio":      torch.from_numpy(proprio.astype(np.float32)),
-            "view_present": torch.from_numpy(self._view_present_per_file[file_idx]),
+            "view_present": torch.from_numpy(self._view_present_per_file[file_idx].copy()),
         }
 
         if is_cached:
