@@ -71,6 +71,7 @@ class Stage3Dataset(Dataset):
         pad_before: int = 0,
         pad_after: int = 0,
         demo_keys_override: "list[str] | None" = None,
+        preload_to_ram: bool = False,
     ):
         if isinstance(hdf5_paths, str):
             hdf5_paths = [hdf5_paths]
@@ -142,6 +143,36 @@ class Stage3Dataset(Dataset):
                 "Using precomputed tokens for %d/%d files", n_cached, len(self._hdf5_paths)
             )
 
+        # Pre-load all data into RAM for faster training
+        self._ram_cache = None
+        if preload_to_ram:
+            import logging
+            log = logging.getLogger(__name__)
+            log.info("Pre-loading data into RAM...")
+            self._ram_cache = {}
+            total_bytes = 0
+            for file_idx, path in enumerate(self._hdf5_paths):
+                is_cached = self._cached_per_file[file_idx]
+                file_cache = {}
+                with h5py.File(path, "r") as f:
+                    keys_in_index = set(k for fi, k, _ in self._index if fi == file_idx)
+                    for key in keys_in_index:
+                        grp = f[f"data/{key}"]
+                        demo = {
+                            "actions": grp["actions"][:],
+                            "proprio": grp["proprio"][:],
+                        }
+                        if is_cached:
+                            demo["tokens"] = grp["tokens"][:]
+                        else:
+                            demo["images"] = grp["images"][:]
+                        for v in demo.values():
+                            total_bytes += v.nbytes
+                        file_cache[key] = demo
+                self._ram_cache[file_idx] = file_cache
+            log.info("Pre-loaded %.1f GB into RAM (%d demos)",
+                     total_bytes / 1e9, sum(len(fc) for fc in self._ram_cache.values()))
+
     def __len__(self) -> int:
         return len(self._index)
 
@@ -150,49 +181,60 @@ class Stage3Dataset(Dataset):
         T_obs, T_pred = self.T_obs, self.T_pred
         is_cached = self._cached_per_file[file_idx]
 
-        with h5py.File(self._hdf5_paths[file_idx], "r") as f:
-            grp = f[f"data/{demo_key}"]
-
-            # --- Observations: frames [t - T_obs + 1, ..., t] ---
+        # Load data from RAM cache or HDF5
+        if self._ram_cache is not None:
+            demo = self._ram_cache[file_idx][demo_key]
             obs_start = max(0, t - T_obs + 1)
-            obs_end = max(0, t) + 1  # handle t < 0: clamp to frame 0
-            proprio_slice = grp["proprio"][obs_start : obs_end]   # (<=T_obs, D_prop)
-
+            obs_end = max(0, t) + 1
+            proprio_slice = demo["proprio"][obs_start:obs_end]
             if is_cached:
-                tokens_slice = grp["tokens"][obs_start : obs_end]  # (<=T_obs, K, 196, 1024) float16
+                tokens_slice = demo["tokens"][obs_start:obs_end]
             else:
-                imgs_slice = grp["images"][obs_start : obs_end]    # (<=T_obs, K, H, W, 3)
-
-            # Start padding: repeat first available frame
-            actual_len = proprio_slice.shape[0]
-            pad_before = T_obs - actual_len
-            if pad_before > 0:
-                proprio_raw = np.concatenate(
-                    [np.repeat(proprio_slice[:1], pad_before, axis=0), proprio_slice],
-                    axis=0,
-                )
-                if is_cached:
-                    tokens_raw = np.concatenate(
-                        [np.repeat(tokens_slice[:1], pad_before, axis=0), tokens_slice],
-                        axis=0,
-                    )
-                else:
-                    imgs_raw = np.concatenate(
-                        [np.repeat(imgs_slice[:1], pad_before, axis=0), imgs_slice],
-                        axis=0,
-                    )
+                imgs_slice = demo["images"][obs_start:obs_end]
+            T_demo = demo["actions"].shape[0]
+            act_start = max(0, t)
+            end = min(t + T_pred, T_demo)
+            actions_raw = demo["actions"][act_start:end]
+        else:
+            f = h5py.File(self._hdf5_paths[file_idx], "r")
+            grp = f[f"data/{demo_key}"]
+            obs_start = max(0, t - T_obs + 1)
+            obs_end = max(0, t) + 1
+            proprio_slice = grp["proprio"][obs_start:obs_end]
+            if is_cached:
+                tokens_slice = grp["tokens"][obs_start:obs_end]
             else:
-                proprio_raw = proprio_slice
-                if is_cached:
-                    tokens_raw = tokens_slice
-                else:
-                    imgs_raw = imgs_slice
-
-            # --- Actions: frames [t, ..., t + T_pred - 1] ---
+                imgs_slice = grp["images"][obs_start:obs_end]
             T_demo = grp["actions"].shape[0]
             act_start = max(0, t)
             end = min(t + T_pred, T_demo)
-            actions_raw = grp["actions"][act_start : end]  # (<=T_pred, D_act)
+            actions_raw = grp["actions"][act_start:end]
+            f.close()
+
+        # --- Obs padding: repeat first available frame ---
+        actual_len = proprio_slice.shape[0]
+        pad_before = T_obs - actual_len
+        if pad_before > 0:
+            proprio_raw = np.concatenate(
+                [np.repeat(proprio_slice[:1], pad_before, axis=0), proprio_slice],
+                axis=0,
+            )
+            if is_cached:
+                tokens_raw = np.concatenate(
+                    [np.repeat(tokens_slice[:1], pad_before, axis=0), tokens_slice],
+                    axis=0,
+                )
+            else:
+                imgs_raw = np.concatenate(
+                    [np.repeat(imgs_slice[:1], pad_before, axis=0), imgs_slice],
+                    axis=0,
+                )
+        else:
+            proprio_raw = proprio_slice
+            if is_cached:
+                tokens_raw = tokens_slice
+            else:
+                imgs_raw = imgs_slice
 
             # Pad front if t < 0 (repeat first action)
             if t < 0:
