@@ -236,15 +236,15 @@ class Stage3Dataset(Dataset):
             else:
                 imgs_raw = imgs_slice
 
-            # Pad front if t < 0 (repeat first action)
-            if t < 0:
-                front_pad = min(-t, T_pred)
-                actions_raw = np.concatenate(
-                    [np.repeat(actions_raw[:1], front_pad, axis=0), actions_raw],
-                    axis=0,
-                )[:T_pred]
+        # Pad front if t < 0 (repeat first action)
+        if t < 0:
+            front_pad = min(-t, T_pred)
+            actions_raw = np.concatenate(
+                [np.repeat(actions_raw[:1], front_pad, axis=0), actions_raw],
+                axis=0,
+            )[:T_pred]
 
-            # Pad with last action if beyond demo end (pad_after)
+        # Pad with last action if beyond demo end (pad_after)
             if actions_raw.shape[0] < T_pred:
                 pad_len = T_pred - actions_raw.shape[0]
                 actions_raw = np.concatenate(
