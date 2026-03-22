@@ -48,7 +48,6 @@ class V3Config:
     num_workers: int = 4
     norm_mode: str = "minmax"
     use_rot6d: bool = True  # convert 7D→10D in __getitem__
-    preload_to_ram: bool = False  # pre-load all data into RAM
 
     # Architecture
     ac_dim: int = 10            # 10D for robomimic rot6d, 8 for RLBench
@@ -328,7 +327,6 @@ def train_v3(
         norm_mode=config.norm_mode, use_rot6d=config.use_rot6d,
         pad_before=config.pad_before, pad_after=config.pad_after,
         demo_keys_override=train_keys_override,
-        preload_to_ram=config.preload_to_ram,
     )
     valid_ds = Stage3Dataset(
         config.hdf5_paths, split="valid",
@@ -336,22 +334,20 @@ def train_v3(
         norm_mode=config.norm_mode, use_rot6d=config.use_rot6d,
         pad_before=config.pad_before, pad_after=config.pad_after,
         demo_keys_override=valid_keys_override,
-        preload_to_ram=config.preload_to_ram,
     )
 
     train_sampler = DistributedSampler(train_ds, shuffle=True) if distributed else None
-    n_workers = config.num_workers
-    persistent = n_workers > 0
+    persistent = config.num_workers > 0
     train_loader = DataLoader(
         train_ds, batch_size=config.batch_size,
         shuffle=(train_sampler is None), sampler=train_sampler,
-        num_workers=n_workers, pin_memory=(device.type == "cuda"),
+        num_workers=config.num_workers, pin_memory=(device.type == "cuda"),
         drop_last=True, persistent_workers=persistent,
-        prefetch_factor=3 if n_workers > 0 else None,
+        prefetch_factor=3 if config.num_workers > 0 else None,
     )
     valid_loader = DataLoader(
         valid_ds, batch_size=config.batch_size, shuffle=False,
-        num_workers=n_workers, pin_memory=(device.type == "cuda"),
+        num_workers=config.num_workers, pin_memory=(device.type == "cuda"),
         persistent_workers=persistent,
     )
 

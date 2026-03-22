@@ -63,8 +63,6 @@ def main():
     parser.add_argument("--weight_decay_encoder", type=float, default=1e-6)
     parser.add_argument("--p_drop_attn", type=float, default=0.3)
     parser.add_argument("--p_drop_emb", type=float, default=0.0)
-    parser.add_argument("--preload_ram", action="store_true",
-                        help="Pre-load all data into RAM (needs ~30GB for fp32-none tokens)")
 
     # Diffusion
     parser.add_argument("--train_diffusion_steps", type=int, default=100)
@@ -133,7 +131,6 @@ def main():
         num_workers=args.num_workers,
         norm_mode=args.norm_mode,
         use_rot6d=not args.no_rot6d,
-        preload_to_ram=args.preload_ram,
         ac_dim=args.ac_dim,
         proprio_dim=args.proprio_dim,
         d_model=args.d_model,

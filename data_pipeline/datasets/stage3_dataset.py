@@ -71,7 +71,6 @@ class Stage3Dataset(Dataset):
         pad_before: int = 0,
         pad_after: int = 0,
         demo_keys_override: "list[str] | None" = None,
-        preload_to_ram: bool = False,
     ):
         if isinstance(hdf5_paths, str):
             hdf5_paths = [hdf5_paths]
@@ -143,36 +142,6 @@ class Stage3Dataset(Dataset):
                 "Using precomputed tokens for %d/%d files", n_cached, len(self._hdf5_paths)
             )
 
-        # Pre-load all data into RAM for faster training
-        self._ram_cache = None
-        if preload_to_ram:
-            import logging
-            log = logging.getLogger(__name__)
-            log.info("Pre-loading data into RAM...")
-            self._ram_cache = {}
-            total_bytes = 0
-            for file_idx, path in enumerate(self._hdf5_paths):
-                is_cached = self._cached_per_file[file_idx]
-                file_cache = {}
-                with h5py.File(path, "r") as f:
-                    keys_in_index = set(k for fi, k, _ in self._index if fi == file_idx)
-                    for key in keys_in_index:
-                        grp = f[f"data/{key}"]
-                        demo = {
-                            "actions": grp["actions"][:],
-                            "proprio": grp["proprio"][:],
-                        }
-                        if is_cached:
-                            demo["tokens"] = grp["tokens"][:]
-                        else:
-                            demo["images"] = grp["images"][:]
-                        for v in demo.values():
-                            total_bytes += v.nbytes
-                        file_cache[key] = demo
-                self._ram_cache[file_idx] = file_cache
-            log.info("Pre-loaded %.1f GB into RAM (%d demos)",
-                     total_bytes / 1e9, sum(len(fc) for fc in self._ram_cache.values()))
-
     def __len__(self) -> int:
         return len(self._index)
 
@@ -181,76 +150,65 @@ class Stage3Dataset(Dataset):
         T_obs, T_pred = self.T_obs, self.T_pred
         is_cached = self._cached_per_file[file_idx]
 
-        # Load data from RAM cache or HDF5
-        if self._ram_cache is not None:
-            demo = self._ram_cache[file_idx][demo_key]
-            obs_start = max(0, t - T_obs + 1)
-            obs_end = max(0, t) + 1
-            proprio_slice = demo["proprio"][obs_start:obs_end].copy()
-            if is_cached:
-                tokens_slice = demo["tokens"][obs_start:obs_end].copy()
-            else:
-                imgs_slice = demo["images"][obs_start:obs_end].copy()
-            T_demo = demo["actions"].shape[0]
-            act_start = max(0, t)
-            end = min(t + T_pred, T_demo)
-            actions_raw = demo["actions"][act_start:end].copy()
-        else:
-            f = h5py.File(self._hdf5_paths[file_idx], "r")
+        with h5py.File(self._hdf5_paths[file_idx], "r") as f:
             grp = f[f"data/{demo_key}"]
+
+            # --- Observations: frames [t - T_obs + 1, ..., t] ---
             obs_start = max(0, t - T_obs + 1)
-            obs_end = max(0, t) + 1
-            proprio_slice = grp["proprio"][obs_start:obs_end]
+            obs_end = max(0, t) + 1  # handle t < 0: clamp to frame 0
+            proprio_slice = grp["proprio"][obs_start : obs_end]   # (<=T_obs, D_prop)
+
             if is_cached:
-                tokens_slice = grp["tokens"][obs_start:obs_end]
+                tokens_slice = grp["tokens"][obs_start : obs_end]  # (<=T_obs, K, 196, 1024) float16
             else:
-                imgs_slice = grp["images"][obs_start:obs_end]
+                imgs_slice = grp["images"][obs_start : obs_end]    # (<=T_obs, K, H, W, 3)
+
+            # Start padding: repeat first available frame
+            actual_len = proprio_slice.shape[0]
+            pad_before = T_obs - actual_len
+            if pad_before > 0:
+                proprio_raw = np.concatenate(
+                    [np.repeat(proprio_slice[:1], pad_before, axis=0), proprio_slice],
+                    axis=0,
+                )
+                if is_cached:
+                    tokens_raw = np.concatenate(
+                        [np.repeat(tokens_slice[:1], pad_before, axis=0), tokens_slice],
+                        axis=0,
+                    )
+                else:
+                    imgs_raw = np.concatenate(
+                        [np.repeat(imgs_slice[:1], pad_before, axis=0), imgs_slice],
+                        axis=0,
+                    )
+            else:
+                proprio_raw = proprio_slice
+                if is_cached:
+                    tokens_raw = tokens_slice
+                else:
+                    imgs_raw = imgs_slice
+
+            # --- Actions: frames [t, ..., t + T_pred - 1] ---
             T_demo = grp["actions"].shape[0]
             act_start = max(0, t)
             end = min(t + T_pred, T_demo)
-            actions_raw = grp["actions"][act_start:end]
-            f.close()
+            actions_raw = grp["actions"][act_start : end]  # (<=T_pred, D_act)
 
-        # --- Obs padding: repeat first available frame ---
-        actual_len = proprio_slice.shape[0]
-        pad_before = T_obs - actual_len
-        if pad_before > 0:
-            proprio_raw = np.concatenate(
-                [np.repeat(proprio_slice[:1], pad_before, axis=0), proprio_slice],
-                axis=0,
-            )
-            if is_cached:
-                tokens_raw = np.concatenate(
-                    [np.repeat(tokens_slice[:1], pad_before, axis=0), tokens_slice],
+            # Pad front if t < 0 (repeat first action)
+            if t < 0:
+                front_pad = min(-t, T_pred)
+                actions_raw = np.concatenate(
+                    [np.repeat(actions_raw[:1], front_pad, axis=0), actions_raw],
+                    axis=0,
+                )[:T_pred]
+
+            # Pad with last action if beyond demo end (pad_after)
+            if actions_raw.shape[0] < T_pred:
+                pad_len = T_pred - actions_raw.shape[0]
+                actions_raw = np.concatenate(
+                    [actions_raw, np.repeat(actions_raw[-1:], pad_len, axis=0)],
                     axis=0,
                 )
-            else:
-                imgs_raw = np.concatenate(
-                    [np.repeat(imgs_slice[:1], pad_before, axis=0), imgs_slice],
-                    axis=0,
-                )
-        else:
-            proprio_raw = proprio_slice
-            if is_cached:
-                tokens_raw = tokens_slice
-            else:
-                imgs_raw = imgs_slice
-
-        # Pad front if t < 0 (repeat first action)
-        if t < 0:
-            front_pad = min(-t, T_pred)
-            actions_raw = np.concatenate(
-                [np.repeat(actions_raw[:1], front_pad, axis=0), actions_raw],
-                axis=0,
-            )[:T_pred]
-
-        # Pad with last action if beyond demo end (pad_after)
-        if actions_raw.shape[0] < T_pred:
-            pad_len = T_pred - actions_raw.shape[0]
-            actions_raw = np.concatenate(
-                [actions_raw, np.repeat(actions_raw[-1:], pad_len, axis=0)],
-                axis=0,
-            )
 
         # --- Convert 7D → 10D if using rot6d representation ---
         if self.use_rot6d:
@@ -261,17 +219,15 @@ class Stage3Dataset(Dataset):
         actions = self._normalize_actions(actions_raw, norm["actions"])
         proprio = self._normalize(proprio_raw, norm["proprio"])
 
-        # Use torch.tensor (not torch.from_numpy) to ensure resizable storage
-        # for DataLoader collation with multiprocessing workers
         result = {
-            "actions":      torch.tensor(actions.astype(np.float32)),
-            "proprio":      torch.tensor(proprio.astype(np.float32)),
-            "view_present": torch.tensor(self._view_present_per_file[file_idx]),
+            "actions":      torch.from_numpy(actions.astype(np.float32)),
+            "proprio":      torch.from_numpy(proprio.astype(np.float32)),
+            "view_present": torch.from_numpy(self._view_present_per_file[file_idx]),
         }
 
         if is_cached:
             # Return precomputed tokens (cast float16 -> float32)
-            result["cached_tokens"] = torch.tensor(tokens_raw.astype(np.float32))
+            result["cached_tokens"] = torch.from_numpy(tokens_raw.astype(np.float32))
         else:
             # Process images
             if imgs_raw.dtype == np.uint8:
@@ -282,13 +238,14 @@ class Stage3Dataset(Dataset):
             # Raw target: HWC -> CHW for co-training L_recon
             images_target = np.moveaxis(imgs_01, -1, -3)  # (T_obs, K, 3, H, W)
 
-            # Chi's normalization: [0,1] -> [-1,1] -> ImageNet norm
+            # Chi's normalization: [0,1] → [-1,1] → ImageNet norm
+            # LinearNormalizer maps to [-1,1] before ImageNet norm is applied
             imgs_neg11 = imgs_01 * 2.0 - 1.0
             images_enc = (imgs_neg11 - _IMAGENET_MEAN) / _IMAGENET_STD
             images_enc = np.moveaxis(images_enc, -1, -3)  # (T_obs, K, 3, H, W)
 
-            result["images_enc"] = torch.tensor(np.ascontiguousarray(images_enc))
-            result["images_target"] = torch.tensor(np.ascontiguousarray(images_target))
+            result["images_enc"] = torch.from_numpy(images_enc)
+            result["images_target"] = torch.from_numpy(images_target)
 
         return result
 
