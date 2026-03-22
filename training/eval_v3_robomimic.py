@@ -692,7 +692,7 @@ if __name__ == "__main__":
 
     # Load model
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    bridge = Stage1Bridge(checkpoint_path=args.stage1_checkpoint, device=str(device))
+    bridge = Stage1Bridge(checkpoint_path=args.stage1_checkpoint)
     policy = PolicyDiTv3(bridge=bridge).to(device)
 
     # Load checkpoint
