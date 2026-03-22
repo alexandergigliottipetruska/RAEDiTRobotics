@@ -96,6 +96,7 @@ class V3Config:
     eval_episodes: int = 10
     eval_full_episodes: int = 50        # episodes for full eval (with video)
     eval_full_every_epoch: int = 50     # full eval + video every N epochs
+    eval_n_envs: int = 10              # max parallel envs for eval
     eval_image_size: int = 84
     eval_mode: str = "custom"           # "custom" = our RobomimicWrapper, "robomimic" = Chi's pipeline
 
@@ -650,6 +651,7 @@ def _run_v3_eval(policy, ema_model, config, epoch, device,
             hdf5_path=config.eval_hdf5,
             norm_stats=norm_stats,
             num_episodes=num_episodes,
+            n_envs=config.eval_n_envs,
             use_rot6d=config.use_rot6d,
             device=str(device),
             norm_mode=config.norm_mode,
