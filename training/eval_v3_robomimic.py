@@ -705,21 +705,31 @@ if __name__ == "__main__":
 
     # Load checkpoint
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    policy.load_state_dict(ckpt.get("policy", ckpt.get("model", {})), strict=False)
-    policy.eval()
 
-    ema_model = None
-    if "ema" in ckpt:
-        from diffusers.training_utils import EMAModel
-        ema_model = EMAModel(policy.parameters(), power=0.75, max_value=0.9999)
-        ema_model.load_state_dict(ckpt["ema"])
-        ema_model.to(device)
+    # Load policy weights
+    if "denoiser" in ckpt:
+        def _strip(sd):
+            prefix = "_orig_mod."
+            if any(k.startswith(prefix) for k in sd):
+                return {k.removeprefix(prefix): v for k, v in sd.items()}
+            return sd
+        policy.denoiser.load_state_dict(_strip(ckpt["denoiser"]))
+        policy.obs_encoder.load_state_dict(_strip(ckpt["obs_encoder"]))
+        policy.bridge.adapter.load_state_dict(_strip(ckpt["adapter"]))
+    else:
+        policy.load_state_dict(ckpt.get("policy", ckpt.get("model", {})), strict=False)
+
+    # Load EMA weights directly into policy (Chi's approach)
+    if "ema" in ckpt and "averaged_model" in ckpt["ema"]:
+        policy.load_state_dict(ckpt["ema"]["averaged_model"], strict=False)
+        log.info("Loaded EMA weights into policy for eval")
+    policy.eval()
 
     norm_stats = load_norm_stats(args.hdf5)
 
     if args.sequential:
         success_rate, results = evaluate_v3_robomimic(
-            policy=policy, ema_model=ema_model,
+            policy=policy, ema_model=None,
             hdf5_path=args.hdf5, norm_stats=norm_stats,
             num_episodes=args.num_episodes,
             use_rot6d=True, device=str(device),
@@ -729,7 +739,7 @@ if __name__ == "__main__":
         )
     else:
         success_rate, results = evaluate_v3_robomimic_parallel(
-            policy=policy, ema_model=ema_model,
+            policy=policy, ema_model=None,
             hdf5_path=args.hdf5, norm_stats=norm_stats,
             num_episodes=args.num_episodes, n_envs=args.n_envs,
             use_rot6d=True, device=str(device),

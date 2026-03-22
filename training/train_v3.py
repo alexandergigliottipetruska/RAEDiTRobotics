@@ -132,7 +132,11 @@ def save_v3_checkpoint(
         "val_metrics": val_metrics,
     }
     if ema_model is not None:
-        ckpt["ema"] = ema_model.state_dict()
+        ckpt["ema"] = {
+            "averaged_model": ema_model.averaged_model.state_dict(),
+            "optimization_step": ema_model.optimization_step,
+            "decay": ema_model.decay,
+        }
     torch.save(ckpt, path)
     log.info("Saved V3 checkpoint: %s (epoch %d, step %d)", path, epoch, global_step)
 
@@ -163,7 +167,15 @@ def load_v3_checkpoint(
     optimizer.load_state_dict(ckpt["optimizer"])
 
     if ema_model is not None and "ema" in ckpt:
-        ema_model.load_state_dict(ckpt["ema"])
+        ema_state = ckpt["ema"]
+        if "averaged_model" in ema_state:
+            # Chi's EMA format
+            ema_model.averaged_model.load_state_dict(ema_state["averaged_model"])
+            ema_model.optimization_step = ema_state.get("optimization_step", 0)
+            ema_model.decay = ema_state.get("decay", 0.0)
+        else:
+            # Old diffusers EMA format — skip (incompatible)
+            log.warning("Old diffusers EMA format detected, skipping EMA load (will re-init)")
 
     log.info("Loaded V3 checkpoint from epoch %d, step %d: %s",
              ckpt["epoch"], ckpt["global_step"], path)
@@ -184,7 +196,8 @@ def train_v3(
 
     Creates PolicyDiTv3, sets up optimizer with Chi's recipe, and trains.
     """
-    from diffusers.training_utils import EMAModel
+    import copy
+    from models.ema_model import EMAModel
     from models.policy_v3 import PolicyDiTv3
     from models.stage1_bridge import Stage1Bridge
 
@@ -230,13 +243,15 @@ def train_v3(
         torch.set_float32_matmul_precision("high")
         torch.backends.cudnn.benchmark = True
 
-    # --- EMA: diffusers adaptive schedule (power=0.75) ---
+    # --- EMA: Chi's implementation (separate model copy) ---
+    ema_policy = copy.deepcopy(policy)
+    ema_policy.eval()
+    ema_policy.requires_grad_(False)
     ema_model = EMAModel(
-        policy.parameters(),
+        model=ema_policy,
         power=config.ema_power,
         max_value=config.ema_max_decay,
     )
-    ema_model.to(device)
 
     # --- Optimizer: Chi's transformer recipe ---
     # Three param groups with different weight decay
@@ -269,8 +284,8 @@ def train_v3(
             resume_from, policy, optimizer, ema_model,
         )
 
-    # Ensure EMA shadow params are on the right device (checkpoint load may put them on CPU)
-    ema_model.to(device)
+    # Ensure EMA model is on the right device
+    ema_model.averaged_model.to(device)
 
     # torch.compile
     if device.type == "cuda" and not distributed:
@@ -404,7 +419,7 @@ def train_v3(
                 batch, policy, optimizer, config, global_step, use_amp=use_amp,
             )
 
-            ema_model.step(policy.parameters())
+            ema_model.step(policy)
             lr_scheduler.step()
 
             for k, v in step_losses.items():
@@ -441,7 +456,7 @@ def train_v3(
         # --- Logging ---
         if is_main:
             # EMA decay value
-            ema_decay = ema_model.cur_decay_value if hasattr(ema_model, 'cur_decay_value') else -1
+            ema_decay = ema_model.decay if hasattr(ema_model, 'decay') else -1
             train_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(avg.items()))
             val_str = " | ".join(f"val_{k}={v:.4f}" for k, v in sorted(val_avg.items()))
             log.info("Epoch %d  %s | %s  (lr=%.2e, ema=%.4f)", epoch, train_str, val_str,
@@ -571,45 +586,42 @@ def _run_per_timestep_diagnostic(
     obs_cond = pu._encode_obs(batch_dev)
 
     # --- Per-timestep noise prediction loss (on val data, EMA weights) ---
-    # Use EMA weights to match Chi's diagnostic (monotonically decreasing t0)
-    if ema_model is not None:
-        ema_model.store(pu.parameters())
-        ema_model.copy_to(pu.parameters())
+    # Use EMA model directly (Chi's approach: separate model copy)
+    diag_model = ema_model.averaged_model if ema_model is not None else pu
+    diag_model.eval()
 
     timestep_losses = {}
-    obs_cond_for_ts = pu._encode_obs(batch_dev)  # re-encode with current weights (EMA if available)
+    obs_cond_for_ts = diag_model._encode_obs(batch_dev)
     for t_val in [0, 25, 50, 75, 99]:
         torch.manual_seed(42)
         noise = torch.randn_like(actions)
         timesteps = torch.full((actions.shape[0],), t_val, device=device, dtype=torch.long)
-        noisy = pu.noise_scheduler.add_noise(actions, noise, timesteps)
+        noisy = diag_model.noise_scheduler.add_noise(actions, noise, timesteps)
         with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
-            pred = pu.denoiser(noisy, timesteps, obs_cond_for_ts)
+            pred = diag_model.denoiser(noisy, timesteps, obs_cond_for_ts)
         loss_t = F.mse_loss(pred, noise).item()
         timestep_losses[f"t{t_val}"] = loss_t
-
-    if ema_model is not None:
-        ema_model.restore(pu.parameters())
 
     ts_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(timestep_losses.items()))
     log.info("  Per-timestep epoch %d: %s", epoch, ts_str)
 
     # --- Denoised-action-MSE (Chi's train_action_mse_error equivalent) ---
-    def _denoised_mse(batch_d, obs_c):
+    def _denoised_mse(batch_d, obs_c, model=None):
         """Run DDIM sampling and compute MSE vs GT actions."""
+        m = model or pu
         scheduler = DDIMScheduler(
-            num_train_timesteps=pu.train_diffusion_steps,
+            num_train_timesteps=m.train_diffusion_steps,
             beta_schedule="squaredcos_cap_v2",
             prediction_type="epsilon",
             clip_sample=True,
         )
-        scheduler.set_timesteps(pu.eval_diffusion_steps, device=device)
+        scheduler.set_timesteps(m.eval_diffusion_steps, device=device)
         B = batch_d["actions"].shape[0]
         noisy_actions = torch.randn_like(batch_d["actions"])
         for t in scheduler.timesteps:
             ts = t.expand(B)
             with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
-                noise_pred = pu.denoiser(noisy_actions, ts, obs_c)
+                noise_pred = m.denoiser(noisy_actions, ts, obs_c)
             noisy_actions = scheduler.step(noise_pred, t, noisy_actions).prev_sample
         return F.mse_loss(noisy_actions, batch_d["actions"]).item()
 
@@ -627,17 +639,12 @@ def _run_per_timestep_diagnostic(
     torch.manual_seed(42)
     train_action_mse = _denoised_mse(train_dev, train_obs_cond)
 
-    # EMA denoised-MSE (on val data)
+    # EMA denoised-MSE (on val data) — use EMA model directly
     ema_val_action_mse = None
     if ema_model is not None:
-        ema_model.store(pu.parameters())
-        ema_model.copy_to(pu.parameters())
-        try:
-            ema_obs_cond = pu._encode_obs(batch_dev)
-            torch.manual_seed(42)
-            ema_val_action_mse = _denoised_mse(batch_dev, ema_obs_cond)
-        finally:
-            ema_model.restore(pu.parameters())
+        ema_obs_cond = diag_model._encode_obs(batch_dev)
+        torch.manual_seed(42)
+        ema_val_action_mse = _denoised_mse(batch_dev, ema_obs_cond, model=diag_model)
 
     log.info("  Denoised-MSE epoch %d: train=%.4f | val=%.4f | ema_val=%s",
              epoch, train_action_mse, val_action_mse,
@@ -664,8 +671,12 @@ def _run_v3_eval(policy, ema_model, config, epoch, device,
     if num_episodes is None:
         num_episodes = config.eval_episodes
 
-    pu = _unwrap(policy)
-    pu.eval()
+    # Use EMA model for eval (Chi's approach: separate model, no store/restore)
+    if ema_model is not None:
+        eval_policy = ema_model.averaged_model
+    else:
+        eval_policy = _unwrap(policy)
+    eval_policy.eval()
     norm_stats = load_norm_stats(config.eval_hdf5)
 
     if config.eval_mode == "robomimic":
@@ -673,7 +684,7 @@ def _run_v3_eval(policy, ema_model, config, epoch, device,
         from training.eval_v3_robomimic import evaluate_v3_robomimic_parallel
         video_dir = os.path.join(config.save_dir, "media", f"epoch_{epoch:04d}")
         success_rate, results = evaluate_v3_robomimic_parallel(
-            policy=pu, ema_model=ema_model,
+            policy=eval_policy, ema_model=None,
             hdf5_path=config.eval_hdf5,
             norm_stats=norm_stats,
             num_episodes=num_episodes,
