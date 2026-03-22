@@ -118,9 +118,10 @@ class TransformerDenoiser(nn.Module):
 
         # --- Weight initialization: Chi's scheme, normal(0, 0.02) everywhere ---
         self.apply(self._init_weights)
-        # Note: Chi does NOT zero-init the output head. The normal(0, 0.02) init
-        # produces near-zero initial predictions (std ~0.02), which is small enough.
-        # We match Chi exactly to minimize deviations from the proven recipe.
+        # Chi also initializes positional embeddings with normal(0, 0.02)
+        # (not zeros — this affects early training convergence)
+        nn.init.normal_(self.pos_emb, mean=0.0, std=0.02)
+        nn.init.normal_(self.cond_pos_emb, mean=0.0, std=0.02)
 
     def _init_weights(self, module):
         """Chi's weight initialization: normal(0, 0.02) for Linear/Embedding."""

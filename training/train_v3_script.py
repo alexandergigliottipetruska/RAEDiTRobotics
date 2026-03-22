@@ -43,7 +43,7 @@ def main():
     parser.add_argument("--T_obs", type=int, default=2)
     parser.add_argument("--T_pred", type=int, default=10)
     parser.add_argument("--T_act", type=int, default=8)
-    parser.add_argument("--pad_before", type=int, default=0,
+    parser.add_argument("--pad_before", type=int, default=1,
                         help="Chi uses 1: allow windows starting before episode")
     parser.add_argument("--pad_after", type=int, default=7)
     parser.add_argument("--num_views", type=int, default=4)
@@ -53,10 +53,10 @@ def main():
     # Training
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--num_epochs", type=int, default=100)
-    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--num_epochs", type=int, default=3000)
+    parser.add_argument("--warmup_steps", type=int, default=1000)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--no_rot6d", action="store_true",
                         help="Disable rot6d conversion (for RLBench 8D actions)")
     parser.add_argument("--weight_decay_denoiser", type=float, default=1e-3)
