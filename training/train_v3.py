@@ -615,18 +615,18 @@ def _run_v3_eval(policy, ema_model, config, epoch, device) -> float:
 
     if config.eval_mode == "robomimic":
         import os
-        from training.eval_v3_robomimic import evaluate_v3_robomimic
+        from training.eval_v3_robomimic import evaluate_v3_robomimic_parallel
         video_dir = os.path.join(config.save_dir, "media", f"epoch_{epoch:04d}")
-        success_rate, results = evaluate_v3_robomimic(
+        success_rate, results = evaluate_v3_robomimic_parallel(
             policy=pu, ema_model=ema_model,
             hdf5_path=config.eval_hdf5,
             norm_stats=norm_stats,
             num_episodes=config.eval_episodes,
             use_rot6d=config.use_rot6d,
             device=str(device),
+            norm_mode=config.norm_mode,
             save_video=True,
             video_dir=video_dir,
-            norm_mode=config.norm_mode,
         )
         n_success = sum(1 for r in results.values() if r["success"])
     else:

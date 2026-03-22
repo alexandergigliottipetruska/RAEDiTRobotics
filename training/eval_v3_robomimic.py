@@ -359,3 +359,373 @@ def evaluate_v3_robomimic(
              success_rate * 100, int(success_rate * num_episodes), num_episodes)
 
     return success_rate, results
+
+
+# ── Parallel eval with AsyncVectorEnv ──────────────────────────────────
+
+
+def _create_env_fn(hdf5_path, shape_meta, abs_action, n_obs_steps,
+                   n_action_steps, max_steps, render_offscreen=True):
+    """Factory that returns a callable creating one env (for worker process)."""
+    def _fn():
+        # Each import happens inside the worker process
+        from collections import defaultdict
+        import robomimic.utils.file_utils as FileUtils
+        import robomimic.utils.env_utils as EnvUtils
+        import robomimic.utils.obs_utils as ObsUtils
+        from data_pipeline.envs.robomimic_image_wrapper import RobomimicImageWrapper
+        from data_pipeline.envs.multistep_wrapper import MultiStepWrapper
+
+        modality_mapping = defaultdict(list)
+        for key, attr in shape_meta['obs'].items():
+            modality_mapping[attr.get('type', 'low_dim')].append(key)
+        ObsUtils.initialize_obs_modality_mapping_from_dict(modality_mapping)
+
+        env_meta = FileUtils.get_env_metadata_from_dataset(hdf5_path)
+        env_meta['env_kwargs']['use_object_obs'] = False
+
+        if abs_action:
+            ctrl = env_meta['env_kwargs']['controller_configs']
+            if 'body_parts' in ctrl:
+                for part in ctrl['body_parts'].values():
+                    part['control_delta'] = False
+                    part['input_type'] = 'absolute'
+                    part['input_ref_frame'] = 'world'
+                    part['input_min'] = -10
+                    part['input_max'] = 10
+            else:
+                ctrl['control_delta'] = False
+                ctrl['input_min'] = -10
+                ctrl['input_max'] = 10
+
+        robomimic_env = EnvUtils.create_env_from_metadata(
+            env_meta=env_meta,
+            render=False,
+            render_offscreen=render_offscreen,
+            use_image_obs=render_offscreen,
+        )
+
+        return MultiStepWrapper(
+            RobomimicImageWrapper(
+                env=robomimic_env,
+                shape_meta=shape_meta,
+                init_state=None,
+                render_obs_key='agentview_image',
+            ),
+            n_obs_steps=n_obs_steps,
+            n_action_steps=n_action_steps,
+            max_episode_steps=max_steps,
+        )
+    return _fn
+
+
+def evaluate_v3_robomimic_parallel(
+    policy,
+    ema_model=None,
+    hdf5_path: str = "",
+    norm_stats: dict = None,
+    num_episodes: int = 50,
+    n_envs: int = None,
+    seed_start: int = 100000,
+    max_steps: int = 400,
+    n_obs_steps: int = 2,
+    n_action_steps: int = 8,
+    shape_meta: dict = None,
+    use_rot6d: bool = True,
+    device: str = "cuda",
+    norm_mode: str = "minmax",
+    save_video: bool = False,
+    video_dir: str = "",
+) -> tuple:
+    """Parallel V3 evaluation using AsyncVectorEnv (matching Chi's runner).
+
+    Each environment runs in a separate process with its own OpenGL context,
+    fixing the framebuffer swap bug and enabling batched policy inference.
+
+    Args:
+        n_envs: Number of parallel envs. Defaults to num_episodes.
+    """
+    import math
+    import dill
+    from data_pipeline.envs.async_vector_env import AsyncVectorEnv
+
+    if shape_meta is None:
+        shape_meta = LIFT_SHAPE_META
+    if n_envs is None:
+        n_envs = num_episodes
+
+    # Flush GPU before creating envs
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+    # env_fn: full rendering (runs in worker process)
+    env_fn = _create_env_fn(
+        hdf5_path, shape_meta, abs_action=True,
+        n_obs_steps=n_obs_steps, n_action_steps=n_action_steps,
+        max_steps=max_steps, render_offscreen=True,
+    )
+    # dummy_env_fn: no rendering (space detection in main process)
+    dummy_env_fn = _create_env_fn(
+        hdf5_path, shape_meta, abs_action=True,
+        n_obs_steps=n_obs_steps, n_action_steps=n_action_steps,
+        max_steps=max_steps, render_offscreen=False,
+    )
+
+    log.info("Creating AsyncVectorEnv with %d workers...", n_envs)
+    env = AsyncVectorEnv(
+        [env_fn] * n_envs,
+        dummy_env_fn=dummy_env_fn,
+    )
+
+    # Video setup
+    imageio = None
+    if save_video:
+        import os
+        os.makedirs(video_dir, exist_ok=True)
+        try:
+            import imageio as _imageio
+            imageio = _imageio
+        except ImportError:
+            log.warning("imageio not installed, disabling video recording")
+            save_video = False
+
+    # Norm stats
+    action_min = norm_stats["actions"]["min"]
+    action_max = norm_stats["actions"]["max"]
+    proprio_min = norm_stats["proprio"]["min"]
+    proprio_max = norm_stats["proprio"]["max"]
+    p_range = proprio_max - proprio_min
+    p_range = np.where(p_range < 1e-6, 1.0, p_range)
+
+    # Process episodes in chunks of n_envs
+    n_chunks = math.ceil(num_episodes / n_envs)
+    all_results = {}
+
+    # Apply EMA weights for the entire eval
+    if ema_model is not None:
+        ema_model.store(policy.parameters())
+        ema_model.copy_to(policy.parameters())
+
+    try:
+        for chunk_idx in range(n_chunks):
+            start_ep = chunk_idx * n_envs
+            end_ep = min(start_ep + n_envs, num_episodes)
+            n_active = end_ep - start_ep
+
+            # Seed each env via init function
+            seeds = [seed_start + i for i in range(start_ep, end_ep)]
+            # Pad if n_active < n_envs
+            while len(seeds) < n_envs:
+                seeds.append(seeds[0])
+
+            def _make_init_fn(seed):
+                def _init(env):
+                    from data_pipeline.envs.robomimic_image_wrapper import RobomimicImageWrapper
+                    assert isinstance(env.env, RobomimicImageWrapper)
+                    env.env.init_state = None
+                    env.seed(seed)
+                return _init
+
+            init_fns = [dill.dumps(_make_init_fn(s)) for s in seeds]
+            env.call_each('run_dill_function', args_list=[(fn,) for fn in init_fns])
+
+            # Reset all envs
+            obs = env.reset()
+
+            # Rollout loop
+            all_rewards = [[] for _ in range(n_envs)]
+            all_frames = [[] for _ in range(n_envs)] if save_video else None
+            done_all = False
+
+            while not done_all:
+                # Convert obs dict to our format (batched)
+                agentview = obs['agentview_image']  # (n_envs, T_obs, C, H, W) or (n_envs, T_obs, H, W, C)
+                eye_in_hand = obs['robot0_eye_in_hand_image']
+
+                # Handle HWC vs CHW (robomimic returns CHW float [0,1])
+                if agentview.shape[-1] == 3 and agentview.ndim == 5:
+                    # HWC → CHW
+                    agentview = np.transpose(agentview, (0, 1, 4, 2, 3))
+                    eye_in_hand = np.transpose(eye_in_hand, (0, 1, 4, 2, 3))
+
+                # Ensure float32 [0,1]
+                if agentview.dtype == np.uint8:
+                    agentview = agentview.astype(np.float32) / 255.0
+                    eye_in_hand = eye_in_hand.astype(np.float32) / 255.0
+
+                T_obs_actual = agentview.shape[1]
+                B = n_envs
+                K = 4
+                H, W = agentview.shape[-2], agentview.shape[-1]
+
+                images = np.zeros((B, T_obs_actual, K, 3, H, W), dtype=np.float32)
+                images[:, :, 0] = agentview
+                images[:, :, 3] = eye_in_hand
+
+                proprio = np.concatenate([
+                    obs['robot0_eef_pos'],
+                    obs['robot0_eef_quat'],
+                    obs['robot0_gripper_qpos'],
+                ], axis=-1)  # (B, T_obs, 9)
+
+                # Normalize proprio (minmax)
+                proprio_norm = 2.0 * (proprio - proprio_min) / p_range - 1.0
+
+                view_present = np.array([True, False, False, True])
+                view_present_batch = np.tile(view_present, (B, 1))
+
+                # To tensors
+                images_t = torch.from_numpy(images).to(device)
+                proprio_t = torch.from_numpy(proprio_norm).float().to(device)
+                view_present_t = torch.from_numpy(view_present_batch).to(device)
+
+                obs_dict = {
+                    "images_enc": images_t,
+                    "proprio": proprio_t,
+                    "view_present": view_present_t,
+                }
+
+                # Batched policy inference
+                with torch.no_grad():
+                    actions_norm = policy.predict_action(obs_dict)
+
+                # (B, T_pred, 10) → numpy
+                actions_norm = actions_norm.cpu().numpy()
+
+                # Denormalize
+                if norm_mode == "chi":
+                    actions_raw = actions_norm.copy()
+                    pos_min = action_min[:3]
+                    pos_max = action_max[:3]
+                    pos_range = np.clip(pos_max - pos_min, 1e-6, None)
+                    actions_raw[..., :3] = (actions_norm[..., :3] + 1.0) / 2.0 * pos_range + pos_min
+                else:
+                    a_range = action_max - action_min
+                    a_range = np.where(np.abs(a_range) < 1e-6, 1.0, a_range)
+                    actions_raw = (actions_norm + 1.0) / 2.0 * a_range + action_min
+
+                # Convert rot6d → axis_angle per env
+                if use_rot6d:
+                    actions_7d = np.stack([
+                        convert_actions_from_rot6d(actions_raw[i])
+                        for i in range(B)
+                    ])  # (B, T_pred, 7)
+                else:
+                    actions_7d = actions_raw
+
+                # Extract exec actions
+                exec_actions = actions_7d[:, :n_action_steps]  # (B, 8, 7)
+
+                obs, reward, done, info = env.step(exec_actions)
+
+                for i in range(n_active):
+                    all_rewards[i].append(reward[i])
+                    if save_video:
+                        frame = obs['agentview_image'][i, -1]  # (C,H,W) or (H,W,C)
+                        if frame.shape[0] == 3 and frame.ndim == 3:
+                            frame = np.transpose(frame, (1, 2, 0))  # CHW → HWC
+                        if frame.dtype != np.uint8:
+                            frame = (np.clip(frame, 0, 1) * 255).astype(np.uint8)
+                        all_frames[i].append(frame)
+
+                done_all = np.all(done[:n_active])
+
+            # Collect results and save videos for this chunk
+            for i in range(n_active):
+                ep_idx = start_ep + i
+                max_reward = np.max(all_rewards[i]) if all_rewards[i] else 0.0
+                success = max_reward > 0.5
+                all_results[ep_idx] = {
+                    "seed": seeds[i],
+                    "success": bool(success),
+                    "max_reward": float(max_reward),
+                }
+                if save_video and all_frames[i]:
+                    tag = "success" if success else "fail"
+                    video_path = os.path.join(
+                        video_dir, f"ep{ep_idx:03d}_seed{seeds[i]}_{tag}.mp4")
+                    imageio.mimwrite(video_path, all_frames[i], fps=10)
+
+            chunk_sr = sum(all_results[start_ep + i]["success"] for i in range(n_active)) / n_active
+            log.info("Eval chunk %d/%d: %d/%d success (%.0f%%)",
+                     chunk_idx + 1, n_chunks, int(chunk_sr * n_active), n_active, chunk_sr * 100)
+
+    finally:
+        # Restore non-EMA weights
+        if ema_model is not None:
+            ema_model.restore(policy.parameters())
+        env.close()
+
+    success_rate = sum(r["success"] for r in all_results.values()) / num_episodes
+    log.info("Parallel eval: %.1f%% success (%d/%d episodes)",
+             success_rate * 100, int(success_rate * num_episodes), num_episodes)
+
+    return success_rate, all_results
+
+
+# ── CLI entry point ──────────────────────────────────────────────────────
+
+
+if __name__ == "__main__":
+    import argparse
+    import os
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
+
+    parser = argparse.ArgumentParser(description="V3 robomimic evaluation")
+    parser.add_argument("--checkpoint", required=True, help="Path to V3 checkpoint")
+    parser.add_argument("--hdf5", required=True, help="Path to unified HDF5 with env_args")
+    parser.add_argument("--stage1_checkpoint", required=True, help="Path to Stage 1 checkpoint")
+    parser.add_argument("--num_episodes", type=int, default=50)
+    parser.add_argument("--n_envs", type=int, default=None, help="Parallel envs (default: num_episodes)")
+    parser.add_argument("--norm_mode", default="minmax", choices=["minmax", "chi"])
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--sequential", action="store_true", help="Use sequential eval (no AsyncVectorEnv)")
+    args = parser.parse_args()
+
+    from data_pipeline.conversion.compute_norm_stats import load_norm_stats
+    from models.policy_v3 import PolicyDiTv3
+    from models.stage1_bridge import Stage1Bridge
+
+    # Load model
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    bridge = Stage1Bridge(checkpoint_path=args.stage1_checkpoint, device=str(device))
+    policy = PolicyDiTv3(bridge=bridge).to(device)
+
+    # Load checkpoint
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    policy.load_state_dict(ckpt.get("policy", ckpt.get("model", {})), strict=False)
+    policy.eval()
+
+    ema_model = None
+    if "ema" in ckpt:
+        from diffusers.training_utils import EMAModel
+        ema_model = EMAModel(policy.parameters(), power=0.75, max_value=0.9999)
+        ema_model.load_state_dict(ckpt["ema"])
+        ema_model.to(device)
+
+    norm_stats = load_norm_stats(args.hdf5)
+
+    if args.sequential:
+        success_rate, results = evaluate_v3_robomimic(
+            policy=policy, ema_model=ema_model,
+            hdf5_path=args.hdf5, norm_stats=norm_stats,
+            num_episodes=args.num_episodes,
+            use_rot6d=True, device=str(device),
+            norm_mode=args.norm_mode,
+        )
+    else:
+        success_rate, results = evaluate_v3_robomimic_parallel(
+            policy=policy, ema_model=ema_model,
+            hdf5_path=args.hdf5, norm_stats=norm_stats,
+            num_episodes=args.num_episodes, n_envs=args.n_envs,
+            use_rot6d=True, device=str(device),
+            norm_mode=args.norm_mode,
+        )
+
+    print(f"\nFinal: {success_rate*100:.1f}% ({int(success_rate*args.num_episodes)}/{args.num_episodes})")
+    for ep_idx, r in sorted(results.items()):
+        print(f"  ep{ep_idx:03d} seed={r['seed']} {'SUCCESS' if r['success'] else 'FAIL'} reward={r['max_reward']:.2f}")
