@@ -93,7 +93,9 @@ class V3Config:
     # Eval
     eval_task: str = "lift"
     eval_hdf5: str = ""                 # unified HDF5 for norm stats
-    eval_episodes: int = 50
+    eval_episodes: int = 10
+    eval_full_episodes: int = 50        # episodes for full eval (with video)
+    eval_full_every_epoch: int = 50     # full eval + video every N epochs
     eval_image_size: int = 84
     eval_mode: str = "custom"           # "custom" = our RobomimicWrapper, "robomimic" = Chi's pipeline
 
@@ -459,9 +461,8 @@ def train_v3(
                     epoch, global_step, policy, optimizer, ema_model, avg,
                 )
 
-            # Eval rollout + per-timestep diagnostics
+            # Per-timestep diagnostics (t0, denoised-MSE)
             if (epoch + 1) % config.eval_every_epoch == 0:
-                # Per-timestep loss diagnostic
                 try:
                     _run_per_timestep_diagnostic(
                         policy, train_loader, valid_loader, ema_model,
@@ -470,10 +471,13 @@ def train_v3(
                 except Exception as e:
                     log.warning("Per-timestep diagnostic failed at epoch %d: %s", epoch, e)
 
-                # Rollout eval
+            # Rollout eval (less frequent, with video)
+            if (epoch + 1) % config.eval_full_every_epoch == 0:
                 if config.eval_task and config.eval_hdf5:
                     try:
-                        sr = _run_v3_eval(policy, ema_model, config, epoch, device)
+                        n_eps = config.eval_full_episodes
+                        sr = _run_v3_eval(policy, ema_model, config, epoch, device,
+                                          num_episodes=n_eps, save_video=True)
 
                         # Log eval success rate to metrics jsonl
                         if metrics_path:
@@ -481,7 +485,8 @@ def train_v3(
                                 mf.write(json.dumps({
                                     "epoch": epoch,
                                     "eval_success_rate": sr,
-                                    "eval_episodes": config.eval_episodes,
+                                    "eval_episodes": n_eps,
+                                    "eval_full": is_full_eval,
                                 }) + "\n")
 
                         if sr > best_success_rate:
@@ -624,9 +629,13 @@ def _run_per_timestep_diagnostic(
     pu.train()
 
 
-def _run_v3_eval(policy, ema_model, config, epoch, device) -> float:
+def _run_v3_eval(policy, ema_model, config, epoch, device,
+                 num_episodes=None, save_video=False) -> float:
     """Run V3 rollout evaluation during training. Returns success rate."""
     from data_pipeline.conversion.compute_norm_stats import load_norm_stats
+
+    if num_episodes is None:
+        num_episodes = config.eval_episodes
 
     pu = _unwrap(policy)
     pu.eval()
@@ -640,11 +649,11 @@ def _run_v3_eval(policy, ema_model, config, epoch, device) -> float:
             policy=pu, ema_model=ema_model,
             hdf5_path=config.eval_hdf5,
             norm_stats=norm_stats,
-            num_episodes=config.eval_episodes,
+            num_episodes=num_episodes,
             use_rot6d=config.use_rot6d,
             device=str(device),
             norm_mode=config.norm_mode,
-            save_video=True,
+            save_video=save_video,
             video_dir=video_dir,
         )
         n_success = sum(1 for r in results.values() if r["success"])
@@ -661,5 +670,5 @@ def _run_v3_eval(policy, ema_model, config, epoch, device) -> float:
         n_success = sum(1 for r in results if r["success"])
 
     log.info("Eval epoch %d: %d/%d (%.1f%%)",
-             epoch, n_success, config.eval_episodes, success_rate * 100)
+             epoch, n_success, num_episodes, success_rate * 100)
     return success_rate

@@ -70,8 +70,13 @@ def main():
     parser.add_argument("--eval_task", type=str, default="lift")
     parser.add_argument("--eval_hdf5", type=str, default="",
                         help="HDF5 for eval norm stats (defaults to first --hdf5)")
-    parser.add_argument("--eval_episodes", type=int, default=50)
-    parser.add_argument("--eval_every_epoch", type=int, default=5)
+    parser.add_argument("--eval_episodes", type=int, default=10,
+                        help="Quick eval episodes (every eval_every_epoch)")
+    parser.add_argument("--eval_full_episodes", type=int, default=50,
+                        help="Full eval episodes with video (every eval_full_every_epoch)")
+    parser.add_argument("--eval_every_epoch", type=int, default=10)
+    parser.add_argument("--eval_full_every_epoch", type=int, default=50,
+                        help="Full eval + video interval")
     parser.add_argument("--eval_mode", type=str, default="custom",
                         choices=["custom", "robomimic"],
                         help="'custom'=our RobomimicWrapper, 'robomimic'=Chi's pipeline")
@@ -146,9 +151,11 @@ def main():
         save_dir=args.save_dir,
         save_every_epoch=args.save_every_epoch,
         eval_every_epoch=args.eval_every_epoch,
+        eval_full_every_epoch=args.eval_full_every_epoch,
         eval_task=args.eval_task,
         eval_hdf5=args.eval_hdf5 or args.hdf5[0],
         eval_episodes=args.eval_episodes,
+        eval_full_episodes=args.eval_full_episodes,
         eval_mode=args.eval_mode,
         val_ratio=args.val_ratio,
         val_seed=args.val_seed,
