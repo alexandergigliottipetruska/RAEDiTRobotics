@@ -261,15 +261,17 @@ class Stage3Dataset(Dataset):
         actions = self._normalize_actions(actions_raw, norm["actions"])
         proprio = self._normalize(proprio_raw, norm["proprio"])
 
+        # Use torch.tensor (not torch.from_numpy) to ensure resizable storage
+        # for DataLoader collation with multiprocessing workers
         result = {
-            "actions":      torch.from_numpy(actions.astype(np.float32)),
-            "proprio":      torch.from_numpy(proprio.astype(np.float32)),
-            "view_present": torch.from_numpy(self._view_present_per_file[file_idx].copy()),
+            "actions":      torch.tensor(actions.astype(np.float32)),
+            "proprio":      torch.tensor(proprio.astype(np.float32)),
+            "view_present": torch.tensor(self._view_present_per_file[file_idx]),
         }
 
         if is_cached:
             # Return precomputed tokens (cast float16 -> float32)
-            result["cached_tokens"] = torch.from_numpy(tokens_raw.astype(np.float32))
+            result["cached_tokens"] = torch.tensor(tokens_raw.astype(np.float32))
         else:
             # Process images
             if imgs_raw.dtype == np.uint8:
@@ -280,14 +282,13 @@ class Stage3Dataset(Dataset):
             # Raw target: HWC -> CHW for co-training L_recon
             images_target = np.moveaxis(imgs_01, -1, -3)  # (T_obs, K, 3, H, W)
 
-            # Chi's normalization: [0,1] → [-1,1] → ImageNet norm
-            # LinearNormalizer maps to [-1,1] before ImageNet norm is applied
+            # Chi's normalization: [0,1] -> [-1,1] -> ImageNet norm
             imgs_neg11 = imgs_01 * 2.0 - 1.0
             images_enc = (imgs_neg11 - _IMAGENET_MEAN) / _IMAGENET_STD
             images_enc = np.moveaxis(images_enc, -1, -3)  # (T_obs, K, 3, H, W)
 
-            result["images_enc"] = torch.from_numpy(images_enc)
-            result["images_target"] = torch.from_numpy(images_target)
+            result["images_enc"] = torch.tensor(np.ascontiguousarray(images_enc))
+            result["images_target"] = torch.tensor(np.ascontiguousarray(images_target))
 
         return result
 
