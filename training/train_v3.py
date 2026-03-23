@@ -1,7 +1,6 @@
 """V3 training loop: PolicyDiTv3 with Chi's cross-attention transformer.
 
-Builds on the shared infrastructure from train_stage3.py (train_step,
-LR scheduler, distributed helpers) but with V3-specific:
+V3-specific features:
   - PolicyDiTv3 instead of PolicyDiT
   - diffusers.EMAModel(power=0.75) adaptive schedule
   - Optimizer betas=(0.9, 0.95), two-tier weight decay
@@ -12,6 +11,7 @@ LR scheduler, distributed helpers) but with V3-specific:
 
 import json
 import logging
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -23,12 +23,117 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from data_pipeline.datasets.stage3_dataset import Stage3Dataset
-from training.train_stage3 import (
-    _is_distributed, _rank, _is_main, _world_size, _unwrap,
-    train_step, _create_lr_scheduler,
-)
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Distributed helpers
+# ---------------------------------------------------------------------------
+
+def _is_distributed() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def _rank() -> int:
+    return torch.distributed.get_rank() if _is_distributed() else 0
+
+
+def _is_main() -> bool:
+    return _rank() == 0
+
+
+def _world_size() -> int:
+    return torch.distributed.get_world_size() if _is_distributed() else 1
+
+
+def _unwrap(model: nn.Module) -> nn.Module:
+    """Get the underlying module from DDP, DataParallel, or torch.compile wrapper."""
+    if isinstance(model, (nn.parallel.DistributedDataParallel, nn.DataParallel)):
+        model = model.module
+    if hasattr(model, "_orig_mod"):
+        model = model._orig_mod
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Single training step
+# ---------------------------------------------------------------------------
+
+def train_step(
+    batch: dict,
+    policy: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    config,
+    global_step: int,
+    use_amp: bool = False,
+) -> dict:
+    """One DDPM training step.
+
+    Args:
+        batch:       Dict from Stage3Dataset (images_enc, actions, proprio, view_present).
+        policy:      Policy instance (must be callable, returning scalar loss).
+        optimizer:   AdamW optimizer.
+        config:      Training config (must have .grad_clip attribute).
+        global_step: Current global step (for logging).
+        use_amp:     Whether to use BF16 mixed precision.
+
+    Returns:
+        Dict of scalar losses for logging.
+    """
+    device = next(policy.parameters()).device
+    device_type = device.type
+
+    # Move batch to device
+    batch_dev = {
+        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        for k, v in batch.items()
+    }
+
+    with torch.amp.autocast(device_type, dtype=torch.bfloat16, enabled=use_amp):
+        loss = policy(batch_dev)
+
+    # Backward + optimizer step
+    optimizer.zero_grad()
+    loss.backward()
+
+    # Gradient clipping
+    if config.grad_clip > 0:
+        torch.nn.utils.clip_grad_norm_(
+            [p for p in policy.parameters() if p.requires_grad],
+            config.grad_clip,
+        )
+
+    optimizer.step()
+
+    return {"policy": loss.item(), "total": loss.item()}
+
+
+# ---------------------------------------------------------------------------
+# LR scheduler with linear warmup
+# ---------------------------------------------------------------------------
+
+def _create_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    warmup_steps: int,
+    total_steps: int,
+    schedule: str = "cosine",
+) -> torch.optim.lr_scheduler.LambdaLR:
+    """LR schedule with linear warmup.
+
+    Args:
+        schedule: "cosine" (decay to 0) or "constant" (warmup then flat).
+    """
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(warmup_steps, 1)
+        if schedule == "constant":
+            return 1.0
+        # cosine decay
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # ---------------------------------------------------------------------------

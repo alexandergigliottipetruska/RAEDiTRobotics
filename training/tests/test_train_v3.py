@@ -13,7 +13,7 @@ import pytest
 from models.policy_v3 import PolicyDiTv3
 from models.stage1_bridge import Stage1Bridge
 from training.train_v3 import V3Config, save_v3_checkpoint, load_v3_checkpoint
-from training.train_stage3 import train_step
+from training.train_v3 import train_step
 
 # Constants
 B = 2
@@ -293,7 +293,7 @@ class TestV3DDIMInference:
 class TestV3LRScheduler:
     def test_warmup(self):
         """LR increases linearly during warmup."""
-        from training.train_stage3 import _create_lr_scheduler
+        from training.train_v3 import _create_lr_scheduler
         import torch.nn as nn
 
         model = nn.Linear(10, 10)
@@ -308,7 +308,7 @@ class TestV3LRScheduler:
 
     def test_cosine_decay(self):
         """LR decays after warmup."""
-        from training.train_stage3 import _create_lr_scheduler
+        from training.train_v3 import _create_lr_scheduler
         import torch.nn as nn
 
         model = nn.Linear(10, 10)
@@ -431,7 +431,7 @@ class TestV3FullPipeline:
         """Multiple training steps with EMA + LR scheduler."""
         from diffusers.training_utils import EMAModel
         from data_pipeline.datasets.stage3_dataset import Stage3Dataset
-        from training.train_stage3 import _create_lr_scheduler
+        from training.train_v3 import _create_lr_scheduler
 
         path = str(tmp_path / "v3_multi.hdf5")
         self._make_v3_hdf5(path)
