@@ -515,6 +515,7 @@ def train_v3(
     # --- Training loop ---
     best_val_loss = float("inf")
     best_success_rate = -1.0
+    last_best_save_epoch = -999  # cooldown for best.pt saves
 
     # Save first training batch for diagnostics (Chi measures t0 on this)
     train_sampling_batch = None
@@ -667,13 +668,17 @@ def train_v3(
                     except Exception as e:
                         log.warning("Eval failed at epoch %d: %s", epoch, e)
 
-            # Best checkpoint (by val loss)
+            # Best checkpoint (by val loss) with 5-epoch cooldown
             if val_avg.get("policy", float("inf")) < best_val_loss:
                 best_val_loss = val_avg["policy"]
-                save_v3_checkpoint(
-                    os.path.join(config.save_dir, "best.pt"),
-                    epoch, global_step, policy, optimizer, ema_model, avg,
-                )
+                if epoch - last_best_save_epoch >= 5:
+                    save_v3_checkpoint(
+                        os.path.join(config.save_dir, "best.pt"),
+                        epoch, global_step, policy, optimizer, ema_model, avg,
+                    )
+                    last_best_save_epoch = epoch
+                else:
+                    log.info("New best val loss=%.4f but skipping save (cooldown, last saved epoch %d)", best_val_loss, last_best_save_epoch)
 
         if distributed:
             torch.distributed.barrier()
