@@ -411,6 +411,9 @@ def train_v3(
     best_val_loss = float("inf")
     best_success_rate = -1.0
 
+    # Save first training batch for diagnostics (Chi measures t0 on this)
+    train_sampling_batch = None
+
     for epoch in range(start_epoch, config.num_epochs):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -425,6 +428,12 @@ def train_v3(
         )
 
         for batch in loader_iter:
+            if train_sampling_batch is None:
+                train_sampling_batch = {
+                    k: v.clone() if isinstance(v, torch.Tensor) else v
+                    for k, v in batch.items()
+                }
+
             step_losses = train_step(
                 batch, policy, optimizer, config, global_step, use_amp=use_amp,
             )
@@ -494,6 +503,7 @@ def train_v3(
                     _run_per_timestep_diagnostic(
                         policy, train_loader, valid_loader, ema_model,
                         epoch, device, use_amp, metrics_path,
+                        train_sampling_batch=train_sampling_batch,
                     )
                 except Exception as e:
                     log.warning("Per-timestep diagnostic failed at epoch %d: %s", epoch, e)
@@ -573,12 +583,12 @@ def train_v3(
 def _run_per_timestep_diagnostic(
     policy, train_loader, valid_loader, ema_model,
     epoch, device, use_amp, metrics_path,
+    train_sampling_batch=None,
 ):
     """Per-timestep diffusion loss + denoised-action-MSE diagnostic.
 
-    Matches Chi's train_action_mse_error: run full DDIM sampling on a batch,
-    compare predicted actions to GT. Runs on both train and val data, and
-    with both training weights and EMA weights.
+    Measures t0 on BOTH train batch (Chi's method) and val batch.
+    Chi saves the first training batch and reuses it every diagnostic.
     """
     import torch.nn.functional as F
     from diffusers.schedulers.scheduling_ddim import DDIMScheduler
@@ -586,34 +596,57 @@ def _run_per_timestep_diagnostic(
     pu = _unwrap(policy)
     pu.eval()
 
+    # EMA model for diagnostics (Chi's approach)
+    diag_model = ema_model.averaged_model if ema_model is not None else pu
+    diag_model.eval()
+
+    def _t0_loss(batch_d, model):
+        """Compute t0 noise prediction loss on a batch."""
+        obs_c = model._encode_obs(batch_d)
+        actions = batch_d["actions"]
+        torch.manual_seed(42)
+        noise = torch.randn_like(actions)
+        timesteps = torch.zeros(actions.shape[0], device=device, dtype=torch.long)
+        noisy = model.noise_scheduler.add_noise(actions, noise, timesteps)
+        with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
+            pred = model.denoiser(noisy, timesteps, obs_c)
+        return F.mse_loss(pred, noise).item()
+
+    # --- Per-timestep loss on val batch (EMA weights) ---
     val_batch = next(iter(valid_loader))
-    batch_dev = {
+    val_dev = {
         k: v.to(device) if isinstance(v, torch.Tensor) else v
         for k, v in val_batch.items()
     }
 
-    actions = batch_dev["actions"]
-    obs_cond = pu._encode_obs(batch_dev)
-
-    # --- Per-timestep noise prediction loss (on val data, EMA weights) ---
-    # Use EMA model directly (Chi's approach: separate model copy)
-    diag_model = ema_model.averaged_model if ema_model is not None else pu
-    diag_model.eval()
-
     timestep_losses = {}
-    obs_cond_for_ts = diag_model._encode_obs(batch_dev)
+    obs_cond_val = diag_model._encode_obs(val_dev)
     for t_val in [0, 25, 50, 75, 99]:
         torch.manual_seed(42)
-        noise = torch.randn_like(actions)
-        timesteps = torch.full((actions.shape[0],), t_val, device=device, dtype=torch.long)
-        noisy = diag_model.noise_scheduler.add_noise(actions, noise, timesteps)
+        noise = torch.randn_like(val_dev["actions"])
+        timesteps = torch.full((val_dev["actions"].shape[0],), t_val, device=device, dtype=torch.long)
+        noisy = diag_model.noise_scheduler.add_noise(val_dev["actions"], noise, timesteps)
         with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
-            pred = diag_model.denoiser(noisy, timesteps, obs_cond_for_ts)
+            pred = diag_model.denoiser(noisy, timesteps, obs_cond_val)
         loss_t = F.mse_loss(pred, noise).item()
         timestep_losses[f"t{t_val}"] = loss_t
 
     ts_str = " | ".join(f"{k}={v:.4f}" for k, v in sorted(timestep_losses.items()))
     log.info("  Per-timestep epoch %d: %s", epoch, ts_str)
+
+    # --- t0 on train batch (Chi's method) and val batch ---
+    train_t0 = None
+    if train_sampling_batch is not None:
+        train_dev = {
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in train_sampling_batch.items()
+        }
+        train_t0 = _t0_loss(train_dev, diag_model)
+
+    val_t0 = _t0_loss(val_dev, diag_model)
+
+    log.info("  t0 epoch %d: train=%.4f | val=%.4f",
+             epoch, train_t0 if train_t0 is not None else -1, val_t0)
 
     # --- Denoised-action-MSE (Chi's train_action_mse_error equivalent) ---
     def _denoised_mse(batch_d, obs_c, model=None):
@@ -635,29 +668,14 @@ def _run_per_timestep_diagnostic(
             noisy_actions = scheduler.step(noise_pred, t, noisy_actions).prev_sample
         return F.mse_loss(noisy_actions, batch_d["actions"]).item()
 
-    # Val denoised-MSE (training weights)
-    torch.manual_seed(42)
-    val_action_mse = _denoised_mse(batch_dev, obs_cond)
-
-    # Train denoised-MSE (training weights)
-    train_batch = next(iter(train_loader))
-    train_dev = {
-        k: v.to(device) if isinstance(v, torch.Tensor) else v
-        for k, v in train_batch.items()
-    }
-    train_obs_cond = pu._encode_obs(train_dev)
-    torch.manual_seed(42)
-    train_action_mse = _denoised_mse(train_dev, train_obs_cond)
-
-    # EMA denoised-MSE (on val data) — use EMA model directly
+    # EMA denoised-MSE on val
     ema_val_action_mse = None
     if ema_model is not None:
-        ema_obs_cond = diag_model._encode_obs(batch_dev)
         torch.manual_seed(42)
-        ema_val_action_mse = _denoised_mse(batch_dev, ema_obs_cond, model=diag_model)
+        ema_val_action_mse = _denoised_mse(val_dev, obs_cond_val, model=diag_model)
 
-    log.info("  Denoised-MSE epoch %d: train=%.4f | val=%.4f | ema_val=%s",
-             epoch, train_action_mse, val_action_mse,
+    log.info("  Denoised-MSE epoch %d: ema_val=%s",
+             epoch,
              f"{ema_val_action_mse:.4f}" if ema_val_action_mse is not None else "N/A")
 
     if metrics_path:
@@ -665,8 +683,8 @@ def _run_per_timestep_diagnostic(
             mf.write(json.dumps({
                 "epoch": epoch,
                 "per_timestep_loss": timestep_losses,
-                "train_action_mse": train_action_mse,
-                "val_action_mse": val_action_mse,
+                "train_t0": train_t0,
+                "val_t0": val_t0,
                 "ema_val_action_mse": ema_val_action_mse,
             }) + "\n")
 
