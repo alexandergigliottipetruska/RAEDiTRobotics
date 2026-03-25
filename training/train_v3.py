@@ -604,18 +604,21 @@ def train_v3(
                 )
 
             # Per-timestep diagnostics + quick eval every eval_every_epoch
+            is_full_eval_epoch = (epoch + 1) % config.eval_full_every_epoch == 0
             if (epoch + 1) % config.eval_every_epoch == 0:
-                try:
-                    _run_per_timestep_diagnostic(
-                        policy, train_loader, valid_loader, ema_model,
-                        epoch, device, use_amp, metrics_path,
-                        train_sampling_batch=train_sampling_batch,
-                    )
-                except Exception as e:
-                    log.warning("Per-timestep diagnostic failed at epoch %d: %s", epoch, e)
+                # Skip diagnostic on full eval epochs — running DDIM sampling
+                # back-to-back with full eval causes ~2x train loss spikes
+                if not is_full_eval_epoch:
+                    try:
+                        _run_per_timestep_diagnostic(
+                            policy, train_loader, valid_loader, ema_model,
+                            epoch, device, use_amp, metrics_path,
+                            train_sampling_batch=train_sampling_batch,
+                        )
+                    except Exception as e:
+                        log.warning("Per-timestep diagnostic failed at epoch %d: %s", epoch, e)
 
                 # Quick eval (no video) — skip if full eval runs this epoch
-                is_full_eval_epoch = (epoch + 1) % config.eval_full_every_epoch == 0
                 if not is_full_eval_epoch and config.eval_task and config.eval_hdf5:
                     try:
                         sr = _run_v3_eval(policy, ema_model, config, epoch, device,
@@ -640,7 +643,7 @@ def train_v3(
                         log.warning("Eval failed at epoch %d: %s", epoch, e)
 
             # Full eval (with video) every eval_full_every_epoch
-            if (epoch + 1) % config.eval_full_every_epoch == 0:
+            if is_full_eval_epoch:
                 if config.eval_task and config.eval_hdf5:
                     try:
                         n_eps = config.eval_full_episodes
