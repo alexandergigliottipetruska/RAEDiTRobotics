@@ -84,8 +84,10 @@ def main():
     parser.add_argument("--eval_n_envs", type=int, default=10,
                         help="Max parallel envs for eval (default: 10)")
     parser.add_argument("--eval_mode", type=str, default="custom",
-                        choices=["custom", "robomimic"],
-                        help="'custom'=our RobomimicWrapper, 'robomimic'=Chi's pipeline")
+                        choices=["custom", "robomimic", "rlbench"],
+                        help="'custom'=RobomimicWrapper, 'robomimic'=Chi's pipeline, 'rlbench'=OMPL eval")
+    parser.add_argument("--eval_exec_horizon", type=int, default=8,
+                        help="T_a: actions executed before re-planning (robomimic=8, RLBench=1)")
 
     # Normalization mode
     parser.add_argument("--norm_mode", type=str, default="minmax",
@@ -175,6 +177,7 @@ def main():
         eval_episodes=args.eval_episodes,
         eval_full_episodes=args.eval_full_episodes,
         eval_mode=args.eval_mode,
+        eval_exec_horizon=args.eval_exec_horizon,
         val_ratio=args.val_ratio,
         val_seed=args.val_seed,
         no_amp=args.no_amp,

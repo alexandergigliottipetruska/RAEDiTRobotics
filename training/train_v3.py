@@ -204,7 +204,8 @@ class V3Config:
     eval_full_every_epoch: int = 50     # full eval + video every N epochs
     eval_n_envs: int = 10              # max parallel envs for eval
     eval_image_size: int = 84
-    eval_mode: str = "custom"           # "custom" = our RobomimicWrapper, "robomimic" = Chi's pipeline
+    eval_mode: str = "custom"           # "custom" | "robomimic" | "rlbench"
+    eval_exec_horizon: int = 8          # T_a: robomimic=8, RLBench=1
 
     # Val split override (0 = use HDF5 mask, >0 = random split like Chi)
     val_ratio: float = 0.0              # Chi uses 0.02 (4 val demos, seed=42)
@@ -852,12 +853,24 @@ def _run_v3_eval(policy, ema_model, config, epoch, device,
             video_dir=video_dir,
         )
         n_success = sum(1 for r in results.values() if r["success"])
+    elif config.eval_mode == "rlbench":
+        from training.eval_v3 import V3PolicyWrapper
+        from training.eval_v3_rlbench import evaluate_v3_rlbench
+        wrapper = V3PolicyWrapper(eval_policy, device=str(device))
+        success_rate, results, _run_v3_eval._rlbench_env = evaluate_v3_rlbench(
+            wrapper, norm_stats,
+            task=config.eval_task,
+            num_episodes=num_episodes,
+            obs_horizon=config.T_obs,
+            _cached_env=getattr(_run_v3_eval, '_rlbench_env', None),
+        )
+        n_success = sum(1 for r in results if r["success"])
     else:
         from training.eval_v3 import V3PolicyWrapper, evaluate_v3
-        wrapper = V3PolicyWrapper(pu, ema_model=ema_model, device=str(device))
+        wrapper = V3PolicyWrapper(_unwrap(policy), ema_model=ema_model, device=str(device))
         success_rate, results = evaluate_v3(
             wrapper, norm_stats,
-            num_episodes=config.eval_episodes,
+            num_episodes=num_episodes,
             task=config.eval_task,
             image_size=config.eval_image_size,
             use_rot6d=config.use_rot6d,

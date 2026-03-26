@@ -2,7 +2,7 @@ import pytest
 
 DEFAULT_HDF5 = (
     "c:/Users/naqee/OneDrive/Desktop/CSC415 Project"
-    "/data/unified/robomimic/lift/ph.hdf5"
+    "/data/unified/robomimic/lift/ph_abs_v15.hdf5"
 )
 
 
