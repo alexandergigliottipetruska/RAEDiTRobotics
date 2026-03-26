@@ -7,9 +7,10 @@ Camera mapping (slot assignment matches spec section 5):
   wrist_rgb          -> slot 3
   (overhead_rgb is ignored — not in our 4-slot schema)
 
-Actions: 8D absolute EE poses [position(3), quaternion_xyzw(4), gripper(1)].
+Actions: 8D absolute EE poses [position(3), quaternion_xyzw(4), gripper_centered(1)].
   Action at time t = target pose at time t+1 (next EE position to reach),
   with gripper state from time t (current gripper command).
+  Gripper centered: {0,1} -> {-1,1} via grip*2-1 (symmetric for DDPM).
   T timesteps -> T-1 actions (last observation has no "next" target).
 
   Changed in v6: Previously stored 7D delta actions (position delta + rotation
@@ -21,7 +22,9 @@ Quaternion: gripper_pose stores [x, y, z, qx, qy, qz, qw]  (xyzw — scipy-nativ
   Verified from RVT codebase: utils.quaternion_to_discrete_euler calls
   scipy Rotation.from_quat(obs.gripper_pose[3:]) directly with no reordering.
 
-Proprio: joint_positions (7) + gripper_open (1) = 8D.
+Proprio: eef_pos (3) + eef_quat_xyzw (4) + gripper_centered (1) = 8D.
+  Matches action space (EE-centric) for direct proprio→action correspondence.
+  Changed from joint_positions(7)+gripper_open(1) in v35 update.
 
 Images stored as uint8 [0, 255] to avoid ~3x disk inflation vs float32.
   Resized to 224x224 (spec IMAGE_SIZE) using PIL LANCZOS.
@@ -90,7 +93,7 @@ _VIEW_PRESENT = np.array([True, True, True, True], dtype=bool)  # all 4 real cam
 # Constants
 # ---------------------------------------------------------------------------
 
-PROPRIO_DIM = 8   # joint_positions (7) + gripper_open (1)
+PROPRIO_DIM = 8   # eef_pos (3) + eef_quat_xyzw (4) + gripper_centered (1)
 ACTION_DIM = 8    # position (3) + quaternion_xyzw (4) + gripper (1)
 
 
@@ -109,6 +112,8 @@ def extract_absolute_actions(
     This follows the convention that the action is the target the robot
     should reach from the current state.
 
+    Gripper is centered: {0,1} → {-1,1} via grip*2-1 for DDPM symmetry.
+
     Args:
         positions:   [T, 3]  absolute xyz positions.
         quats_xyzw:  [T, 4]  absolute orientations in xyzw order (scipy-native).
@@ -116,7 +121,7 @@ def extract_absolute_actions(
 
     Returns:
         [T-1, 8] float32 absolute actions:
-          [position(3), quaternion_xyzw(4), gripper(1)]
+          [position(3), quaternion_xyzw(4), gripper_centered(1)]
     """
     T = positions.shape[0]
     assert T >= 2, "Need at least 2 timesteps"
@@ -125,8 +130,8 @@ def extract_absolute_actions(
     target_pos = positions[1:]          # [T-1, 3]
     target_quat = quats_xyzw[1:]       # [T-1, 4]
 
-    # Gripper command at current timestep
-    gripper_action = grippers[:-1, None].astype(np.float32)  # [T-1, 1]
+    # Gripper command at current timestep, centered {0,1} → {-1,1}
+    gripper_action = (grippers[:-1] * 2 - 1)[:, None].astype(np.float32)  # [T-1, 1]
 
     return np.concatenate(
         [target_pos.astype(np.float32),
@@ -179,26 +184,31 @@ def extract_proprio_and_pose(
 
     gripper_pose layout: [x, y, z, qx, qy, qz, qw]  (xyzw — no reordering needed)
 
+    Proprio is EE-centric: [eef_pos(3), eef_quat_xyzw(4), gripper_centered(1)] = 8D.
+    This matches the action space for direct proprio→action correspondence
+    (same pattern as robomimic's eef_pos+eef_quat+gripper_qpos).
+    Gripper centered: {0,1} → {-1,1} via grip*2-1.
+
     Returns:
         positions:  [T, 3]  gripper xyz
         quats_xyzw: [T, 4]  gripper quaternion in xyzw order (scipy-native)
-        grippers:   [T]     gripper_open (float)
-        proprio:    [T, 8]  joint_positions(7) + gripper_open(1)
+        grippers:   [T]     gripper_open (float, raw 0/1)
+        proprio:    [T, 8]  eef_pos(3) + eef_quat_xyzw(4) + gripper_centered(1)
     """
     T = len(obs_list)
     positions  = np.zeros((T, 3), dtype=np.float32)
     quats_xyzw = np.zeros((T, 4), dtype=np.float32)
     grippers   = np.zeros(T, dtype=np.float32)
-    joint_pos  = np.zeros((T, 7), dtype=np.float32)
 
     for t, obs in enumerate(obs_list):
         pose = obs.gripper_pose  # [7]: x y z qx qy qz qw
         positions[t]  = pose[:3]
         quats_xyzw[t] = pose[3:]   # already xyzw
         grippers[t]   = float(obs.gripper_open)
-        joint_pos[t]  = np.array(obs.joint_positions, dtype=np.float32)
 
-    proprio = np.concatenate([joint_pos, grippers[:, None]], axis=1)  # [T, 8]
+    # EE-centric proprio: [eef_pos(3), eef_quat(4), gripper_centered(1)]
+    grip_centered = (grippers * 2 - 1)[:, None].astype(np.float32)  # {0,1} → {-1,1}
+    proprio = np.concatenate([positions, quats_xyzw, grip_centered], axis=1)  # [T, 8]
     return positions, quats_xyzw, grippers, proprio
 
 

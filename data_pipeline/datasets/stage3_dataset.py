@@ -29,7 +29,7 @@ from torch.utils.data import Dataset
 
 from data_pipeline.conversion.unified_schema import read_mask
 from data_pipeline.conversion.compute_norm_stats import load_norm_stats
-from data_pipeline.utils.rotation import convert_actions_to_rot6d
+from data_pipeline.utils.rotation import convert_actions_to_rot6d, convert_actions_quat_to_rot6d
 
 # ImageNet normalization constants (RGB order)
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -57,10 +57,13 @@ class Stage3Dataset(Dataset):
         split:      "train" or "valid".
         T_obs:      Observation horizon (number of past frames).
         T_pred:     Prediction horizon (number of future actions).
-        norm_mode:  "zscore" or "minmax" for action/proprio normalization.
-        use_rot6d:  If True, convert 7D actions (pos3+aa3+grip1) to 10D
-                    (pos3+rot6d6+grip1) in __getitem__. The norm_stats in
-                    the HDF5 must already be 10D (computed with rot6d=True).
+        norm_mode:  "zscore", "minmax", or "chi" for action/proprio normalization.
+                    use_rot6d=True requires norm_mode="chi" because the HDF5
+                    stores norm stats in the original format (7D/8D), not 10D.
+        use_rot6d:  If True, convert actions to 10D rot6d in __getitem__:
+                    robomimic 7D (aa) → 10D, RLBench 8D (quat) → 10D.
+                    Norm stats stay in original dims — chi mode only uses
+                    position min/max [0:3] which are the same in all formats.
         pad_after:  Number of timesteps to pad at the end of each demo by
                     repeating the last action. Chi uses pad_after=7 with
                     horizon=10, allowing almost every timestep to be a
@@ -91,12 +94,18 @@ class Stage3Dataset(Dataset):
 
         if norm_mode not in ("zscore", "minmax", "chi"):
             raise ValueError(f"norm_mode must be 'zscore', 'minmax', or 'chi', got '{norm_mode}'")
+        if use_rot6d and norm_mode != "chi":
+            raise ValueError(
+                "use_rot6d=True requires norm_mode='chi' — stored norm stats are "
+                "in original action format (7D/8D), not 10D rot6d"
+            )
 
         # Build flat index and load norm stats per file
         self._index = []  # list of (file_idx, demo_key, t)
         self._view_present_per_file = []
         self._norm_per_file = []  # per-file norm stats (action/proprio dims may differ)
         self._cached_per_file = []  # bool per file: True if tokens are precomputed
+        self._benchmark_per_file = []  # "robomimic" or "rlbench" per file
 
         for file_idx, path in enumerate(self._hdf5_paths):
             # Load norm stats
@@ -120,6 +129,12 @@ class Stage3Dataset(Dataset):
                 # Auto-detect cached tokens
                 is_cached = bool(f.attrs.get("has_cached_tokens", False))
                 self._cached_per_file.append(is_cached)
+
+                # Read benchmark for rot6d conversion branching
+                benchmark = f.attrs.get("benchmark", "robomimic")
+                if isinstance(benchmark, bytes):
+                    benchmark = benchmark.decode()
+                self._benchmark_per_file.append(benchmark)
 
                 demo_keys = demo_keys_override if demo_keys_override is not None else read_mask(f, split)
                 if len(demo_keys) == 0:
@@ -249,9 +264,13 @@ class Stage3Dataset(Dataset):
         if f_handle is not None:
             f_handle.close()
 
-        # --- Convert 7D → 10D if using rot6d representation ---
+        # --- Convert to 10D rot6d if using rot6d representation ---
         if self.use_rot6d:
-            actions_raw = convert_actions_to_rot6d(actions_raw)
+            benchmark = self._benchmark_per_file[file_idx]
+            if benchmark == "rlbench":
+                actions_raw = convert_actions_quat_to_rot6d(actions_raw)   # 8D quat → 10D
+            else:
+                actions_raw = convert_actions_to_rot6d(actions_raw)        # 7D aa → 10D
 
         # --- Normalize actions and proprio ---
         norm = self._norm_per_file[file_idx]
@@ -289,9 +308,18 @@ class Stage3Dataset(Dataset):
         return result
 
     def _normalize_actions(self, x: np.ndarray, stats: dict) -> np.ndarray:
-        """Normalize actions. In 'chi' mode, only position dims get minmax."""
+        """Normalize actions. In 'chi' mode, only position dims get minmax.
+
+        After rot6d conversion, both robomimic and RLBench have 10D actions:
+        [pos(3), rot6d(6), grip(1)]. Chi normalizes pos[0:3] only.
+        Without rot6d, robomimic=7D and RLBench=8D — chi still normalizes [0:3].
+        """
         if self.norm_mode == "chi":
             # Chi's approach: position [0:3] = minmax [-1,1], rest = identity
+            assert x.shape[-1] in (7, 8, 10), (
+                f"chi action norm: unexpected dim {x.shape[-1]}, "
+                f"expected 7 (robomimic raw), 8 (rlbench raw), or 10 (rot6d)"
+            )
             result = x.copy()
             pos_min = stats["min"][:3]
             pos_max = stats["max"][:3]
@@ -301,8 +329,18 @@ class Stage3Dataset(Dataset):
         return self._normalize(x, stats)
 
     def _normalize_proprio(self, x: np.ndarray, stats: dict) -> np.ndarray:
-        """Normalize proprio. In 'chi' mode: pos+grip minmax, quat identity."""
+        """Normalize proprio. In 'chi' mode: pos+grip minmax, quat identity.
+
+        Layout for both robomimic (9D) and RLBench (8D):
+          [0:3] = eef_pos → minmax
+          [3:7] = eef_quat → identity
+          [7:]  = gripper → minmax (robomimic 2D, RLBench 1D)
+        """
         if self.norm_mode == "chi":
+            assert x.shape[-1] in (8, 9), (
+                f"chi proprio norm: unexpected dim {x.shape[-1]}, "
+                f"expected 8 (rlbench) or 9 (robomimic)"
+            )
             result = x.copy()
             # pos [0:3] — minmax [-1, 1]
             pos_min, pos_max = stats["min"][:3], stats["max"][:3]
