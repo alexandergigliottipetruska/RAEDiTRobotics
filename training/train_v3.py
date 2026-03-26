@@ -856,12 +856,15 @@ def _run_v3_eval(policy, ema_model, config, epoch, device,
     elif config.eval_mode == "rlbench":
         from training.eval_v3 import V3PolicyWrapper
         from training.eval_v3_rlbench import evaluate_v3_rlbench
+        video_dir = os.path.join(config.save_dir, "media", f"epoch_{epoch:04d}")
         wrapper = V3PolicyWrapper(eval_policy, device=str(device))
         success_rate, results, _run_v3_eval._rlbench_env = evaluate_v3_rlbench(
             wrapper, norm_stats,
             task=config.eval_task,
             num_episodes=num_episodes,
             obs_horizon=config.T_obs,
+            save_video=save_video,
+            video_dir=video_dir,
             _cached_env=getattr(_run_v3_eval, '_rlbench_env', None),
         )
         n_success = sum(1 for r in results if r["success"])
