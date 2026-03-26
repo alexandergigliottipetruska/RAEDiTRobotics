@@ -355,10 +355,16 @@ def main():
     )
     parser.add_argument(
         "--task", required=True,
-        choices=["close_jar", "open_drawer", "slide_block_to_color_target",
-                 "put_item_in_drawer", "stack_cups", "place_shape_in_shape_sorter",
-                 "meat_off_grill", "turn_tap", "push_buttons", "reach_and_drag",
-                 "place_wine_at_rack_location", "sweep_to_dustpan_of_size"],
+        choices=[
+            # Proposal tasks
+            "reach_target", "push_button", "pick_and_lift",
+            "slide_block_to_target", "put_item_in_drawer",
+            # Additional PerAct tasks
+            "close_jar", "open_drawer", "slide_block_to_color_target",
+            "stack_cups", "place_shape_in_shape_sorter",
+            "meat_off_grill", "turn_tap", "push_buttons", "reach_and_drag",
+            "place_wine_at_rack_location", "sweep_to_dustpan_of_size",
+        ],
     )
     parser.add_argument(
         "--input", required=True,
