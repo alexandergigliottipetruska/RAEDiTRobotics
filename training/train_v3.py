@@ -278,9 +278,27 @@ def load_v3_checkpoint(
             return {k.removeprefix(prefix): v for k, v in sd.items()}
         return sd
 
+    def _resize_pos_emb(target_module, loaded_sd, key="cond_pos_emb"):
+        """Expand positional embeddings if the model's buffer is larger than the checkpoint's."""
+        if key in loaded_sd:
+            old = loaded_sd[key]
+            # Resolve dotted key on the module (e.g. "denoiser.cond_pos_emb")
+            obj = target_module
+            for attr in key.split("."):
+                obj = getattr(obj, attr)
+            new_shape = obj.shape
+            if old.shape != new_shape:
+                new_param = torch.zeros(new_shape, dtype=old.dtype, device=old.device)
+                min_len = min(old.shape[1], new_shape[1])
+                new_param[:, :min_len, :] = old[:, :min_len, :]
+                loaded_sd[key] = new_param
+                log.info("Resized %s from %s -> %s", key, list(old.shape), list(new_shape))
+
     # Load trainable components (backward-compat with old full-policy checkpoints)
     if "denoiser" in ckpt:
-        policy.denoiser.load_state_dict(_strip(ckpt["denoiser"]))
+        denoiser_sd = _strip(ckpt["denoiser"])
+        _resize_pos_emb(policy.denoiser, denoiser_sd)
+        policy.denoiser.load_state_dict(denoiser_sd)
         policy.obs_encoder.load_state_dict(_strip(ckpt["obs_encoder"]))
         policy.bridge.adapter.load_state_dict(_strip(ckpt["adapter"]))
     else:
@@ -288,11 +306,29 @@ def load_v3_checkpoint(
         policy.load_state_dict(_strip(ckpt["policy"]))
     optimizer.load_state_dict(ckpt["optimizer"])
 
+    # Resize optimizer state buffers for any parameters whose shape changed (e.g. cond_pos_emb)
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            state = optimizer.state.get(p)
+            if state is None:
+                continue
+            for buf_key in ("exp_avg", "exp_avg_sq"):
+                if buf_key in state and state[buf_key].shape != p.shape:
+                    old_buf = state[buf_key]
+                    new_buf = torch.zeros_like(p)
+                    slices = tuple(slice(0, min(o, n)) for o, n in zip(old_buf.shape, p.shape))
+                    new_buf[slices] = old_buf[slices]
+                    state[buf_key] = new_buf
+                    log.info("Resized optimizer %s from %s -> %s", buf_key, list(old_buf.shape), list(p.shape))
+
     if ema_model is not None and "ema" in ckpt:
         ema_state = ckpt["ema"]
         if "averaged_model" in ema_state:
-            # Chi's EMA format
-            ema_model.averaged_model.load_state_dict(ema_state["averaged_model"])
+            # Chi's EMA format — resize pos emb if needed
+            ema_sd = ema_state["averaged_model"]
+            _resize_pos_emb(ema_model.averaged_model, ema_sd,
+                            key="denoiser.cond_pos_emb")
+            ema_model.averaged_model.load_state_dict(ema_sd)
             ema_model.optimization_step = ema_state.get("optimization_step", 0)
             ema_model.decay = ema_state.get("decay", 0.0)
         else:
@@ -651,7 +687,8 @@ def train_v3(
             if (epoch + 1) % config.eval_every_epoch == 0 or is_last_epoch:
                 # Skip diagnostic on full eval epochs — running DDIM sampling
                 # back-to-back with full eval causes ~2x train loss spikes
-                if not is_full_eval_epoch:
+                # But always run on the last epoch for final metrics
+                if not is_full_eval_epoch or is_last_epoch:
                     try:
                         _run_per_timestep_diagnostic(
                             policy, train_loader, valid_loader, ema_model,

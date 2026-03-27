@@ -73,7 +73,7 @@ class TransformerDenoiser(nn.Module):
 
         # --- Action input embedding ---
         self.input_emb = nn.Linear(ac_dim, d_model)
-        self.pos_emb = nn.Parameter(torch.zeros(1, T_pred, d_model))
+        self.pos_emb = nn.Parameter(torch.zeros(1, T_pred + 1, d_model))  # +1 for prepended timestep
 
         # --- Timestep embedding (Chi: raw sinusoidal, no MLP) ---
         self.time_emb = SinusoidalPosEmb(d_model)
@@ -210,7 +210,7 @@ class TransformerDenoiser(nn.Module):
         obs_tokens = obs_cond["tokens"]  # (B, S_obs, cond_dim) or (B, N_mem, d_model)
         pre_projected = obs_cond.get("pre_projected", False)
 
-        # 1. Timestep → token
+        # 1. Timestep → token (prepended to action sequence, Chi Section 3.1.2)
         if not torch.is_tensor(timestep):
             timestep = torch.tensor([timestep], dtype=torch.long, device=noisy_actions.device)
         elif timestep.dim() == 0:
@@ -218,31 +218,30 @@ class TransformerDenoiser(nn.Module):
         timestep = timestep.expand(B)
         time_token = self.time_emb(timestep).unsqueeze(1)  # (B, 1, d_model)
 
-        # 2. Obs conditioning → project to d_model (skip if already projected)
+        # 2. Obs conditioning → memory (observations only, no timestep)
         if pre_projected:
             cond_obs = obs_tokens  # already (B, N_mem, d_model)
         else:
             cond_obs = self.cond_obs_emb(obs_tokens)  # (B, S_obs, d_model)
 
-        # 3. Memory = [time_token, cond_obs] + positional embedding + dropout
-        memory = torch.cat([time_token, cond_obs], dim=1)  # (B, 1+S_obs, d_model)
-        tc = memory.shape[1]
-        memory = self.drop(memory + self.cond_pos_emb[:, :tc, :])
+        # 3. Memory = obs tokens only + positional embedding + dropout
+        tc = cond_obs.shape[1]
+        memory = self.drop(cond_obs + self.cond_pos_emb[:, :tc, :])
 
         # 4. Process memory through MLP encoder (n_cond_layers=0)
-        memory = self.encoder(memory)  # (B, 1+S_obs, d_model)
+        memory = self.encoder(memory)  # (B, S_obs, d_model)
 
-        # 5. Action tokens: embed + positional embedding + dropout
+        # 5. Action sequence = [time_token, action_embs] + positional embedding + dropout
         action_emb = self.input_emb(noisy_actions)  # (B, T_pred, d_model)
-        t = action_emb.shape[1]
-        action_emb = self.drop(action_emb + self.pos_emb[:, :t, :])
+        tgt = torch.cat([time_token, action_emb], dim=1)  # (B, 1+T_pred, d_model)
+        t = tgt.shape[1]  # 1 + T_pred
+        tgt = self.drop(tgt + self.pos_emb[:, :t, :])
 
-        # 6. Build masks
+        # 6. Build masks (sizes now 1+T_pred)
         tgt_mask = None
         memory_mask = None
         if self.causal_attn:
-            # Causal self-attention mask for action tokens
-            # torch.nn.Transformer uses additive mask: -inf blocks, 0 allows
+            # Causal self-attention: token i attends to tokens 0..i
             tgt_mask = torch.triu(
                 torch.ones(t, t, device=noisy_actions.device), diagonal=1
             ).float().masked_fill_(
@@ -251,29 +250,27 @@ class TransformerDenoiser(nn.Module):
             )
 
             if pre_projected:
-                # Spatial tokens: all memory visible to all actions.
-                # The temporal mask is meaningless when all tokens come from
-                # the same timestep(s) and are interleaved with spatial structure.
-                # TODO: for T_obs>1, group spatial tokens by timestep.
+                # Spatial tokens: all memory visible to all action+timestep tokens
                 memory_mask = None
             else:
-                # Legacy: action token i sees memory positions s where s <= i + 1
-                # (timestep is always visible; obs tokens visible up to current time)
+                # Legacy temporal mask: action token i sees obs up to step i
+                # Offset by 1 because token 0 is timestep
                 i_idx = torch.arange(t, device=noisy_actions.device)
                 s_idx = torch.arange(tc, device=noisy_actions.device)
-                memory_mask = (i_idx[:, None] >= (s_idx[None, :] - 1)).float()
+                memory_mask = (i_idx[:, None] >= s_idx[None, :]).float()
                 memory_mask = memory_mask.masked_fill(memory_mask == 0, float("-inf"))
                 memory_mask = memory_mask.masked_fill(memory_mask == 1, 0.0)
 
         # 7. Decoder: cross-attention to memory
         x = self.decoder(
-            tgt=action_emb,
+            tgt=tgt,
             memory=memory,
             tgt_mask=tgt_mask,
             memory_mask=memory_mask,
-        )  # (B, T_pred, d_model)
+        )  # (B, 1+T_pred, d_model)
 
-        # 8. Output head
+        # 8. Strip timestep token, apply output head
+        x = x[:, 1:, :]  # (B, T_pred, d_model) — remove prepended timestep
         x = self.ln_f(x)
         x = self.head(x)  # (B, T_pred, ac_dim)
 
