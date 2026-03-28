@@ -1,11 +1,14 @@
-"""PolicyDiTv3 — Chi's cross-attention transformer denoiser in our pipeline.
+"""PolicyDiTv3 — pluggable diffusion policy with selectable denoiser backbone.
 
-Composes: Stage1Bridge → ObservationEncoder → TransformerDenoiser
+Composes: Stage1Bridge → ObservationEncoder → Denoiser
 with DDPM training (epsilon prediction) and DDIM inference.
 
-Key differences from PolicyDiT (V1/V2):
-  - Cross-attention denoiser (actions attend to obs), NOT adaLN-Zero
-  - Pluggable denoiser interface (transformer now, U-Net later)
+Supported denoiser_type values:
+  - "transformer" (default): Chi's cross-attention decoder (TransformerDenoiser)
+  - "dit": True DiT with adaLN-Zero blocks (DiTDenoiser, Peebles & Xie 2023)
+
+Key features:
+  - Pluggable denoiser interface (same forward signature for both)
   - ImageNet norm inside policy (Stage1Bridge handles it for online mode)
   - Adaptive EMA schedule (power=0.75, handled externally)
   - clip_sample=True during DDIM inference
@@ -23,11 +26,12 @@ from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 
 from models.obs_encoder_v3 import ObservationEncoder
 from models.denoiser_transformer import TransformerDenoiser
+from models.denoiser_dit import DiTDenoiser
 from models.stage1_bridge import Stage1Bridge
 
 
 class PolicyDiTv3(nn.Module):
-    """V3 diffusion policy with cross-attention transformer denoiser.
+    """V3 diffusion policy with pluggable denoiser backbone.
 
     Args:
         bridge:               Stage1Bridge (frozen encoder + trainable adapter).
@@ -44,6 +48,7 @@ class PolicyDiTv3(nn.Module):
         eval_diffusion_steps:  DDIM inference steps.
         p_drop_emb:           Embedding dropout.
         p_drop_attn:          Attention dropout.
+        denoiser_type:        "transformer" (Chi cross-attn) or "dit" (adaLN-Zero).
     """
 
     def __init__(
@@ -63,6 +68,7 @@ class PolicyDiTv3(nn.Module):
         p_drop_emb: float = 0.0,
         p_drop_attn: float = 0.3,
         spatial_pool_size: int = 1,
+        denoiser_type: str = "transformer",
     ):
         super().__init__()
 
@@ -83,10 +89,8 @@ class PolicyDiTv3(nn.Module):
             spatial_pool_size=spatial_pool_size,
         )
 
-        # Transformer denoiser: cross-attention to obs conditioning
-        # cond_dim = obs_encoder.output_dim (1033 for robomimic)
-        # This matches Chi: cond_obs_emb is Linear(1033, 256) — single projection
-        self.denoiser = TransformerDenoiser(
+        # Denoiser: selectable backbone
+        denoiser_kwargs = dict(
             ac_dim=ac_dim,
             d_model=d_model,
             n_head=n_head,
@@ -97,6 +101,14 @@ class PolicyDiTv3(nn.Module):
             p_drop_attn=p_drop_attn,
             causal_attn=True,
         )
+
+        if denoiser_type == "transformer":
+            self.denoiser = TransformerDenoiser(**denoiser_kwargs)
+        elif denoiser_type == "dit":
+            self.denoiser = DiTDenoiser(**denoiser_kwargs)
+        else:
+            raise ValueError(f"Unknown denoiser_type: {denoiser_type!r}. "
+                             f"Choose 'transformer' or 'dit'.")
 
         # DDPM noise scheduler for training
         self.noise_scheduler = DDPMScheduler(

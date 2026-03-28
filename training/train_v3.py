@@ -191,6 +191,9 @@ class V3Config:
     ema_power: float = 0.75             # Chi: power=0.75 (adaptive decay)
     ema_max_decay: float = 0.9999
 
+    # Denoiser backbone
+    denoiser_type: str = "transformer"  # "transformer" (Chi cross-attn) or "dit" (adaLN-Zero)
+
     # Spatial tokens
     spatial_pool_size: int = 1          # 1=avg pool (default), 4/7/14=spatial tokens
 
@@ -406,6 +409,7 @@ def train_v3(
         p_drop_emb=config.p_drop_emb,
         p_drop_attn=config.p_drop_attn,
         spatial_pool_size=config.spatial_pool_size,
+        denoiser_type=config.denoiser_type,
     )
     policy = policy.to(device)
 

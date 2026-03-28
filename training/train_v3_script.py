@@ -97,6 +97,11 @@ def main():
                         choices=["minmax", "zscore", "chi"],
                         help="'minmax'=all dims [-1,1], 'chi'=pos minmax + rot6d/grip identity")
 
+    # Denoiser backbone
+    parser.add_argument("--denoiser_type", type=str, default="transformer",
+                        choices=["transformer", "dit"],
+                        help="Denoiser: 'transformer' (Chi cross-attn) or 'dit' (adaLN-Zero)")
+
     # Spatial tokens
     parser.add_argument("--spatial_pool_size", type=int, default=1,
                         choices=[1, 4, 7, 14],
@@ -200,6 +205,7 @@ def main():
         no_amp=args.no_amp,
         no_compile=args.no_compile,
         seed=args.seed,
+        denoiser_type=args.denoiser_type,
         spatial_pool_size=args.spatial_pool_size,
         augment_refresh_every=args.augment_refresh_every,
         random_crop_size=args.random_crop_size,
