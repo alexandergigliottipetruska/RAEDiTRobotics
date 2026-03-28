@@ -681,25 +681,23 @@ def train_v3(
                     epoch, global_step, policy, optimizer, ema_model, avg,
                 )
 
-            # Per-timestep diagnostics + quick eval every eval_every_epoch
+            # Per-timestep diagnostics (t0, denoised-MSE) — every eval_every_epoch + full eval epochs
             is_last_epoch = (epoch == config.num_epochs - 1)
             is_full_eval_epoch = (epoch + 1) % config.eval_full_every_epoch == 0
-            if (epoch + 1) % config.eval_every_epoch == 0 or is_last_epoch:
-                # Skip diagnostic on full eval epochs — running DDIM sampling
-                # back-to-back with full eval causes ~2x train loss spikes
-                # But always run on the last epoch for final metrics
-                if not is_full_eval_epoch or is_last_epoch:
-                    try:
-                        _run_per_timestep_diagnostic(
-                            policy, train_loader, valid_loader, ema_model,
-                            epoch, device, use_amp, metrics_path,
-                            train_sampling_batch=train_sampling_batch,
-                        )
-                    except Exception as e:
-                        log.warning("Per-timestep diagnostic failed at epoch %d: %s", epoch, e)
+            run_diag = (epoch + 1) % config.eval_every_epoch == 0 or is_full_eval_epoch or is_last_epoch
+            if run_diag:
+                try:
+                    _run_per_timestep_diagnostic(
+                        policy, train_loader, valid_loader, ema_model,
+                        epoch, device, use_amp, metrics_path,
+                        train_sampling_batch=train_sampling_batch,
+                    )
+                except Exception as e:
+                    log.warning("Per-timestep diagnostic failed at epoch %d: %s", epoch, e)
 
-                # Quick eval (no video) — skip if full eval runs this epoch
-                if not is_full_eval_epoch and config.eval_task and config.eval_hdf5:
+            # Quick eval (no video) — runs on eval_every_epoch but NOT on full eval epochs
+            if (epoch + 1) % config.eval_every_epoch == 0 and not is_full_eval_epoch:
+                if config.eval_task and config.eval_hdf5:
                     try:
                         sr = _run_v3_eval(policy, ema_model, config, epoch, device,
                                           num_episodes=config.eval_episodes, save_video=False)

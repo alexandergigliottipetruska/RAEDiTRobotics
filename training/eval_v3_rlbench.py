@@ -382,6 +382,13 @@ if __name__ == "__main__":
     parser.add_argument("--proprio_dim", type=int, default=8)
     parser.add_argument("--n_active_cams", type=int, default=4)
     parser.add_argument("--T_pred", type=int, default=10)
+    parser.add_argument("--d_model", type=int, default=256)
+    parser.add_argument("--n_head", type=int, default=4)
+    parser.add_argument("--n_layers", type=int, default=8)
+    parser.add_argument("--T_obs", type=int, default=2)
+    parser.add_argument("--spatial_pool_size", type=int, default=1)
+    parser.add_argument("--train_diffusion_steps", type=int, default=100)
+    parser.add_argument("--eval_diffusion_steps", type=int, default=100)
     parser.add_argument("--save_video", action="store_true")
     parser.add_argument("--video_dir", default="checkpoints/eval_videos")
     parser.add_argument("--demo_pickles", default="",
@@ -405,14 +412,30 @@ if __name__ == "__main__":
     policy = PolicyDiTv3(
         bridge=bridge, ac_dim=args.ac_dim,
         proprio_dim=args.proprio_dim, n_active_cams=args.n_active_cams,
-        T_pred=args.T_pred,
+        d_model=args.d_model, n_head=args.n_head, n_layers=args.n_layers,
+        T_obs=args.T_obs, T_pred=args.T_pred,
+        train_diffusion_steps=args.train_diffusion_steps,
+        eval_diffusion_steps=args.eval_diffusion_steps,
+        spatial_pool_size=args.spatial_pool_size,
     ).to(device)
 
     # Load checkpoint + EMA weights
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
 
     if "ema" in ckpt and "averaged_model" in ckpt["ema"]:
-        policy.load_state_dict(ckpt["ema"]["averaged_model"], strict=False)
+        ema_sd = ckpt["ema"]["averaged_model"]
+        # Handle pos_emb size change (T_pred → T_pred+1) from timestep injection fix
+        for key in ["denoiser.pos_emb", "denoiser.cond_pos_emb"]:
+            if key in ema_sd:
+                model_param = dict(policy.named_parameters())[key]
+                if ema_sd[key].shape != model_param.shape:
+                    old = ema_sd[key]
+                    new = torch.zeros_like(model_param)
+                    min_len = min(old.shape[1], new.shape[1])
+                    new[:, :min_len, :] = old[:, :min_len, :]
+                    ema_sd[key] = new
+                    log.info("Resized EMA %s: %s -> %s", key, list(old.shape), list(new.shape))
+        policy.load_state_dict(ema_sd, strict=False)
         log.info("Loaded EMA weights for eval")
     elif "denoiser" in ckpt:
         def _strip(sd):
@@ -446,6 +469,7 @@ if __name__ == "__main__":
         wrapper, norm_stats,
         task=args.task,
         num_episodes=args.num_episodes,
+        obs_horizon=args.T_obs,
         save_video=args.save_video,
         video_dir=args.video_dir,
         demos=demo_list,
