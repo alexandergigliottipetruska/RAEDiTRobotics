@@ -87,8 +87,8 @@ def main():
     parser.add_argument("--eval_n_envs", type=int, default=10,
                         help="Max parallel envs for eval (default: 10)")
     parser.add_argument("--eval_mode", type=str, default="custom",
-                        choices=["custom", "robomimic", "rlbench"],
-                        help="'custom'=RobomimicWrapper, 'robomimic'=Chi's pipeline, 'rlbench'=OMPL eval")
+                        choices=["custom", "robomimic", "rlbench", "joint"],
+                        help="'custom'=RobomimicWrapper, 'robomimic'=Chi's pipeline, 'rlbench'=OMPL eval, 'joint'=joint-space eval")
     parser.add_argument("--eval_exec_horizon", type=int, default=8,
                         help="T_a: actions executed before re-planning (robomimic=8, RLBench=1)")
 

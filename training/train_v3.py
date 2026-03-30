@@ -567,7 +567,11 @@ def train_v3(
             mf.write(json.dumps(run_info, default=str) + "\n")
 
         log.info("=" * 60)
-        log.info("V3 Training: Chi's Cross-Attention Transformer")
+        denoiser_label = {
+            "transformer": "Chi's Cross-Attention Transformer",
+            "dit": "DiT with adaLN-Zero Blocks (Peebles & Xie)",
+        }.get(config.denoiser_type, config.denoiser_type)
+        log.info("V3 Training: %s", denoiser_label)
         log.info("=" * 60)
         log.info("Train: %d, Valid: %d, Batch: %d", len(train_ds), len(valid_ds), config.batch_size)
         log.info("Arch: d=%d, heads=%d, layers=%d, ac_dim=%d",
@@ -934,6 +938,21 @@ def _run_v3_eval(policy, ema_model, config, epoch, device,
             save_video=save_video,
             video_dir=video_dir,
             _cached_env=getattr(_run_v3_eval, '_rlbench_env', None),
+        )
+        n_success = sum(1 for r in results if r["success"])
+    elif config.eval_mode == "joint":
+        from training.eval_v3 import V3PolicyWrapper
+        from training.eval_v3_joint import evaluate_v3_joint
+        video_dir = os.path.join(config.save_dir, "media", f"epoch_{epoch:04d}")
+        wrapper = V3PolicyWrapper(eval_policy, device=str(device))
+        success_rate, results = evaluate_v3_joint(
+            wrapper, norm_stats,
+            task=config.eval_task,
+            num_episodes=num_episodes,
+            obs_horizon=config.T_obs,
+            exec_horizon=config.eval_exec_horizon,
+            save_video=save_video,
+            video_dir=video_dir,
         )
         n_success = sum(1 for r in results if r["success"])
     else:
