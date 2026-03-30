@@ -1,0 +1,92 @@
+# NOTE we no longer check out to a branch or pull automatically
+project:
+  study_name: "robotics_stage3_lift_with_success_rate"
+  domain: "utm.utoronto.ca" #important for lab pc distribution
+  project_root: "/student/denassau/CSC415/Project/RAEDiTRobotics"
+  venv_path: "~/sweep_env/bin/activate"
+  git_branch: "stage3_hp-tuning" # The specific branch the manager will pull
+  worker_script: "training/swarm_worker_stage3.py"
+  log_directory: "/tmp/swarm_logs"
+  
+  # Storage Quota Safety
+  hf_cache_dir: "/tmp/hf_cache"
+  torch_cache_dir: "/tmp/torch_cache"
+  scratch_dir: "/tmp/denassau_stage3"
+  hf_repo_id: "Denass04/RAEDiTRobotics-stage3-sweeps"
+
+  # Add your eval video parameters right here!
+  # eval_video_task: "lift"
+  eval_video_hdf5: "/student/denassau/CSC415/Project/RAEDiTRobotics/data/complete_unified_data/lift.hdf5"
+  # eval_video_episodes: 1
+  # eval_video_steps: 100
+  # eval_video_dir: "/tmp/eval_videos" # Keep it in /tmp to avoid quota issues
+  
+  # Optuna Pruning Settings
+  n_startup_trials: 10
+  n_warmup_steps: 400     # Don't prune any trial before epoch 500 (warmup phase)
+  pruning_percentile: 25.0   # Prune if in the worst 25% of trials
+  n_trials_per_worker: 5
+
+manager:
+  sshpass_path: "/student/denassau/bin/sshpass" 
+
+nodes:
+  # - dh2020pc05
+  # - dh2020pc06
+  - dh2020pc07
+  - dh2020pc08
+  - dh2020pc09
+  # - dh2020pc10
+  - dh2020pc11
+  # - dh2020pc12
+  - dh2020pc13
+  - dh2020pc14
+  - dh2020pc15
+  # - dh2020pc16
+  - dh2020pc17
+  # - dh2020pc18
+  - dh2020pc19
+  - dh2020pc20
+  # - dh2020pc21
+  - dh2020pc22
+  - dh2020pc23
+
+  # - dh2026pc05
+  - dh2026pc06
+  # - dh2026pc07
+  - dh2026pc08
+  - dh2026pc09
+  - dh2026pc10
+  # - dh2026pc11
+  - dh2026pc12
+  - dh2026pc13
+  # - dh2026pc14
+  - dh2026pc15
+  - dh2026pc16
+  - dh2026pc17
+  - dh2026pc18
+  - dh2026pc19
+  - dh2026pc20
+  - dh2026pc21
+
+
+# ---------------------------------------------------------------------------
+# FIXED VARIABLES (Passed directly to Stage3Config)
+# ---------------------------------------------------------------------------
+training_static:
+  # UPDATE THESE PATHS to point to your actual Phase 1 weights & tokens!
+  stage1_checkpoint: "/student/denassau/CSC415/Project/RAEDiTRobotics/data/stage1_checkpoints/epoch_024.pt" 
+  hdf5_paths: # precomputed tokens
+    - "/student/denassau/CSC415/Project/RAEDiTRobotics/data/stage3_decompressed_tokens/lift_tokens_fast.hdf5"
+
+
+# ---------------------------------------------------------------------------
+# DYNAMIC VARIABLES (Optuna Search Space - 9 Variables)
+# ---------------------------------------------------------------------------
+hyperparameters_search:
+  lr:
+    method: "suggest_float"
+    kwargs:
+      low: 1.0e-5
+      high: 5.0e-4
+      log: true
