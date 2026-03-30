@@ -92,6 +92,12 @@ def main():
     parser.add_argument("--eval_exec_horizon", type=int, default=8,
                         help="T_a: actions executed before re-planning (robomimic=8, RLBench=1)")
 
+    # Action space
+    parser.add_argument("--action_space", type=str, default=None,
+                        choices=["joint", "ee"],
+                        help="Shortcut: 'joint' sets ac_dim=8, eval_mode=joint, no_rot6d, norm_mode=minmax; "
+                             "'ee' sets ac_dim=7, eval_mode=custom, norm_mode=chi")
+
     # Normalization mode
     parser.add_argument("--norm_mode", type=str, default="minmax",
                         choices=["minmax", "zscore", "chi"],
@@ -139,6 +145,23 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
 
     args = parser.parse_args()
+
+    # Apply --action_space defaults (explicit flags still override)
+    if args.action_space == "joint":
+        if "--ac_dim" not in sys.argv:
+            args.ac_dim = 8
+        if "--eval_mode" not in sys.argv:
+            args.eval_mode = "joint"
+        if "--norm_mode" not in sys.argv:
+            args.norm_mode = "minmax"
+        args.no_rot6d = True
+    elif args.action_space == "ee":
+        if "--ac_dim" not in sys.argv:
+            args.ac_dim = 7
+        if "--eval_mode" not in sys.argv:
+            args.eval_mode = "custom"
+        if "--norm_mode" not in sys.argv:
+            args.norm_mode = "chi"
 
     # Setup logging
     logging.basicConfig(
