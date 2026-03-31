@@ -2,8 +2,6 @@
 
 ## Setup (UTM dh2026pcXX machines)
 
-All machines share `/virtual/csc415user/` via NFS, so data and checkpoints are available
-across pc01, pc03, etc. Each machine has an RTX 4080 (16GB).
 
 ```bash
 cd /virtual/csc415user/RAEDiTRobotics
@@ -17,7 +15,7 @@ See `requirements_venv_rlbench.txt` for environment setup on a new machine.
 ## Step 1: Precompute tokens (one-time per task)
 
 ```bash
-# fp32 tokens, no compression (~29GB per task, fastest reads)
+# fp32 tokens, no compression (need to test how much of an effect bf16 tokens have)
 python training/precompute_tokens.py \
     --hdf5 data/robomimic/square/ph_abs_v15.hdf5 \
     --preset fp32-none --rot6d
@@ -107,6 +105,7 @@ python -m training.train_v3_script \
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | `--lr` | 1e-4 | AdamW |
+| `--lr_adapter` | 0 | Separate adapter LR (0 = use main `--lr`) |
 | `--betas` | (0.9, 0.95) | Chi's transformer recipe |
 | `--weight_decay_denoiser` | 1e-3 | Transformer weight decay |
 | `--weight_decay_encoder` | 1e-6 | Obs encoder weight decay |
@@ -123,8 +122,7 @@ python -m training.train_v3_script \
 
 ## Available tasks
 
-`lift`, `can`, `square`, `tool_hang`, `transport`
-
+`lift`, `can`, `square`, `tool_hang`
 Data lives at `data/robomimic/{task}/ph_abs_v15.hdf5`.
 
 ---

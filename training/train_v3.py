@@ -183,6 +183,7 @@ class V3Config:
     betas: tuple = (0.9, 0.95)          # Chi transformer (NOT 0.9, 0.999)
     weight_decay_denoiser: float = 1e-3  # Chi: transformer_weight_decay
     weight_decay_encoder: float = 1e-6   # Chi: obs_encoder_weight_decay
+    lr_adapter: float = 0.0              # 0 = use main lr, >0 = separate adapter lr
     num_epochs: int = 100
     grad_clip: float = 0.0              # Chi: no gradient clipping
     grad_accum_steps: int = 1           # gradient accumulation (effective batch = batch_size * accum)
@@ -451,15 +452,19 @@ def train_v3(
     denoiser_groups = policy.denoiser.get_optim_groups(
         weight_decay=config.weight_decay_denoiser,
     )
+    adapter_group = {
+        "params": list(policy.bridge.adapter.parameters()),
+        "weight_decay": config.weight_decay_encoder,
+    }
+    if config.lr_adapter > 0:
+        adapter_group["lr"] = config.lr_adapter
+
     param_groups = denoiser_groups + [
         {
             "params": list(policy.obs_encoder.parameters()),
             "weight_decay": config.weight_decay_encoder,
         },
-        {
-            "params": list(policy.bridge.adapter.parameters()),
-            "weight_decay": config.weight_decay_encoder,
-        },
+        adapter_group,
     ]
 
     optimizer = torch.optim.AdamW(

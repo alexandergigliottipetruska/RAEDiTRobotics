@@ -179,6 +179,7 @@ class DiTDenoiser(nn.Module):
         p_drop_emb: float = 0.0,
         p_drop_attn: float = 0.3,
         causal_attn: bool = True,
+        **kwargs,
     ):
         super().__init__()
         self.ac_dim = ac_dim

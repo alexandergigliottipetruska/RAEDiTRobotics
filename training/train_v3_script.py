@@ -68,6 +68,8 @@ def main():
                         help="Disable rot6d conversion (for RLBench 8D actions)")
     parser.add_argument("--weight_decay_denoiser", type=float, default=1e-3)
     parser.add_argument("--weight_decay_encoder", type=float, default=1e-6)
+    parser.add_argument("--lr_adapter", type=float, default=0.0,
+                        help="Separate adapter learning rate (0 = use main --lr)")
     parser.add_argument("--p_drop_attn", type=float, default=0.3)
     parser.add_argument("--p_drop_emb", type=float, default=0.0)
 
@@ -222,6 +224,7 @@ def main():
         lr_schedule=args.lr_schedule,
         weight_decay_denoiser=args.weight_decay_denoiser,
         weight_decay_encoder=args.weight_decay_encoder,
+        lr_adapter=args.lr_adapter,
         p_drop_attn=args.p_drop_attn,
         p_drop_emb=args.p_drop_emb,
         save_dir=args.save_dir,

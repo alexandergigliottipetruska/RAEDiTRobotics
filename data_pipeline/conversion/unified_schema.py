@@ -28,7 +28,7 @@ import numpy as np
 NUM_CAMERA_SLOTS = 4
 IMAGE_SIZE = (224, 224)
 ACTION_DIM = 7
-VALID_BENCHMARKS = ["robomimic", "rlbench", "maniskill", "kitchen"]
+VALID_BENCHMARKS = ["robomimic", "rlbench"]
 
 
 def create_unified_hdf5(
