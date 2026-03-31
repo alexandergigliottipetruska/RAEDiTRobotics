@@ -23,6 +23,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+from torch.distributions import LogisticNormal
 
 from models.obs_encoder_v3 import ObservationEncoder
 from models.denoiser_transformer import TransformerDenoiser
@@ -71,6 +72,7 @@ class PolicyDiTv3(nn.Module):
         use_spatial_softmax: bool = False,
         n_cond_layers: int = 0,
         denoiser_type: str = "transformer",
+        use_flow_matching: bool = False,
     ):
         super().__init__()
 
@@ -80,6 +82,7 @@ class PolicyDiTv3(nn.Module):
         self.T_pred = T_pred
         self.train_diffusion_steps = train_diffusion_steps
         self.eval_diffusion_steps = eval_diffusion_steps
+        self.use_flow_matching = use_flow_matching
 
         # Observation encoder: adapted tokens + proprio → conditioning sequence
         self.obs_encoder = ObservationEncoder(
@@ -114,13 +117,19 @@ class PolicyDiTv3(nn.Module):
             raise ValueError(f"Unknown denoiser_type: {denoiser_type!r}. "
                              f"Choose 'transformer' or 'dit'.")
 
-        # DDPM noise scheduler for training
-        self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=train_diffusion_steps,
-            beta_schedule="squaredcos_cap_v2",
-            prediction_type="epsilon",
-            clip_sample=True,
-        )
+        # Noise schedule / flow matching setup
+        if use_flow_matching:
+            self.logistic_normal = LogisticNormal(
+                torch.tensor(0.0), torch.tensor(1.0)
+            )
+            self.noise_scheduler = None
+        else:
+            self.noise_scheduler = DDPMScheduler(
+                num_train_timesteps=train_diffusion_steps,
+                beta_schedule="squaredcos_cap_v2",
+                prediction_type="epsilon",
+                clip_sample=True,
+            )
 
     def _encode_obs(self, batch: dict, pre_normalized: bool = True) -> dict:
         """Encode observations into conditioning dict.
@@ -153,7 +162,7 @@ class PolicyDiTv3(nn.Module):
         return obs_cond
 
     def compute_loss(self, batch: dict) -> torch.Tensor:
-        """DDPM training: sample timestep, add noise, predict epsilon, MSE loss.
+        """Training loss: DDPM epsilon-prediction or L1 Flow sample-prediction.
 
         Args:
             batch: dict with keys from Stage3Dataset:
@@ -163,7 +172,7 @@ class PolicyDiTv3(nn.Module):
                 - view_present: (B, K) bool
 
         Returns:
-            Scalar MSE loss.
+            Scalar loss.
         """
         actions = batch["actions"]  # (B, T_pred, ac_dim) normalized [-1, 1]
         B = actions.shape[0]
@@ -172,25 +181,41 @@ class PolicyDiTv3(nn.Module):
         # 1. Encode observations (training: images are pre-normalized by dataset)
         obs_cond = self._encode_obs(batch, pre_normalized=True)
 
-        # 2. Sample random timesteps
-        timesteps = torch.randint(
-            0, self.train_diffusion_steps, (B,), device=device, dtype=torch.long
-        )
+        if self.use_flow_matching:
+            # L1 Sample Flow (Song et al. 2025)
+            noise = torch.randn_like(actions)
 
-        # 3. Add noise to actions
-        noise = torch.randn_like(actions)
-        noisy_actions = self.noise_scheduler.add_noise(actions, noise, timesteps)
+            # Logistic-normal + 1% uniform timestep sampling
+            t = self.logistic_normal.sample((B,))[:, 0].to(device)
+            uni_t = torch.rand_like(t)
+            mask = torch.rand_like(t) < 0.01
+            t[mask] = uni_t[mask]
 
-        # 4. Predict noise
-        noise_pred = self.denoiser(noisy_actions, timesteps, obs_cond)
+            # Linear interpolation: x_t = t * x₁ + (1-t) * x₀
+            t_expand = t[:, None, None]
+            noisy_actions = t_expand * actions + (1 - t_expand) * noise
 
-        # 5. MSE loss
-        loss = F.mse_loss(noise_pred, noise)
+            # Model predicts clean sample x₁; scale t for sinusoidal embedding
+            timesteps = (t * 1000).long()
+            x_pred = self.denoiser(noisy_actions, timesteps, obs_cond)
+
+            # L1 loss on sample prediction
+            loss = F.l1_loss(x_pred, actions)
+        else:
+            # DDPM epsilon prediction (Chi's original)
+            timesteps = torch.randint(
+                0, self.train_diffusion_steps, (B,), device=device, dtype=torch.long
+            )
+            noise = torch.randn_like(actions)
+            noisy_actions = self.noise_scheduler.add_noise(actions, noise, timesteps)
+            noise_pred = self.denoiser(noisy_actions, timesteps, obs_cond)
+            loss = F.mse_loss(noise_pred, noise)
+
         return loss
 
     @torch.no_grad()
     def predict_action(self, obs_dict: dict) -> torch.Tensor:
-        """DDIM inference: denoise from random noise to action trajectory.
+        """Inference: DDIM denoising or L1 Flow 2-step prediction.
 
         Args:
             obs_dict: dict with:
@@ -207,28 +232,39 @@ class PolicyDiTv3(nn.Module):
         # 1. Encode observations (eval: images are raw [0,1], bridge normalizes)
         obs_cond = self._encode_obs(obs_dict, pre_normalized=False)
 
-        # 2. Create DDIM scheduler for inference
-        scheduler = DDIMScheduler(
-            num_train_timesteps=self.train_diffusion_steps,
-            beta_schedule="squaredcos_cap_v2",
-            prediction_type="epsilon",
-            clip_sample=True,
-        )
-        scheduler.set_timesteps(self.eval_diffusion_steps, device=device)
-
-        # 3. Start from random noise
+        # 2. Start from random noise
         actions = torch.randn(B, self.T_pred, self.ac_dim, device=device)
 
-        # 4. Denoising loop
-        for t in scheduler.timesteps:
-            timestep = t.expand(B)
-            noise_pred = self.denoiser(actions, timestep, obs_cond)
-            actions = scheduler.step(noise_pred, t, actions).prev_sample
+        if self.use_flow_matching:
+            # L1 Flow 2-step inference (Song et al. 2025)
+            t = torch.zeros(B, device=device)
 
-        # Return full prediction. Callers (eval loops) select which action to
-        # execute based on their execution horizon (T_a).
-        # Note: with pad_before=1 training, position 0 = action at current obs
-        # timestep t, position 1 = action at t+1, etc.
+            # Step 1: One-step integration to midpoint (t=0 → t=0.5)
+            t_int = (t * 1000).long()
+            x_pred = self.denoiser(actions, t_int, obs_cond)
+            v_t = (x_pred - actions) / (1 - t[:, None, None])
+            actions = actions + 0.5 * v_t
+            t = t + 0.5
+
+            # Step 2: Direct prediction at midpoint (t=0.5 → x₁)
+            t_int = (t * 1000).long()
+            actions = self.denoiser(actions, t_int, obs_cond)
+            actions = actions.clamp(-1, 1)
+        else:
+            # DDIM denoising loop (Chi's original)
+            scheduler = DDIMScheduler(
+                num_train_timesteps=self.train_diffusion_steps,
+                beta_schedule="squaredcos_cap_v2",
+                prediction_type="epsilon",
+                clip_sample=True,
+            )
+            scheduler.set_timesteps(self.eval_diffusion_steps, device=device)
+
+            for t in scheduler.timesteps:
+                timestep = t.expand(B)
+                noise_pred = self.denoiser(actions, timestep, obs_cond)
+                actions = scheduler.step(noise_pred, t, actions).prev_sample
+
         return actions
 
     def forward(self, batch: dict) -> torch.Tensor:

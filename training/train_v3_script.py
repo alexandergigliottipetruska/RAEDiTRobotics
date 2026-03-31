@@ -121,6 +121,8 @@ def main():
                         help="Use SpatialSoftmax pooling (Chi-style spatial coordinates) instead of avg pool")
     parser.add_argument("--n_cond_layers", type=int, default=0,
                         help="Self-attention encoder layers for conditioning (0=MLP, >0=transformer encoder)")
+    parser.add_argument("--use_flow_matching", action="store_true",
+                        help="Use L1 Sample Flow (2-step, L1 loss) instead of DDPM/DDIM")
 
     # Augmentation — periodic token refresh with random crop
     parser.add_argument("--augment_refresh_every", type=int, default=0,
@@ -147,7 +149,7 @@ def main():
                         help="Disable torch.compile (Chi doesn't use it)")
 
     # Reproducibility
-    parser.add_argument("--seed", type=int, default=0,
+    parser.add_argument("--seed", type=int, default=42,
                         help="Global seed for reproducibility (0 = random)")
 
     # Device
@@ -243,6 +245,7 @@ def main():
         spatial_pool_size=args.spatial_pool_size,
         use_spatial_softmax=args.use_spatial_softmax,
         n_cond_layers=args.n_cond_layers,
+        use_flow_matching=args.use_flow_matching,
         augment_refresh_every=args.augment_refresh_every,
         random_crop_size=args.random_crop_size,
         image_hdf5=args.image_hdf5,

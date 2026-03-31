@@ -204,6 +204,7 @@ class V3Config:
     spatial_pool_size: int = 1          # 1=avg pool (default), 4/7/14=spatial tokens
     use_spatial_softmax: bool = False   # SpatialSoftmax pooling (Chi-style spatial coordinates)
     n_cond_layers: int = 0              # 0=MLP encoder (Chi), >0=self-attention encoder for spatial tokens
+    use_flow_matching: bool = False     # L1 Sample Flow (2-step, L1 loss) instead of DDPM/DDIM
 
     # Augmentation — periodic token refresh with random crop
     augment_refresh_every: int = 0      # 0=disabled, 5=refresh train tokens every 5 epochs
@@ -421,6 +422,7 @@ def train_v3(
         use_spatial_softmax=config.use_spatial_softmax,
         n_cond_layers=config.n_cond_layers,
         denoiser_type=config.denoiser_type,
+        use_flow_matching=config.use_flow_matching,
     )
     policy = policy.to(device)
 
