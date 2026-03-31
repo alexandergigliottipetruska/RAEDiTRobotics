@@ -163,7 +163,7 @@ def evaluate_v3_parallel(
     wrapper: V3PolicyWrapper,
     norm_stats: dict,
     num_episodes: int = 50,
-    num_workers: int = 4,
+    num_workers: int = 8,
     task: str = "lift",
     max_steps: int = 400,
     seed_start: int = 100000,
