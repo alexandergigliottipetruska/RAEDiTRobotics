@@ -487,16 +487,19 @@ def train_stage1(
     if is_main:
         os.makedirs(config.save_dir, exist_ok=True)
 
-        # Timestamped log file
+        # Merge any fragmented logs from previous runs
+        from training.merge_logs import merge_all
+        merge_all(config.save_dir, start_epoch=start_epoch if resume_from else None)
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(config.save_dir, f"train_{ts}.log")
+        log_file = os.path.join(config.save_dir, "train.log")
         fh = logging.FileHandler(log_file)
         fh.setLevel(logging.INFO)
         fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
         log.addHandler(fh)
 
         # Metrics JSONL (append-friendly, one line per epoch)
-        metrics_path = os.path.join(config.save_dir, f"metrics_{ts}.jsonl")
+        metrics_path = os.path.join(config.save_dir, "metrics.jsonl")
 
         # Write run header as first line
         run_info = {

@@ -141,7 +141,14 @@ def main():
 
     # Checkpointing
     parser.add_argument("--save_dir", type=str, default="checkpoints/v3")
-    parser.add_argument("--save_every_epoch", type=int, default=10)
+    parser.add_argument("--save_every_epoch", type=int, default=10,
+                        help="Permanent milestone checkpoints every N epochs (0=disabled)")
+    parser.add_argument("--save_rolling_every", type=int, default=0,
+                        help="Rolling backup every N epochs (overwrites previous, 0=disabled)")
+    parser.add_argument("--no_save_best", action="store_true",
+                        help="Disable best.pt saving (val loss)")
+    parser.add_argument("--no_save_best_success", action="store_true",
+                        help="Disable best_success.pt saving (eval success rate)")
     parser.add_argument("--resume", type=str, default=None)
 
     # Precision (Chi runs fp32, no compile)
@@ -192,6 +199,11 @@ def main():
         if local_rank >= 0:
             torch.distributed.init_process_group(backend="nccl")
 
+    # Auto-timestamp save_dir (skip on resume to preserve existing path)
+    if not args.resume:
+        from datetime import datetime
+        args.save_dir = f"{args.save_dir}_{datetime.now().strftime('%m%d_%H%M')}"
+
     # Build config
     from training.train_v3 import V3Config, train_v3
 
@@ -229,6 +241,9 @@ def main():
         p_drop_emb=args.p_drop_emb,
         save_dir=args.save_dir,
         save_every_epoch=args.save_every_epoch,
+        save_rolling_every=args.save_rolling_every,
+        no_save_best=args.no_save_best,
+        no_save_best_success=args.no_save_best_success,
         eval_every_epoch=args.eval_every_epoch,
         eval_full_every_epoch=args.eval_full_every_epoch,
         eval_n_envs=args.eval_n_envs,

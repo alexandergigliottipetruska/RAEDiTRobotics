@@ -9,6 +9,7 @@ V3-specific features:
   - Eval via eval_v3.py (no external ImageNet norm)
 """
 
+import glob
 import json
 import logging
 import math
@@ -214,7 +215,10 @@ class V3Config:
 
     # Logging & checkpointing
     log_every: int = 100
-    save_every_epoch: int = 10
+    save_every_epoch: int = 10           # permanent milestone checkpoints (0=disabled)
+    save_rolling_every: int = 0          # rolling backup every N epochs (overwrites previous, 0=disabled)
+    no_save_best: bool = False           # disable best.pt (val loss)
+    no_save_best_success: bool = False   # disable best_success.pt (eval success rate)
     eval_every_epoch: int = 10000           # eval every 5 epochs (first 50), then 50
     save_dir: str = "checkpoints/v3"
 
@@ -567,14 +571,19 @@ def train_v3(
     metrics_path = None
     if is_main:
         os.makedirs(config.save_dir, exist_ok=True)
+
+        # Merge any fragmented logs from previous runs
+        from training.merge_logs import merge_all
+        merge_all(config.save_dir, start_epoch=start_epoch if resume_from else None)
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(config.save_dir, f"train_{ts}.log")
+        log_file = os.path.join(config.save_dir, "train.log")
         fh = logging.FileHandler(log_file)
         fh.setLevel(logging.INFO)
         fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
         log.addHandler(fh)
 
-        metrics_path = os.path.join(config.save_dir, f"metrics_{ts}.jsonl")
+        metrics_path = os.path.join(config.save_dir, "metrics.jsonl")
         run_info = {
             "type": "run_info", "version": "v3", "timestamp": ts,
             "gpu": torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu",
@@ -611,6 +620,13 @@ def train_v3(
     best_val_loss = float("inf")
     best_success_rate = -1.0
     last_best_save_epoch = -999  # cooldown for best.pt saves
+
+    # Rolling backup state — detect any existing backup from a previous run
+    prev_rolling_path = None
+    if config.save_rolling_every:
+        existing = sorted(glob.glob(os.path.join(config.save_dir, "latest_backup_*.pt")))
+        if existing:
+            prev_rolling_path = existing[-1]
 
     # Save first training batch for diagnostics (Chi measures t0 on this)
     train_sampling_batch = None
@@ -729,13 +745,25 @@ def train_v3(
                         "train": avg, "valid": val_avg,
                     }) + "\n")
 
-            # Periodic checkpoint
-            if (epoch + 1) % config.save_every_epoch == 0:
+            # Periodic checkpoint (permanent milestones)
+            if config.save_every_epoch and (epoch + 1) % config.save_every_epoch == 0:
                 save_v3_checkpoint(
                     os.path.join(config.save_dir, f"epoch_{epoch:03d}.pt"),
                     epoch, global_step, policy, optimizer, ema_model, avg,
                     config=config,
                 )
+
+            # Rolling backup (overwrites previous — frequent saves, constant disk usage)
+            if config.save_rolling_every and (epoch + 1) % config.save_rolling_every == 0:
+                rolling_path = os.path.join(config.save_dir, f"latest_backup_{epoch:04d}.pt")
+                save_v3_checkpoint(
+                    rolling_path, epoch, global_step, policy, optimizer, ema_model, avg,
+                    config=config,
+                )
+                if prev_rolling_path and prev_rolling_path != rolling_path and os.path.isfile(prev_rolling_path):
+                    os.remove(prev_rolling_path)
+                    log.info("Removed old rolling backup: %s", os.path.basename(prev_rolling_path))
+                prev_rolling_path = rolling_path
 
             # Per-timestep diagnostics (t0, denoised-MSE) — every eval_every_epoch + full eval epochs
             is_last_epoch = (epoch == config.num_epochs - 1)
@@ -767,12 +795,13 @@ def train_v3(
                                 }) + "\n")
                         if sr > best_success_rate:
                             best_success_rate = sr
-                            save_v3_checkpoint(
-                                os.path.join(config.save_dir, "best_success.pt"),
-                                epoch, global_step, policy, optimizer, ema_model,
-                                {**avg, "success_rate": sr},
-                                config=config,
-                            )
+                            if not config.no_save_best_success:
+                                save_v3_checkpoint(
+                                    os.path.join(config.save_dir, "best_success.pt"),
+                                    epoch, global_step, policy, optimizer, ema_model,
+                                    {**avg, "success_rate": sr},
+                                    config=config,
+                                )
                             log.info("New best success rate: %.1f%% (epoch %d)", sr * 100, epoch)
                     except Exception as e:
                         log.warning("Eval failed at epoch %d: %s", epoch, e)
@@ -797,18 +826,19 @@ def train_v3(
 
                         if sr > best_success_rate:
                             best_success_rate = sr
-                            save_v3_checkpoint(
-                                os.path.join(config.save_dir, "best_success.pt"),
-                                epoch, global_step, policy, optimizer, ema_model,
-                                {**avg, "success_rate": sr},
-                                config=config,
-                            )
+                            if not config.no_save_best_success:
+                                save_v3_checkpoint(
+                                    os.path.join(config.save_dir, "best_success.pt"),
+                                    epoch, global_step, policy, optimizer, ema_model,
+                                    {**avg, "success_rate": sr},
+                                    config=config,
+                                )
                             log.info("New best success rate: %.1f%% (epoch %d)", sr * 100, epoch)
                     except Exception as e:
                         log.warning("Eval failed at epoch %d: %s", epoch, e)
 
             # Best checkpoint (by val loss) with 5-epoch cooldown
-            if val_avg.get("policy", float("inf")) < best_val_loss:
+            if not config.no_save_best and val_avg.get("policy", float("inf")) < best_val_loss:
                 best_val_loss = val_avg["policy"]
                 if epoch - last_best_save_epoch >= 5:
                     save_v3_checkpoint(
