@@ -102,7 +102,8 @@ def main():
     parser.add_argument("--action_space", type=str, default=None,
                         choices=["joint", "ee"],
                         help="Shortcut: 'joint' sets ac_dim=8, eval_mode=joint, no_rot6d, norm_mode=minmax; "
-                             "'ee' sets ac_dim=7, eval_mode=custom, norm_mode=chi")
+                             "'ee' sets ac_dim=10 (rot6d), eval_mode=custom, norm_mode=chi, "
+                             "with quaternion projection at inference")
 
     # Normalization mode
     parser.add_argument("--norm_mode", type=str, default="minmax",
@@ -114,6 +115,20 @@ def main():
     parser.add_argument("--denoiser_type", type=str, default="transformer",
                         choices=["transformer", "dit"],
                         help="Denoiser: 'transformer' (Chi cross-attn) or 'dit' (adaLN-Zero)")
+
+    # DiT enhancements
+    parser.add_argument("--prediction_type", type=str, default="epsilon",
+                        choices=["epsilon", "v_prediction", "sample"],
+                        help="Diffusion prediction target: epsilon (default), v_prediction (more stable), sample")
+    parser.add_argument("--cfg_drop_rate", type=float, default=0.0,
+                        help="Classifier-free guidance: obs dropout rate during training (0=disabled, 0.1=recommended)")
+    parser.add_argument("--cfg_scale", type=float, default=1.0,
+                        help="Classifier-free guidance: inference guidance scale (1.0=no guidance, 1.5-3.0=recommended)")
+    parser.add_argument("--use_rope", action="store_true",
+                        help="Use Rotary Position Embeddings (RoPE) in DiT instead of learned pos emb")
+    parser.add_argument("--dit_preset", type=str, default=None,
+                        choices=["S", "M", "L"],
+                        help="DiT model size preset: S (d=256,h=4,l=8), M (d=384,h=6,l=12), L (d=512,h=8,l=16)")
 
     # Spatial tokens
     parser.add_argument("--spatial_pool_size", type=int, default=1,
@@ -177,11 +192,29 @@ def main():
         args.no_rot6d = True
     elif args.action_space == "ee":
         if "--ac_dim" not in sys.argv:
-            args.ac_dim = 7
+            args.ac_dim = 10
         if "--eval_mode" not in sys.argv:
             args.eval_mode = "custom"
         if "--norm_mode" not in sys.argv:
             args.norm_mode = "chi"
+        args.no_rot6d = False  # enable rot6d conversion (7D aa → 10D)
+
+    # Apply --dit_preset defaults (explicit flags still override)
+    if args.dit_preset:
+        presets = {
+            "S": (256, 4, 8),    # ~15M params
+            "M": (384, 6, 12),   # ~45M params
+            "L": (512, 8, 16),   # ~110M params
+        }
+        d, h, l = presets[args.dit_preset]
+        if "--d_model" not in sys.argv:
+            args.d_model = d
+        if "--n_head" not in sys.argv:
+            args.n_head = h
+        if "--n_layers" not in sys.argv:
+            args.n_layers = l
+        if "--denoiser_type" not in sys.argv:
+            args.denoiser_type = "dit"
 
     # Setup logging
     logging.basicConfig(
@@ -260,6 +293,10 @@ def main():
         no_compile=args.no_compile,
         seed=args.seed,
         denoiser_type=args.denoiser_type,
+        prediction_type=args.prediction_type,
+        cfg_drop_rate=args.cfg_drop_rate,
+        cfg_scale=args.cfg_scale,
+        use_rope=args.use_rope,
         spatial_pool_size=args.spatial_pool_size,
         use_spatial_softmax=args.use_spatial_softmax,
         n_cond_layers=args.n_cond_layers,

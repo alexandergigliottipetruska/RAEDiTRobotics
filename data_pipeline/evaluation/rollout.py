@@ -110,6 +110,12 @@ def evaluate_policy(
                 elif action_mean is not None and action_std is not None:
                     raw = raw * action_std + action_mean
 
+                # Project rot6d through quaternion space to enforce valid rotation
+                if rot6d:
+                    from models.policy_v3 import PolicyDiTv3
+                    raw_t = torch.from_numpy(raw).float()
+                    raw = PolicyDiTv3.project_rot6d_via_quaternion(raw_t).numpy()
+
                 # Convert 10D rot6d actions → 7D axis-angle for robosuite
                 if rot6d:
                     from data_pipeline.utils.rotation import convert_actions_from_rot6d

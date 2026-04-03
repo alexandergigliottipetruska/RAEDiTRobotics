@@ -751,6 +751,10 @@ if __name__ == "__main__":
     spatial_pool_size = _get("spatial_pool_size", 1)
     use_flow_matching = _get("use_flow_matching", False)
     denoiser_type = _get("denoiser_type", "transformer")
+    prediction_type = _get("prediction_type", "epsilon")
+    cfg_drop_rate = _get("cfg_drop_rate", 0.0)
+    cfg_scale = args.cfg_scale if hasattr(args, "cfg_scale") and args.cfg_scale is not None else _get("cfg_scale", 1.0)
+    use_rope = _get("use_rope", False)
     norm_mode = args.norm_mode or cfg.get("norm_mode", "chi")
 
     log.info("Arch: d=%d, heads=%d, layers=%d, ncond=%d, spatial=%d, fm=%s, denoiser=%s",
@@ -773,6 +777,10 @@ if __name__ == "__main__":
         n_cond_layers=n_cond_layers,
         use_flow_matching=use_flow_matching,
         denoiser_type=denoiser_type,
+        prediction_type=prediction_type,
+        cfg_drop_rate=cfg_drop_rate,
+        cfg_scale=cfg_scale,
+        use_rope=use_rope,
     ).to(device)
 
     # Load policy weights

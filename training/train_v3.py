@@ -202,6 +202,12 @@ class V3Config:
     # Denoiser backbone
     denoiser_type: str = "transformer"  # "transformer" (Chi cross-attn) or "dit" (adaLN-Zero)
 
+    # DiT enhancements
+    prediction_type: str = "epsilon"    # "epsilon" (default), "v_prediction", or "sample"
+    cfg_drop_rate: float = 0.0          # CFG: probability of dropping obs conditioning (0=disabled, 0.1=recommended)
+    cfg_scale: float = 1.0              # CFG: guidance scale at inference (1.0=no guidance, 1.5-3.0=recommended)
+    use_rope: bool = False              # Use RoPE instead of learned positional embeddings in DiT
+
     # Spatial tokens
     spatial_pool_size: int = 1          # 1=avg pool (default), 4/7/14=spatial tokens
     use_spatial_softmax: bool = False   # SpatialSoftmax pooling (Chi-style spatial coordinates)
@@ -431,6 +437,10 @@ def train_v3(
         n_cond_layers=config.n_cond_layers,
         denoiser_type=config.denoiser_type,
         use_flow_matching=config.use_flow_matching,
+        prediction_type=config.prediction_type,
+        cfg_drop_rate=config.cfg_drop_rate,
+        cfg_scale=config.cfg_scale,
+        use_rope=config.use_rope,
     )
     policy = policy.to(device)
 
@@ -614,6 +624,16 @@ def train_v3(
             log.info("EMA: power=%.2f, Diffusion: %d train / %d eval steps",
                      config.ema_power, config.train_diffusion_steps, config.eval_diffusion_steps)
         log.info("Precision: AMP=%s, compile=%s", not config.no_amp, not config.no_compile)
+        if config.denoiser_type == "dit":
+            extras = []
+            if config.use_rope:
+                extras.append("RoPE")
+            if config.prediction_type != "epsilon":
+                extras.append(f"pred={config.prediction_type}")
+            if config.cfg_drop_rate > 0:
+                extras.append(f"CFG(drop={config.cfg_drop_rate}, scale={config.cfg_scale})")
+            if extras:
+                log.info("DiT enhancements: %s", ", ".join(extras))
         log.info("=" * 60)
 
     # --- Training loop ---
