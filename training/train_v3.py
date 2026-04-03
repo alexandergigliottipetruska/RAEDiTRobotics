@@ -97,7 +97,9 @@ def train_step(
     }
 
     with torch.amp.autocast(device_type, dtype=torch.bfloat16, enabled=use_amp):
-        loss = policy(batch_dev)
+        result = policy(batch_dev)
+
+    loss = result["loss"]
 
     # Scale loss for gradient accumulation and backward
     (loss * loss_scale).backward()
@@ -113,7 +115,7 @@ def train_step(
         optimizer.step()
         optimizer.zero_grad()
 
-    return {"policy": loss.item(), "total": loss.item()}
+    return {"policy": result["policy"], "recon": result["recon"], "total": loss.item()}
 
 
 # ---------------------------------------------------------------------------
@@ -214,10 +216,14 @@ class V3Config:
     n_cond_layers: int = 0              # 0=MLP encoder (Chi), >0=self-attention encoder for spatial tokens
     use_flow_matching: bool = False     # L1 Sample Flow (2-step, L1 loss) instead of DDPM/DDIM
 
+    # RAE decoder co-training
+    lambda_recon: float = 0.0           # reconstruction loss weight (0=disabled)
+    decoder_weight_decay: float = 1e-6  # weight decay for decoder params
+
     # Augmentation — periodic token refresh with random crop
     augment_refresh_every: int = 0      # 0=disabled, 5=refresh train tokens every 5 epochs
     random_crop_size: int = 208         # crop 224→208→resize 224
-    image_hdf5: str = ""                # raw image HDF5 for token refresh
+    image_hdf5: str = ""                # raw image HDF5 for token refresh + co-training targets
 
     # Logging & checkpointing
     log_every: int = 100
@@ -278,6 +284,9 @@ def save_v3_checkpoint(
         "optimizer": optimizer.state_dict(),
         "val_metrics": val_metrics,
     }
+    # Save decoder if co-training
+    if pu.bridge.decoder is not None:
+        ckpt["decoder"] = pu.bridge.decoder.state_dict()
     if config is not None:
         ckpt["config"] = {k: v for k, v in config.__dict__.items()}
     if ema_model is not None:
@@ -328,6 +337,8 @@ def load_v3_checkpoint(
         policy.denoiser.load_state_dict(denoiser_sd)
         policy.obs_encoder.load_state_dict(_strip(ckpt["obs_encoder"]))
         policy.bridge.adapter.load_state_dict(_strip(ckpt["adapter"]))
+        if "decoder" in ckpt and policy.bridge.decoder is not None:
+            policy.bridge.decoder.load_state_dict(_strip(ckpt["decoder"]))
     else:
         # Old format: full policy state dict
         policy.load_state_dict(_strip(ckpt["policy"]))
@@ -415,6 +426,7 @@ def train_v3(
     bridge = Stage1Bridge(
         checkpoint_path=config.stage1_checkpoint,
         pretrained_encoder=True,
+        load_decoder=(config.lambda_recon > 0),
     )
 
     policy = PolicyDiTv3(
@@ -443,6 +455,13 @@ def train_v3(
         use_rope=config.use_rope,
     )
     policy = policy.to(device)
+    policy._lambda_recon = config.lambda_recon
+
+    # Eagerly init LPIPS before EMA deepcopy (lazy init would desync modules)
+    if config.lambda_recon > 0 and policy.bridge.decoder is not None:
+        from models.losses import create_lpips_net
+        policy.bridge._lpips_net = create_lpips_net().to(device)
+        policy.bridge._lpips_net.requires_grad_(False)
 
     # Performance (skip benchmark when seeded — it breaks determinism)
     if device.type == "cuda":
@@ -480,6 +499,16 @@ def train_v3(
         },
         adapter_group,
     ]
+
+    # Decoder co-training: add decoder params to optimizer
+    if config.lambda_recon > 0 and policy.bridge.decoder is not None:
+        param_groups.append({
+            "params": list(policy.bridge.decoder.parameters()),
+            "weight_decay": config.decoder_weight_decay,
+        })
+        log.info("RAE co-training enabled: lambda_recon=%.4f, decoder params=%d",
+                 config.lambda_recon,
+                 sum(p.numel() for p in policy.bridge.decoder.parameters()))
 
     optimizer = torch.optim.AdamW(
         param_groups,
@@ -741,8 +770,8 @@ def train_v3(
                     for k, v in val_batch.items()
                 }
                 with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    val_loss = _unwrap(policy)(val_batch_dev)
-                val_losses["policy"] = val_losses.get("policy", 0.0) + val_loss.item()
+                    val_result = _unwrap(policy)(val_batch_dev)
+                val_losses["policy"] = val_losses.get("policy", 0.0) + val_result["policy"]
                 val_steps += 1
         val_avg = {k: v / max(val_steps, 1) for k, v in val_losses.items()}
         policy.train()

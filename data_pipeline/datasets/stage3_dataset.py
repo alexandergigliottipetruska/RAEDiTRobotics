@@ -197,6 +197,8 @@ class Stage3Dataset(Dataset):
     def _open_handles(self):
         """Open persistent HDF5 file handles (called from worker_init_fn)."""
         self._handles = [h5py.File(p, "r") for p in self._hdf5_paths]
+        if self._image_hdf5_path:
+            self._image_handle = h5py.File(self._image_hdf5_path, "r")
 
     def _close_handles(self):
         """Close persistent HDF5 file handles."""
@@ -204,6 +206,9 @@ class Stage3Dataset(Dataset):
             for h in self._handles:
                 h.close()
             self._handles = None
+        if hasattr(self, '_image_handle') and self._image_handle:
+            self._image_handle.close()
+            self._image_handle = None
 
     @torch.no_grad()
     def refresh_cached_tokens(self, encoder, device, crop_size=208):
@@ -396,6 +401,32 @@ class Stage3Dataset(Dataset):
         if is_cached:
             # Return precomputed tokens (cast float16 -> float32)
             result["cached_tokens"] = torch.from_numpy(tokens_raw.astype(np.float32))
+
+            # Co-training: load raw images from original HDF5 for reconstruction target
+            if self._image_hdf5_path:
+                if hasattr(self, '_image_handle') and self._image_handle:
+                    img_f = self._image_handle
+                    _close_img = False
+                else:
+                    img_f = h5py.File(self._image_hdf5_path, 'r')
+                    _close_img = True
+                try:
+                    img_grp = img_f[f'data/{demo_key}']
+                    imgs_co = img_grp["images"][obs_start:obs_end]  # (<=T_obs, K, H, W, 3)
+                    if pad_before > 0:
+                        imgs_co = np.concatenate(
+                            [np.repeat(imgs_co[:1], pad_before, axis=0), imgs_co],
+                            axis=0,
+                        )
+                    if imgs_co.dtype == np.uint8:
+                        imgs_01 = imgs_co.astype(np.float32) / 255.0
+                    else:
+                        imgs_01 = imgs_co.astype(np.float32)
+                    images_target = np.moveaxis(imgs_01, -1, -3)  # (T_obs, K, 3, H, W)
+                    result["images_target"] = torch.from_numpy(images_target)
+                finally:
+                    if _close_img:
+                        img_f.close()
         else:
             # Process images
             if imgs_raw.dtype == np.uint8:

@@ -247,6 +247,8 @@ class Stage1Bridge(nn.Module):
         total_loss = torch.tensor(0.0, device=adapted.device)
         n_views = 0
 
+        # Use bf16 autocast for decoder + LPIPS (heavy compute, safe for auxiliary loss)
+        device_type = adapted.device.type
         for t in range(T_o):
             for k in range(K):
                 mask = view_present[:, k]
@@ -256,10 +258,11 @@ class Stage1Bridge(nn.Module):
                 tokens_k = adapted[mask, t, k]  # (B_real, N, d')
                 target_k = images_target[mask, t, k]  # (B_real, 3, H, W)
 
-                pred_k = self.decoder(tokens_k)  # (B_real, 3, H, W) in [0,1]
+                with torch.amp.autocast(device_type, dtype=torch.bfloat16):
+                    pred_k = self.decoder(tokens_k)  # (B_real, 3, H, W) in [0,1]
+                    loss_l1 = l1_loss(pred_k, target_k)
+                    loss_lpips = lpips_loss_fn(pred_k, target_k, self._lpips_net)
 
-                loss_l1 = l1_loss(pred_k, target_k)
-                loss_lpips = lpips_loss_fn(pred_k, target_k, self._lpips_net)
                 total_loss = total_loss + loss_l1 + loss_lpips
                 n_views += 1
 

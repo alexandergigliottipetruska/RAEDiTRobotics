@@ -141,6 +141,12 @@ def main():
     parser.add_argument("--use_flow_matching", action="store_true",
                         help="Use L1 Sample Flow (2-step, L1 loss) instead of DDPM/DDIM")
 
+    # RAE decoder co-training
+    parser.add_argument("--lambda_recon", type=float, default=0.0,
+                        help="Reconstruction loss weight for decoder co-training (0=disabled)")
+    parser.add_argument("--decoder_weight_decay", type=float, default=1e-6,
+                        help="Weight decay for decoder parameters")
+
     # Augmentation — periodic token refresh with random crop
     parser.add_argument("--augment_refresh_every", type=int, default=0,
                         help="Re-encode train tokens with random crop every N epochs (0=disabled, 5=recommended)")
@@ -301,6 +307,8 @@ def main():
         use_spatial_softmax=args.use_spatial_softmax,
         n_cond_layers=args.n_cond_layers,
         use_flow_matching=args.use_flow_matching,
+        lambda_recon=args.lambda_recon,
+        decoder_weight_decay=args.decoder_weight_decay,
         augment_refresh_every=args.augment_refresh_every,
         random_crop_size=args.random_crop_size,
         image_hdf5=args.image_hdf5,

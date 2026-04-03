@@ -185,7 +185,7 @@ class PolicyDiTv3(nn.Module):
                 null_cond[k] = v
         return null_cond
 
-    def compute_loss(self, batch: dict) -> torch.Tensor:
+    def compute_loss(self, batch: dict, lambda_recon: float = 0.0) -> dict:
         """Training loss: DDPM epsilon/v-prediction or L1 Flow sample-prediction.
 
         With CFG: randomly drops observation conditioning with probability cfg_drop_rate.
@@ -196,16 +196,28 @@ class PolicyDiTv3(nn.Module):
                 - actions: (B, T_pred, ac_dim) normalized
                 - proprio: (B, T_obs, proprio_dim) normalized
                 - view_present: (B, K) bool
+                - images_target: (B, T_obs, K, 3, H, W) optional, for co-training
+            lambda_recon: weight for reconstruction loss (0=disabled).
 
         Returns:
-            Scalar loss.
+            dict with 'loss' (scalar for backward), 'policy' (float),
+            'recon' (float), for logging.
         """
         actions = batch["actions"]  # (B, T_pred, ac_dim) normalized [-1, 1]
         B = actions.shape[0]
         device = actions.device
+        view_present = batch["view_present"]
 
-        # 1. Encode observations (training: images are pre-normalized by dataset)
-        obs_cond = self._encode_obs(batch, pre_normalized=True)
+        # 1. Encode observations — capture adapted tokens for reconstruction
+        if "cached_tokens" in batch:
+            adapted = self.bridge.adapt(batch["cached_tokens"], view_present)
+        else:
+            adapted = self.bridge.encode(
+                batch["images_enc"], view_present, pre_normalized=True
+            )
+
+        # adapted: (B, T_o, K, 196, 512)
+        obs_cond = self.obs_encoder(adapted, batch["proprio"], view_present)
 
         # 2. CFG: randomly drop conditioning
         if self.cfg_drop_rate > 0 and self.training:
@@ -219,26 +231,18 @@ class PolicyDiTv3(nn.Module):
                             null_cond[k], v,
                         )
 
+        # 3. Diffusion loss
         if self.use_flow_matching:
-            # L1 Sample Flow (Song et al. 2025)
             noise = torch.randn_like(actions)
-
-            # Logistic-normal + 1% uniform timestep sampling
             t = self.logistic_normal.sample((B,))[:, 0].to(device)
             uni_t = torch.rand_like(t)
             mask = torch.rand_like(t) < 0.01
             t[mask] = uni_t[mask]
-
-            # Linear interpolation: x_t = t * x₁ + (1-t) * x₀
             t_expand = t[:, None, None]
             noisy_actions = t_expand * actions + (1 - t_expand) * noise
-
-            # Model predicts clean sample x₁; scale t for sinusoidal embedding
             timesteps = (t * 1000).long()
             x_pred = self.denoiser(noisy_actions, timesteps, obs_cond)
-
-            # L1 loss on sample prediction
-            loss = F.l1_loss(x_pred, actions)
+            loss_policy = F.l1_loss(x_pred, actions)
         else:
             # DDPM training
             timesteps = torch.randint(
@@ -250,7 +254,6 @@ class PolicyDiTv3(nn.Module):
 
             if self.prediction_type == "epsilon":
                 target = noise
-                loss = F.mse_loss(model_output, target)
             elif self.prediction_type == "v_prediction":
                 # v = alpha_t * noise - sigma_t * sample
                 alpha_t = self.noise_scheduler.alphas_cumprod[timesteps] ** 0.5
@@ -258,14 +261,26 @@ class PolicyDiTv3(nn.Module):
                 alpha_t = alpha_t[:, None, None]
                 sigma_t = sigma_t[:, None, None]
                 target = alpha_t * noise - sigma_t * actions
-                loss = F.mse_loss(model_output, target)
             elif self.prediction_type == "sample":
                 target = actions
-                loss = F.mse_loss(model_output, target)
             else:
                 raise ValueError(f"Unknown prediction_type: {self.prediction_type}")
+            loss_policy = F.mse_loss(model_output, target)
 
-        return loss
+        # 3. Reconstruction loss (co-training)
+        loss_recon = torch.tensor(0.0, device=device)
+        if lambda_recon > 0 and "images_target" in batch and self.bridge.decoder is not None:
+            loss_recon = self.bridge.compute_recon_loss(
+                adapted, batch["images_target"], view_present,
+            )
+
+        loss = loss_policy + lambda_recon * loss_recon
+
+        return {
+            "loss": loss,
+            "policy": loss_policy.item(),
+            "recon": loss_recon.item(),
+        }
 
     @torch.no_grad()
     def predict_action(self, obs_dict: dict) -> torch.Tensor:
@@ -386,6 +401,6 @@ class PolicyDiTv3(nn.Module):
         rot6d_clean = torch.cat([R2[..., :, 0], R2[..., :, 1]], dim=-1)
         return torch.cat([pos, rot6d_clean, grip], dim=-1)
 
-    def forward(self, batch: dict) -> torch.Tensor:
+    def forward(self, batch: dict) -> dict:
         """Alias for compute_loss (used by training loop)."""
-        return self.compute_loss(batch)
+        return self.compute_loss(batch, lambda_recon=getattr(self, '_lambda_recon', 0.0))
