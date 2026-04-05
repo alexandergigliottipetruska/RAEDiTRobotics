@@ -36,20 +36,21 @@ DISPLAY=:99 PYTHONPATH=. python data_pipeline/scripts/collect_rlbench_demos.py \
 ## Step 2: Convert to unified HDF5
 
 ```bash
-python data_pipeline/conversion/convert_rlbench.py \
-    --raw_dir data/raw/rlbench \
+PYTHONPATH=. python -m data_pipeline.conversion.convert_rlbench \
     --task open_drawer \
-    --output data/raw/rlbench/open_drawer.hdf5
+    --input /virtual/csc415user/data/raw/rlbench_fresh/train/open_drawer \
+    --val-input /virtual/csc415user/data/raw/rlbench_fresh/valid/open_drawer \
+    --output /virtual/csc415user/data/rlbench/open_drawer/open_drawer_dense.hdf5
 ```
 
 ## Step 3: Precompute tokens
 
 ```bash
-python training/precompute_tokens.py \
-    --hdf5 data/raw/rlbench/open_drawer.hdf5 \
+PYTHONPATH=. python -m training.precompute_tokens \
+    --hdf5 /virtual/csc415user/data/rlbench/open_drawer/open_drawer_dense.hdf5 \
     --preset fp32-none --rot6d
 
-# Output: data/raw/rlbench/open_drawer_tokens_fp32_none.hdf5
+# Output: /virtual/csc415user/data/rlbench/open_drawer/open_drawer_dense_tokens_fp32_none.hdf5
 ```
 
 ## Step 4: Train
@@ -58,17 +59,18 @@ python training/precompute_tokens.py \
 
 ```bash
 python -m training.train_v3_script \
-    --hdf5 data/raw/rlbench/open_drawer_tokens_fp32_none.hdf5 \
+    --hdf5 /virtual/csc415user/data/rlbench/open_drawer/open_drawer_dense_tokens_fp32_none.hdf5 \
+    --stage1_checkpoint checkpoints/stage1_full_rtx5090_0312_0400/best.pt \
     --save_dir checkpoints/v3_rlbench_open_drawer \
     --eval_task open_drawer --eval_mode rlbench \
     --no_amp --no_compile --norm_mode chi \
-    --action_space joint \
     --use_flow_matching \
     --spatial_pool_size 7 --n_cond_layers 4 \
+    --p_drop_attn 0.05 \
     --n_active_cams 4 \
     --num_epochs 3000 --batch_size 64 --seed 42 \
     --eval_full_every_epoch 50 --eval_full_episodes 25 \
-    --val_ratio 0.02
+    --eval_n_envs 20 --val_ratio 0.02
 ```
 
 ### Standard DDPM training
@@ -81,7 +83,7 @@ Remove `--use_flow_matching` from the command above.
 # Requires CoppeliaSim + Xvfb running
 DISPLAY=:99 python -m training.eval_v3_rlbench \
     --checkpoint checkpoints/v3_rlbench_open_drawer/best.pt \
-    --hdf5 data/raw/rlbench/open_drawer_tokens_fp32_none.hdf5 \
+    --hdf5 /virtual/csc415user/data/rlbench/open_drawer/open_drawer_dense_tokens_fp32_none.hdf5 \
     --task open_drawer --num_episodes 25
 ```
 
@@ -90,8 +92,8 @@ DISPLAY=:99 python -m training.eval_v3_rlbench \
 ## RLBench-specific notes
 
 - **4 cameras**: front, left_shoulder, right_shoulder, wrist (use `--n_active_cams 4`)
-- **Joint-space actions**: Use `--action_space joint` which sets `ac_dim=8`, `eval_mode=rlbench`, `norm_mode=chi`, disables rot6d
-- **Image size**: RLBench collects at 128x128, resized to 224x224 during conversion (PIL LANCZOS)
+- **Action space**: 10D rot6d by default (pos(3) + rot6d(6) + gripper(1)), matching robomimic pipeline
+- **Image size**: RLBench collects at 128x128, resized to 224x224 during conversion (cv2 INTER_LINEAR)
 - **CoppeliaSim**: Required for both demo collection and eval. Not needed for training (precomputed tokens)
 
 ## Available tasks
@@ -106,12 +108,20 @@ DISPLAY=:99 python -m training.eval_v3_rlbench \
 Replay ground-truth actions to verify the pipeline:
 
 ```bash
-DISPLAY=:99 python training/gt_replay_rlbench.py \
-    --hdf5 data/raw/rlbench/open_drawer.hdf5 \
-    --task open_drawer --num_episodes 5
+# Joint mode (should be 100%)
+DISPLAY=:99 PYTHONPATH=. python training/gt_replay_rlbench.py \
+    --task open_drawer --mode joint \
+    --pickles /virtual/csc415user/data/raw/rlbench_fresh/train/open_drawer/variation0/episodes \
+    --num_demos 20
+
+# IK mode (should be 95-100%, much faster than OMPL)
+DISPLAY=:99 PYTHONPATH=. python training/gt_replay_rlbench.py \
+    --task open_drawer --mode ik \
+    --pickles /virtual/csc415user/data/raw/rlbench_fresh/train/open_drawer/variation0/episodes \
+    --num_demos 20
 ```
 
-Expected: 100% success rate with GT actions.
+Expected: 100% joint, 95-100% IK. Use IK for dev iteration, OMPL for final benchmarks.
 
 ---
 

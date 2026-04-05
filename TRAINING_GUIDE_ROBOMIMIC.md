@@ -28,37 +28,39 @@ Use `--rot6d` to recompute norm stats in 10D rot6d format (required for V3).
 
 ## Step 2: Train
 
-### Standard DDPM training (Chi's recipe)
+### Recommended: L1 Flow + spatial tokens + warm-start
 
 ```bash
 python -m training.train_v3_script \
     --hdf5 data/robomimic/square/ph_abs_v15_tokens_fp32_none.hdf5 \
-    --save_dir checkpoints/v3_square \
-    --eval_task square --eval_mode robomimic \
-    --no_amp --no_compile --norm_mode chi \
-    --num_epochs 3000 --batch_size 64 --seed 42 \
-    --eval_every_epoch 10 --eval_full_every_epoch 50 \
-    --eval_episodes 10 --eval_full_episodes 100 \
-    --eval_n_envs 20 --val_ratio 0.02
-```
-
-### With L1 Flow (faster convergence, 2-step inference)
-
-```bash
-python -m training.train_v3_script \
-    --hdf5 data/robomimic/square/ph_abs_v15_tokens_fp32_none.hdf5 \
+    --stage1_checkpoint checkpoints/stage1_full_rtx5090_0312_0400/best.pt \
     --save_dir checkpoints/v3_square_fm \
     --eval_task square --eval_mode robomimic \
     --no_amp --no_compile --norm_mode chi \
     --use_flow_matching \
+    --spatial_pool_size 7 --n_cond_layers 4 \
+    --p_drop_attn 0.05 \
     --num_epochs 3000 --batch_size 64 --seed 42 \
     --eval_full_every_epoch 20 --eval_full_episodes 200 \
     --eval_n_envs 20 --val_ratio 0.02
 ```
 
-### With spatial tokens (DINOv3 14x14 -> 7x7 pooled)
+### Standard DDPM training (Chi's recipe)
 
-Add `--spatial_pool_size 7 --n_cond_layers 4` to either command above.
+```bash
+python -m training.train_v3_script \
+    --hdf5 data/robomimic/square/ph_abs_v15_tokens_fp32_none.hdf5 \
+    --stage1_checkpoint checkpoints/stage1_full_rtx5090_0312_0400/best.pt \
+    --save_dir checkpoints/v3_square \
+    --eval_task square --eval_mode robomimic \
+    --no_amp --no_compile --norm_mode chi \
+    --spatial_pool_size 7 --n_cond_layers 4 \
+    --p_drop_attn 0.05 \
+    --num_epochs 3000 --batch_size 64 --seed 42 \
+    --eval_every_epoch 10 --eval_full_every_epoch 50 \
+    --eval_episodes 10 --eval_full_episodes 100 \
+    --eval_n_envs 20 --val_ratio 0.02
+```
 
 ## Step 3: Standalone eval
 
@@ -94,8 +96,8 @@ python -m training.train_v3_script \
 | `--d_model` | 256 | Transformer hidden dimension |
 | `--n_head` | 4 | Attention heads |
 | `--n_layers` | 8 | Decoder layers |
-| `--spatial_pool_size` | 1 | 1=avg pool (Chi), 4/7/14=spatial tokens |
-| `--n_cond_layers` | 0 | 0=MLP encoder (Chi), >0=self-attention encoder |
+| `--spatial_pool_size` | 7 | 7=spatial tokens (recommended), 1=avg pool (Chi), 4/14=alternatives |
+| `--n_cond_layers` | 4 | 4=self-attention encoder (recommended), 0=MLP encoder (Chi) |
 | `--denoiser_type` | transformer | `transformer` (Chi) or `dit` (adaLN-Zero) |
 | `--use_flow_matching` | off | L1 Sample Flow (2-step inference) |
 | `--grad_accum_steps` | 1 | Gradient accumulation (effective batch = batch_size * accum) |
@@ -110,7 +112,7 @@ python -m training.train_v3_script \
 | `--weight_decay_denoiser` | 1e-3 | Transformer weight decay |
 | `--weight_decay_encoder` | 1e-6 | Obs encoder weight decay |
 | `--warmup_steps` | 1000 | Linear warmup then cosine decay |
-| `--p_drop_attn` | 0.3 | Attention dropout |
+| `--p_drop_attn` | 0.05 | Attention dropout (0.05 works better with frozen DINOv3 tokens) |
 | `--ema_power` | 0.75 | Adaptive EMA schedule |
 | `--train_diffusion_steps` | 100 | DDPM noise levels |
 | `--eval_diffusion_steps` | 100 | DDIM inference steps |
