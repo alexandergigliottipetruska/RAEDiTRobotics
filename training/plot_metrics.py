@@ -143,7 +143,7 @@ def plot_comparison(runs, labels, title, output, max_epoch=None, smoothing=0):
     plt.close()
 
 
-def plot_multiseed(grouped, title, output, max_epoch=None):
+def plot_multiseed(grouped, title, output, max_epoch=None, cummax=False):
     """Plot with confidence intervals from multiple seeds per config."""
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
     fig.suptitle(title, fontsize=14, fontweight="bold")
@@ -178,10 +178,17 @@ def plot_multiseed(grouped, title, output, max_epoch=None):
             n_valid = np.sum(~np.isnan(matrix), axis=0)
             se = std / np.sqrt(np.maximum(n_valid, 1))
 
-            label = f"{group_label} (n={n_seeds})"
-            ax.plot(epochs, mean, color=color, label=label, linewidth=2)
-            ax.fill_between(epochs, mean - se, mean + se, color=color, alpha=0.2)
-            ax.fill_between(epochs, mean - std, mean + std, color=color, alpha=0.08)
+            if cummax and key == "eval":
+                # Max across seeds with SD band below
+                center = np.nanmax(matrix, axis=0)
+                label = f"{group_label} (n={n_seeds}, max)"
+                ax.plot(epochs, center, color=color, label=label, linewidth=2.5, marker="o", markersize=4)
+                ax.fill_between(epochs, center - std, center + std, color=color, alpha=0.2)
+            else:
+                # Mean with prominent SD band
+                label = f"{group_label} mean (n={n_seeds})"
+                ax.plot(epochs, mean, color=color, label=label, linewidth=2.5, marker="o", markersize=3)
+                ax.fill_between(epochs, mean - std, mean + std, color=color, alpha=0.25)
 
     for (key, metric_title), ax in zip(metrics, axes):
         ax.set_title(metric_title)
@@ -215,6 +222,17 @@ def main():
         action="store_true",
         help="Group runs by config (for multi-seed CI plots)",
     )
+    parser.add_argument(
+        "--cummax",
+        action="store_true",
+        help="Plot max across seeds for eval success rate (with SD band below)",
+    )
+    parser.add_argument(
+        "--eval-every",
+        type=int,
+        default=None,
+        help="Only keep eval points at multiples of this epoch (e.g. 2 to match every-2-epoch runs)",
+    )
     args = parser.parse_args()
 
     # Collect run directories
@@ -240,6 +258,12 @@ def main():
         print("No valid metrics found.", file=sys.stderr)
         sys.exit(1)
 
+    # Subsample eval epochs if requested
+    if args.eval_every:
+        step = args.eval_every
+        for data in all_data:
+            data["eval"] = {e: v for e, v in data["eval"].items() if e % step == 1}
+
     # Default output name
     if args.output is None:
         safe_title = args.title.lower().replace(" ", "_").replace(":", "")
@@ -253,7 +277,7 @@ def main():
             key = config_key(config)
             label = config_label(config)
             grouped[label].append(data)
-        plot_multiseed(grouped, args.title, args.output, max_epoch=args.max_epoch)
+        plot_multiseed(grouped, args.title, args.output, max_epoch=args.max_epoch, cummax=args.cummax)
     else:
         # Individual comparison
         if args.labels and len(args.labels) == len(all_data):

@@ -242,9 +242,10 @@ class V3Config:
     eval_full_every_epoch: int = 50     # full eval + video every N epochs
     eval_n_envs: int = 20              # max parallel envs for eval
     eval_image_size: int = 84
-    eval_mode: str = "custom"           # "custom" | "robomimic" | "rlbench"
+    eval_mode: str = "robomimic"        # robomimic | rlbench
     eval_exec_horizon: int = 8          # T_a: robomimic=8, RLBench=1
-    keyframe_eval: bool = False         # predict full keyframe sequence, execute all through OMPL
+    keyframe_eval: bool = False         # Deprecated/Experimental NBP
+    stop_after_epochs: int = 0          # If > 0, forcefully terminate training at this epoch
 
     # Val split override (0 = use HDF5 mask, >0 = random split like Chi)
     val_ratio: float = 0.0              # Chi uses 0.02 (4 val demos, seed=42)
@@ -679,8 +680,15 @@ def train_v3(
 
     # Save first training batch for diagnostics (Chi measures t0 on this)
     train_sampling_batch = None
+    scaler = getattr(torch.amp, "GradScaler", torch.cuda.amp.GradScaler)(enabled=not config.no_amp)
 
     for epoch in range(start_epoch, config.num_epochs):
+
+        if config.stop_after_epochs > 0 and epoch >= config.stop_after_epochs:
+            if is_main:
+                log.info(f"Reached early stop condition at epoch {epoch}. Terminating gracefully.")
+            break
+
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 

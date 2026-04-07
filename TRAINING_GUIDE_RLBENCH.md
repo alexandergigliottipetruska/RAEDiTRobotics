@@ -21,8 +21,13 @@ export QT_QPA_PLATFORM_PLUGIN_PATH=$COPPELIASIM_ROOT
 ## Step 1: Collect demos
 
 ```bash
-# Start virtual display (headless rendering)
-Xvfb :99 -screen 0 1024x768x24 &
+# Start virtual display (headless rendering) using custom binary
+/virtual/csc415user/Xvfb :99 -screen 0 1024x768x24 &
+export DISPLAY=:99
+unset QT_QPA_PLATFORM
+
+# Verify display and OpenGL are working
+python -c "import pyrep; print('PyRep Display Boot OK')"
 
 # Collect demos (100 train + 25 valid per task)
 DISPLAY=:99 PYTHONPATH=. python data_pipeline/scripts/collect_rlbench_demos.py \

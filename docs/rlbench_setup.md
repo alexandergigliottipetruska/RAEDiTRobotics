@@ -33,6 +33,9 @@ For **training eval with cameras** (needs OpenGL):
 
 export DISPLAY=:99
 unset QT_QPA_PLATFORM
+
+# Verify display and OpenGL are working
+python -c "import pyrep; print('PyRep Display Boot OK')"
 ```
 
 If Xvfb won't start ("Server is already active"), it's already running. If the lock is stale:

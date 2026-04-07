@@ -173,8 +173,11 @@ def main():
     parser.add_argument("--no_save_best_success", action="store_true",
                         help="Disable best_success.pt saving (eval success rate)")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--stop_after_epochs", type=int, default=0,
+                        help="Forcefully terminate training gracefully after this many epochs (without shrinking LR schedule)")
 
     # Precision (Chi runs fp32, no compile)
+
     parser.add_argument("--no_amp", action="store_true",
                         help="Disable BF16 autocast (run in fp32 like Chi)")
     parser.add_argument("--no_compile", action="store_true",
@@ -307,6 +310,7 @@ def main():
         eval_mode=args.eval_mode,
         eval_exec_horizon=args.eval_exec_horizon,
         keyframe_eval=args.keyframe_eval,
+        stop_after_epochs=args.stop_after_epochs,
         val_ratio=args.val_ratio,
         val_seed=args.val_seed,
         no_amp=args.no_amp,
