@@ -1,18 +1,17 @@
 <div align="center">
 
-# RAE-DP: Robust Diffusion Transformer Policy with Representation Autoencoder Visual Encoding
+# RAE-DP: Representation Autoencoder Regularization in Diffusion Policy
 
-**Robust Multi-View Diffusion Policy with Frozen ViT and RAE-Decoder Regularization**
+**Frozen DINOv3-L Encoder with RAE-Pretrained Adapter for Visuomotor Control**
 
-*Alexander Gigliotti Petruska · Naqeeb Ali · Jean de Nassau*
-*University of Toronto — CSC415 Course Project, 2026*
+*Alexander Gigliotti Petruska, Naqeeb Ali, Jean de Nassau*
+*University of Toronto -- CSC415 Course Project, 2026*
 
 ---
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.9-ee4c2c.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Branch](https://img.shields.io/badge/branch-ViT__experiments-brightgreen)](https://github.com/)
 
 </div>
 
@@ -20,243 +19,217 @@
 
 ## Overview
 
-RAEDiT investigates whether **Representation Autoencoder (RAE)** visual encoding improves robotic manipulation policies built on **Diffusion Transformer (DiT) Block** architectures. Standard approaches encode camera observations with trained CNNs or VAEs, each with known limitations: CNNs discard the rich prior of large-scale vision models, and VAEs impose a Gaussian bottleneck that blurs fine-grained spatial detail. We replace both with a **frozen DINOv3-L encoder** regularised by a lightweight trainable adapter and an RAE-style decoder reconstruction objective, then feed the resulting tokens into a faithful reproduction of Chi et al.'s cross-attention diffusion policy transformer.
-
-The central question: *does an RAE-regularised visual representation yield measurably better task success, sample efficiency, or generalisation compared to standard trained-encoder baselines on established manipulation benchmarks?*
+RAE-DP replaces end-to-end trained CNN encoders in diffusion policies with a **frozen DINOv3-L** Vision Transformer, bridged to the policy via a lightweight trainable adapter. The adapter is pre-trained using an RAE-style ViT decoder with L1 + LPIPS + GAN reconstruction losses, ensuring it retains fine-grained spatial detail before policy training. Combined with **L1 Flow Matching** for efficient 2-step inference and a **spatial observation encoder** that preserves the 7x7 grid structure of multi-view visual tokens, RAE-DP matches the performance of end-to-end trained baselines while converging **9x faster** thanks to pre-computed token caching.
 
 ---
 
-## Key Contributions
+## Key Results
 
-| # | Contribution | Description |
-|---|---|---|
-| 1 | **Frozen foundation encoder** | DINOv3-L replaces trained CNN/ResNet encoders; weights never updated during policy training |
-| 2 | **RAE-regularised adapter** | A 2-layer MLP adapter projects DINOv3 patch tokens (1024→512) and is jointly trained with a ViT decoder reconstruction loss to prevent representation collapse |
-| 3 | **Faithful DiT baseline** | Chi et al. (2023) cross-attention transformer denoiser reproduced with exact hyperparameters (betas, weight decay, AdaLN-Zero) for clean ablation comparisons |
-| 4 | **Unified multi-benchmark data pipeline** | Single HDF5 schema covering Robomimic, RLBench, and ManiSkill with precomputed token caching for 50% training speedup |
+| Method | Lift | Can | Square |
+|--------|------|-----|--------|
+| DP-CNN (e2e ResNet-18, Chi et al.) | 1.00 / 1.00 | 1.00 / 0.96 | 0.98 / 0.92 |
+| DP-T (e2e ResNet-18, Chi et al.) | 1.00 / 1.00 | 1.00 / 0.98 | 1.00 / 0.90 |
+| Frozen ViT-CLIP (Chi et al.) | -- | -- | 0.70 |
+| Finetuned ViT-CLIP (Chi et al.) | -- | -- | 0.98 |
+| **RAE-DP (ours, frozen DINOv3-L)** | **1.00 / 1.00** | **1.00 / 0.99** | **1.00 / 0.90** |
+
+*Reported as max / avg of last 10 checkpoints. Chi et al. use 3 seeds, 3000 epochs. RAE-DP uses 5 seeds, 100 epochs.*
+
+**Key findings:**
+- Warm-start adapter pre-training provides a 19-point improvement on Can (79.5% -> 98.5% at epoch 19)
+- RAE-DP reaches 95% on Can by epoch 5 vs epoch 50 for DP-T (10x faster convergence)
+- d=512 denoiser needed for harder tasks (RLBench open_drawer: d=256 gets 0%, d=512 gets 80%)
+- 7x7 spatial tokens with linear projection outperform MLP and Q-Former alternatives
+- Pre-computed tokens provide **9x training speedup** (66s vs 597s per epoch on Square)
+- 2-step flow matching inference is 50x faster than 100-step DDIM
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Stage 1 — Visual Encoder Pretraining (RAE)                             │
-│                                                                         │
-│   I^(v)_t ──► [Frozen DINOv3-L] ──► z^(v)_t ∈ R^{196×1024}              │
-│                                          │                              │
-│                              [Trainable Adapter A_φ]                    │
-│                                          │                              │
-│                              z̄^(v)_t ∈ R^{196×512}                      │
-│                                    │         │                          │
-│                             [ViT Decoder] [GAN Disc.]                   │
-│                                    │                                    │
-│              L_recon = Σ_v ‖D_ψ(z̄^(v)_t) − I^(v)_t‖²                    │
-└─────────────────────────────────────────────────────────────────────────┘
-                                    │
-              Adapter checkpoint  ──┘  (frozen at Stage 2)
-                                    │
-┌─────────────────────────────────────────────────────────────────────────┐
-│  Stage 2 — Policy Training (DiT Block Policy)                           │
-│                                                                         │
-│   Observation buffer [T_obs frames × K cameras]                         │
-│          │                                                              │
-│   [Stage1Bridge]  ──── online encode OR load cached tokens              │
-│          │                                                              │
-│   [ObservationEncoder]  ──  pool 196 tokens → 512D per view             │
-│          │                  concat proprioception → conditioning seq.   │
-│          ▼                                                              │
-│   [Cross-Attention TransformerDenoiser]  (Chi et al., 2023)             │
-│          │  ┌─ noisy actions x_t                                        │
-│          │  ├─ time embedding (sinusoidal)                              │
-│          │  └─ memory = [t_emb, obs_0, obs_1, ...]                      │
-│          │     causal self-attn → cross-attn → FFN                      │
-│          ▼                                                              │
-│   ε̂  ──► DDPM loss  ──► DDIM inference at evaluation                    │
-│                                                                         │
-│   L_total = L_DDPM  +  λ · L_recon   (λ annealed during policy train)   │
-└─────────────────────────────────────────────────────────────────────────┘
+Phase 1 -- Representation Pre-Training (RAE):
+  Camera views -> [Frozen DINOv3-L] -> 196 tokens x 1024D
+                    -> [Cancel-Affine LN] -> [Adapter MLP 1024->1024->512]
+                    -> [ViT Decoder] -> Reconstruct image (L1 + LPIPS + GAN loss)
+
+Phase 2 -- Policy Training (Flow Matching):
+  Adapted tokens -> [AdaptiveAvgPool2d(7)] -> 49 tokens x 512D per camera
+    -> [Linear(512, d)] + camera embeddings + spatial position embeddings
+    -> [4 self-attention conditioning layers] (cross-camera reasoning)
+    -> [Cross-attention Transformer Denoiser] (8 layers, 4 heads)
+    -> L1 Flow Matching (sample prediction, logistic-normal timestep sampling)
+    -> 2-step inference: half-step to midpoint, then direct prediction
 ```
 
 ### Module Map
 
 ```
-RAEDiTRoboticsMain/
-├── models/
-│   ├── encoder.py              # FrozenMultiViewEncoder (DINOv3-L wrapper)
-│   ├── adapter.py              # TrainableAdapter  (1024 → 512, 2-layer MLP)
-│   ├── decoder.py              # ViTDecoder        (RAE reconstruction head)
-│   ├── discriminator.py        # GAN discriminator (Stage 1 auxiliary)
-│   ├── stage1_bridge.py        # Stage1Bridge      (load & freeze Stage 1)
-│   ├── obs_encoder_v3.py       # ObservationEncoder (pool + concat proprio)
-│   ├── denoiser_transformer.py # TransformerDenoiser (Chi cross-attention)
-│   ├── denoiser_dit.py         # DiTDenoiser       (adaLN-Zero ablation)
-│   ├── policy_v3.py            # PolicyDiTv3       (end-to-end policy)
-│   ├── ema_model.py            # EMAModel          (adaptive power schedule)
-│   └── losses.py               # Custom loss utilities
-├── training/
-│   ├── train_v3.py             # Main training loop  (V3Config dataclass)
-│   ├── train_v3_script.py      # CLI entry point
-│   ├── eval_v3.py              # Receding-horizon rollout evaluator
-│   ├── eval_v3_async.py        # Parallel async evaluation
-│   ├── eval_v3_robomimic.py    # Robomimic-specific evaluation
-│   └── precompute_tokens.py    # Cache DINOv3 tokens to HDF5
-├── data_pipeline/
-│   ├── conversion/             # Raw → unified HDF5 converters
-│   ├── datasets/               # Stage1Dataset, Stage3Dataset
-│   ├── envs/                   # Robomimic / RLBench / ManiSkill wrappers
-│   ├── evaluation/             # Rollout, metrics, visualisation
-│   └── gym_util/               # AsyncVectorEnv utilities
-└── requirements.txt
+RAEDiTRobotics/
+  models/
+    encoder.py              # FrozenMultiViewEncoder (DINOv3-L + cancel-affine LN)
+    adapter.py              # TrainableAdapter (1024 -> 1024 -> 512, 2-layer MLP)
+    decoder.py              # ViTDecoder (8-layer transformer, RAE reconstruction)
+    discriminator.py        # GAN discriminator (Phase 1 auxiliary)
+    stage1_bridge.py        # Stage1Bridge (loads Phase 1 weights, manages encoding)
+    obs_encoder_v3.py       # ObservationEncoder (7x7 spatial pool + camera/pos embeddings)
+    denoiser_transformer.py # TransformerDenoiser (Chi cross-attention architecture)
+    denoiser_dit.py         # DiTDenoiser (adaLN-Zero, experimental)
+    policy_v3.py            # PolicyDiTv3 (end-to-end policy with flow matching)
+    ema_model.py            # EMAModel (adaptive power schedule)
+    losses.py               # L1, LPIPS, GAN loss utilities
+  training/
+    train_v3.py             # Main training loop (V3Config dataclass)
+    train_v3_script.py      # CLI entry point for Phase 2 training
+    train_stage1_script.py  # CLI entry point for Phase 1 training
+    eval_v3_robomimic.py    # Robomimic evaluation (Chi's protocol)
+    eval_v3_rlbench.py      # RLBench evaluation (IK + temporal ensemble)
+    precompute_tokens.py    # Cache DINOv3 tokens to HDF5
+    plot_metrics.py         # Training curve visualization
+    slim_checkpoints.py     # Strip frozen encoder from old EMA checkpoints
+  data_pipeline/
+    conversion/             # Raw -> unified HDF5 converters
+    datasets/               # Stage1Dataset, Stage3Dataset
+    envs/                   # Environment wrappers
+    evaluation/             # Rollout, metrics, visualization
 ```
-
----
-
-## Baselines
-
-We design four baselines to isolate each contribution:
-
-| ID | Name | Encoder | Decoder Reg. | Denoiser |
-|----|------|---------|-------------|---------|
-| **B1** | Diffusion Policy (Chi et al., 2023) | ResNet-18 (trained) | — | U-Net |
-| **B2** | DiT-Block Policy (Dasari et al., 2024) | ResNet-26 (trained) | — | Cross-attention DiT |
-| **B3** | RAEDiT — no decoder | DINOv3-L (frozen) | None | Cross-attention DiT |
-| **Ours** | **RAEDiT** | DINOv3-L (frozen) | RAE recon. | Cross-attention DiT |
-
----
-
-## Benchmarks
-
-| Benchmark | Tasks | # Demos | Cameras | Eval Episodes |
-|-----------|-------|---------|---------|---------------|
-| **Robomimic** (Mandlekar et al., 2021) | Lift, Can, Square | 200 / task | 2 RGB | 50 |
-| **RLBench** (James et al., 2020) | reach\_target, push\_button, pick\_and\_lift, slide\_block\_to\_target, put\_item\_in\_drawer | 100 / task | 4 RGB | 25 |
-| **ManiSkill2** | PickCube, StackCube | 1000 / task | 2 RGB | 50 |
 
 ---
 
 ## Installation
 
-> **Requirements:** Python ≥ 3.10, CUDA ≥ 11.8, ~16 GB VRAM recommended for full pipeline.
+> **Requirements:** Python >= 3.10, CUDA >= 11.8, ~16 GB VRAM (RTX 4080 or equivalent).
 
-### 1. Clone & create environment
+### Option A: venv (recommended)
 
 ```bash
-git clone https://github.com/<your-org>/RAEDiTRoboticsMain.git
-cd RAEDiTRoboticsMain
+git clone https://github.com/alexandergigliottipetruska/RAE-DP.git
+cd RAEDiTRobotics
+python -m venv venv
+source venv/bin/activate
+```
+
+### Option B: conda
+
+```bash
+git clone https://github.com/alexandergigliottipetruska/RAE-DP.git
+cd RAEDiTRobotics
 conda create -n raedit python=3.10 -y
 conda activate raedit
 ```
 
-### 2. Install dependencies
+### Install dependencies
 
 ```bash
+# PyTorch (install first, matching your CUDA version)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+
+# Core dependencies
 pip install -r requirements.txt
+
+# Simulation environments (required for training and evaluation)
+pip install robosuite==1.5.2
+pip install -e git+https://github.com/ARISE-Initiative/robomimic.git@e10526b#egg=robomimic
+
+# RLBench (optional, requires CoppeliaSim + PyRep)
+pip install git+https://github.com/stepjam/PyRep.git
+pip install -e git+https://github.com/stepjam/RLBench.git#egg=rlbench
+pip install git+https://github.com/stepjam/gymnasium.git
 ```
 
-**Robomimic** (required for Robomimic benchmarks):
-```bash
-pip install git+https://github.com/ARISE-Initiative/robomimic.git
-```
-
-**RLBench** (required for RLBench benchmarks):
-```bash
-# Follow the official RLBench install guide (requires CoppeliaSim/PyRep)
-# https://github.com/stepjam/RLBench
-```
-
-### 3. Configure data paths
+### HuggingFace token (required for DINOv3-L)
 
 ```bash
-cp data_pipeline/configs/paths_template.yaml data_pipeline/configs/paths.yaml
-# Edit paths.yaml to point to your raw demo directories and unified HDF5 output location
+huggingface-cli login
+# Or create data_pipeline/configs/secrets.yaml with: hf_token: "hf_..."
 ```
 
 ---
 
 ## Data Preparation
 
-### Convert raw demonstrations to unified HDF5
+### 1. Convert raw demonstrations to unified HDF5
 
 ```bash
 # Robomimic
-python data_pipeline/conversion/convert_robomimic.py \
-    --input /path/to/robomimic/lift.hdf5 \
-    --output /data/unified/robomimic_lift.hdf5
+PYTHONPATH=. python data_pipeline/conversion/convert_robomimic.py \
+    --task lift --variant ph --config data_pipeline/configs/paths.yaml
 
 # RLBench
-python data_pipeline/conversion/convert_rlbench.py \
-    --task reach_target \
-    --input /path/to/rlbench/reach_target \
-    --output /data/unified/rlbench_reach_target.hdf5
+PYTHONPATH=. python data_pipeline/conversion/convert_rlbench.py \
+    --task open_drawer \
+    --input /path/to/rlbench/train/open_drawer \
+    --val-input /path/to/rlbench/val/open_drawer \
+    --output data/rlbench/open_drawer/open_drawer_dense.hdf5
 ```
 
-### Compute normalisation statistics
+### 2. Pre-compute DINOv3 tokens (9x training speedup)
+
+This runs the frozen DINOv3-L encoder once on all images and caches the tokens. Training then reads tokens directly from HDF5 instead of running the 303M-param encoder each step.
 
 ```bash
-python data_pipeline/conversion/compute_norm_stats.py \
-    --dataset /data/unified/robomimic_lift.hdf5
+PYTHONPATH=. python training/precompute_tokens.py \
+    --hdf5 data/robomimic/square/ph_abs_v15.hdf5 \
+    --preset fp32-none \
+    --rot6d
 ```
 
-### (Optional) Precompute DINOv3 tokens — ~50% training speedup
-
-```bash
-python training/precompute_tokens.py \
-    --dataset /data/unified/robomimic_lift.hdf5 \
-    --stage1_ckpt /checkpoints/stage1/best.pt \
-    --output /data/cached_tokens/robomimic_lift_tokens.hdf5
-```
+The script creates a `*_tokens_fp32_none.hdf5` file alongside the original. Use `--preset bf16-none` for half the disk space with minimal quality loss. The training data loader auto-detects cached tokens.
 
 ---
 
 ## Training
 
-### Stage 1 — RAE Pretraining (Adapter + Decoder)
+### Phase 1 -- RAE Pretraining (Adapter + Decoder)
 
 Train the adapter and ViT decoder jointly on the reconstruction objective:
 
 ```bash
-python training/train_stage1.py \
-    --dataset /data/unified/robomimic_lift.hdf5 \
-    --output_dir /checkpoints/stage1 \
-    --epochs 50 \
-    --batch_size 64 \
-    --lr 1e-4
+PYTHONPATH=. python training/train_stage1_script.py \
+    --hdf5 data/rlbench/close_jar/close_jar_dense.hdf5 \
+    --save_dir checkpoints/stage1 \
+    --num_epochs 25 \
+    --batch_size 10
 ```
 
-The checkpoint saved under `output_dir/best.pt` contains keys `adapter`, `decoder`, and `discriminator`.
+### Phase 2 -- Policy Training
 
-### Stage 2 — Policy Training (DiT Block Policy)
+The recommended configuration (matching our best results):
 
 ```bash
-python training/train_v3_script.py \
-    --dataset     /data/unified/robomimic_lift.hdf5 \
-    --stage1_ckpt /checkpoints/stage1/best.pt \
-    --output_dir  /checkpoints/policy/lift \
-    --task        lift \
-    --denoiser    cross_attn \
-    --epochs      100 \
-    --batch_size  64 \
-    --n_active_cams 2
+PYTHONPATH=. python training/train_v3_script.py \
+    --hdf5 data/robomimic/can/ph_abs_v15_tokens_fp32_none.hdf5 \
+    --eval_hdf5 data/robomimic/can/ph_abs_v15.hdf5 \
+    --stage1_checkpoint checkpoints/stage1/best.pt \
+    --eval_task can \
+    --d_model 512 \
+    --num_epochs 3000 --stop_after_epochs 100 \
+    --eval_full_every_epoch 2 \
+    --no_amp --no_compile \
+    --save_dir checkpoints/v3_can_d512
 ```
 
-Key flags:
+Key flags and their defaults:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--denoiser` | `cross_attn` | `cross_attn` (Chi) or `dit` (adaLN-Zero ablation) |
-| `--n_active_cams` | `2` | Active cameras (2 for Robomimic, 4 for RLBench) |
-| `--use_cached_tokens` | `False` | Load precomputed tokens instead of running encoder online |
-| `--T_obs` | `2` | Observation history horizon |
-| `--T_pred` | `10` | Action chunk prediction horizon |
-| `--T_act` | `8` | Steps executed per planning cycle |
-| `--lambda_recon` | `0.1` | Weight for reconstruction auxiliary loss during policy training |
+| `--d_model` | `256` | Denoiser hidden dim (256 for easy tasks, 512 for harder ones) |
+| `--spatial_pool_size` | `7` | Spatial pool: 7x7 tokens per camera (recommended) |
+| `--n_cond_layers` | `4` | Self-attention conditioning layers (cross-camera reasoning) |
+| `--use_flow_matching` | `True` | L1 Sample Flow with 2-step inference |
+| `--no_flow_matching` | -- | Fall back to DDPM/DDIM |
+| `--norm_mode` | `chi` | Chi normalization (pos minmax, rot6d/grip identity) |
+| `--p_drop_attn` | `0.05` | Attention dropout |
+| `--eval_mode` | `robomimic` | Chi's evaluation pipeline |
+| `--lambda_recon` | `0.0` | Reconstruction co-training weight (0 = warm-start only) |
+| `--stage1_checkpoint` | -- | Phase 1 checkpoint for adapter warm-start |
+| `--stop_after_epochs` | `0` | Early termination (0 = disabled) |
 
 ### Resume from checkpoint
 
 ```bash
-python training/train_v3_script.py \
-    --resume_from /checkpoints/policy/lift/epoch_050.pt \
+PYTHONPATH=. python training/train_v3_script.py \
+    --resume checkpoints/v3_can_d512/latest_backup_0099.pt \
     [... other flags ...]
 ```
 
@@ -264,106 +237,91 @@ python training/train_v3_script.py \
 
 ## Evaluation
 
-### Single-checkpoint rollout
-
 ```bash
-python training/eval_v3_robomimic.py \
-    --policy_ckpt /checkpoints/policy/lift/best_ema.pt \
-    --task lift \
-    --n_episodes 50 \
-    --n_envs 10
+PYTHONPATH=. python training/eval_v3_robomimic.py \
+    --checkpoint checkpoints/v3_can_d512/best_success.pt \
+    --hdf5 data/robomimic/can/ph_abs_v15.hdf5 \
+    --num_episodes 50 --n_envs 25 \
+    --d_model 512 --spatial_pool_size 7 --n_cond_layers 4 \
+    --use_flow_matching
 ```
 
-### Async parallel evaluation across all tasks
+For RLBench:
 
 ```bash
-python training/eval_v3_async.py \
-    --checkpoint_dir /checkpoints/policy \
-    --tasks lift can square \
-    --n_episodes 50
+PYTHONPATH=. python training/eval_v3_rlbench.py \
+    --checkpoint checkpoints/v3_sweep/best_success.pt \
+    --eval_hdf5 data/rlbench/sweep_to_dustpan/sweep_to_dustpan_dense.hdf5 \
+    --task sweep_to_dustpan_of_size
 ```
+
+---
+
+## Benchmarks
+
+| Benchmark | Tasks | Demos | Cameras | Resolution |
+|-----------|-------|-------|---------|------------|
+| **Robomimic** | Lift, Can, Square | 200/task | 2 RGB | 84x84 |
+| **RLBench** | sweep_to_dustpan, open_drawer, close_jar | 100+25/task | 4 RGB | 224x224 |
 
 ---
 
 ## Key Hyperparameters
 
-The full configuration is managed by the `V3Config` dataclass in [training/train_v3.py](training/train_v3.py). The most important entries:
+Recommended configuration (matching best results):
 
 ```python
 # Architecture
-d_model        = 256    # Transformer hidden dimension
-n_head         = 4      # Attention heads
-n_layers       = 8      # Transformer decoder layers
-adapter_dim    = 512    # Adapter output dimension (DINOv3 1024 → 512)
+d_model           = 512     # 256 for easy tasks, 512 for harder ones
+n_head            = 4
+n_layers          = 8
+n_cond_layers     = 4       # Self-attention conditioning encoder
+spatial_pool_size = 7       # 7x7 spatial tokens per camera
+adapter_dim       = 512     # DINOv3 1024 -> 1024 -> 512
 
-# Diffusion
-train_diffusion_steps = 100   # DDPM training timesteps
-eval_diffusion_steps  = 100   # DDIM inference steps
+# Flow Matching (replaces DDPM/DDIM)
+use_flow_matching = True    # L1 sample prediction, 2-step inference
+                            # 50x faster than 100-step DDIM
 
-# Optimiser (Chi et al. recipe)
-lr                    = 1e-4
-betas                 = (0.9, 0.95)   # NOT diffusers default (0.9, 0.999)
-weight_decay_denoiser = 1e-3
-weight_decay_encoder  = 1e-6
-warmup_steps          = 1000
+# Normalization
+norm_mode         = "chi"   # Position minmax [-1,1], rotation/gripper identity
+
+# Optimizer (Chi et al. recipe)
+lr                = 1e-4
+betas             = (0.9, 0.95)
+weight_decay      = 1e-3    # Denoiser weights
+warmup_steps      = 1000
+p_drop_attn       = 0.05
 
 # EMA (adaptive power schedule)
-ema_power     = 0.75           # Reaches 0.9999 at ~1M steps
-ema_max_decay = 0.9999
+ema_power         = 0.75
+ema_max_decay     = 0.9999
 
 # Action representation
-ac_dim        = 10      # 10D rot6d (converted from 7D delta-EE in dataset)
-proprio_dim   = 9       # Proprioceptive state dimension
+ac_dim            = 10      # pos(3) + rot6d(6) + grip(1), absolute EE pose
 ```
 
 ---
 
-## Results
+## Checkpoint Management
 
-> Experiments are ongoing. Results will be populated as runs complete.
+Old checkpoints may contain the frozen DINOv3-L encoder in the EMA (~1.2 GB of waste per checkpoint). To slim them:
 
-| Method | Lift | Can | Square | RLBench (avg) |
-|--------|------|-----|--------|---------------|
-| B1 — Diffusion Policy (Chi et al.) | — | — | — | — |
-| B2 — DiT-Block Policy (Dasari et al.) | — | — | — | — |
-| B3 — RAEDiT (no decoder reg.) | — | — | — | — |
-| **RAEDiT (ours)** | — | — | — | — |
+```bash
+# Dry run (see how much space you'd save):
+python training/slim_checkpoints.py checkpoints/v3_*/best_success.pt --dry-run
 
-*Table entries will be filled with mean ± std success rate (%) over 3 seeds × 50 episodes.*
-
----
-
-## Project Structure Details
-
-### Data Schema
-
-Each unified HDF5 file follows:
-
+# Slim in-place:
+python training/slim_checkpoints.py $(find checkpoints -name "*.pt")
 ```
-/data/<demo_key>/
-    images        uint8   [T, K=4, H=224, W=224, 3]
-    view_present  bool    [K]
-    actions       float32 [T, 7]     # 7D delta end-effector
-    proprio       float32 [T, D_prop]
-    states        float32 [T, D_s]   # optional, for GT replay
-/norm_stats/
-    actions/{mean, std, min, max}
-    proprio/{mean, std, min, max}
-```
-
-### Rotation Convention
-
-Demonstrations are stored in 7D delta end-effector format `[dx, dy, dz, rx, ry, rz, gripper]` (axis-angle rotation). The dataset class converts to 10D `rot6d` for training; the evaluator converts back to axis-angle before sending actions to the environment.
 
 ---
 
 ## Citation
 
-If you find this work useful, please consider citing:
-
 ```bibtex
-@misc{gigliottialidenassau2026raedit,
-  title        = {Robust Multi-View Diffusion Policy with Frozen {ViT} and {RAE}-Decoder Regularization},
+@misc{gigliottialidenassau2026raedp,
+  title        = {{RAE-DP}: Representation Autoencoder Regularization in Diffusion Policy},
   author       = {Gigliotti Petruska, Alexander and Ali, Naqeeb and de Nassau, Jean},
   year         = {2026},
   institution  = {University of Toronto},
@@ -375,18 +333,15 @@ If you find this work useful, please consider citing:
 
 ## Acknowledgements
 
-This project builds on and is deeply indebted to the following works:
-
-- **Diffusion Policy** — Chi et al., RSS 2023 — cross-attention transformer denoiser and DDPM/DDIM recipe
-- **Ingredients for Robotic Diffusion Transformers** — Dasari et al., 2024 — DiT-Block Policy architecture and adaLN-Zero conditioning
-- **Diffusion Transformers with Representation Autoencoders** — Zheng et al., 2025 — RAE concept and motivation
-- **Scaling Text-to-Image DiTs with RAEs** — Tong et al., 2026 — ViT decoder design
-- **DINOv3** — Simeoni et al., 2025 — frozen foundation visual encoder
-- **Robomimic** — Mandlekar et al., CoRL 2021 — benchmark environments and evaluation protocol
-- **RLBench** — James et al., IEEE RA-L 2020 — manipulation task suite
+- **Diffusion Policy** -- Chi et al., IJRR 2024
+- **Diffusion Transformers with Representation Autoencoders** -- Zheng et al., 2025
+- **L1 Sample Flow** -- Song et al., 2025
+- **DINOv3** -- Simeoni et al., 2025
+- **Robomimic** -- Mandlekar et al., CoRL 2021
+- **RLBench** -- James et al., IEEE RA-L 2020
 
 ---
 
 <div align="center">
-<sub>University of Toronto · CSC415 · 2026</sub>
+<sub>University of Toronto -- CSC415 -- 2026</sub>
 </div>

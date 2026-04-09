@@ -70,7 +70,7 @@ def main():
     parser.add_argument("--weight_decay_encoder", type=float, default=1e-6)
     parser.add_argument("--lr_adapter", type=float, default=0.0,
                         help="Separate adapter learning rate (0 = use main --lr)")
-    parser.add_argument("--p_drop_attn", type=float, default=0.3)
+    parser.add_argument("--p_drop_attn", type=float, default=0.05)
     parser.add_argument("--p_drop_emb", type=float, default=0.0)
 
     # Diffusion
@@ -92,7 +92,7 @@ def main():
                         help="Max parallel envs for eval (default: 25)")
     parser.add_argument("--eval_image_size", type=int, default=84,
                         help="Render size for eval (84 for robomimic, 224 for rlbench)")
-    parser.add_argument("--eval_mode", type=str, default="custom",
+    parser.add_argument("--eval_mode", type=str, default="robomimic",
                         choices=["custom", "robomimic", "rlbench", "joint"],
                         help="'custom'=RobomimicWrapper, 'robomimic'=Chi's pipeline, 'rlbench'=OMPL eval, 'joint'=joint-space eval")
     parser.add_argument("--eval_exec_horizon", type=int, default=8,
@@ -108,7 +108,7 @@ def main():
                              "with quaternion projection at inference")
 
     # Normalization mode
-    parser.add_argument("--norm_mode", type=str, default="minmax",
+    parser.add_argument("--norm_mode", type=str, default="chi",
                         choices=["minmax", "zscore", "chi", "minmax_margin"],
                         help="'minmax'=all dims [-1,1], 'chi'=pos minmax + rot6d/grip identity, "
                              "'minmax_margin'=all dims with 0.2 margin (robobase-style)")
@@ -133,15 +133,17 @@ def main():
                         help="DiT model size preset: S (d=256,h=4,l=8), M (d=384,h=6,l=12), L (d=512,h=8,l=16)")
 
     # Spatial tokens
-    parser.add_argument("--spatial_pool_size", type=int, default=1,
+    parser.add_argument("--spatial_pool_size", type=int, default=7,
                         choices=[1, 4, 7, 14],
-                        help="Spatial pool: 1=avg pool (default), 4/7/14=spatial tokens per camera")
+                        help="Spatial pool: 1=avg pool, 4/7/14=spatial tokens per camera (7 recommended)")
     parser.add_argument("--use_spatial_softmax", action="store_true",
                         help="Use SpatialSoftmax pooling (Chi-style spatial coordinates) instead of avg pool")
-    parser.add_argument("--n_cond_layers", type=int, default=0,
-                        help="Self-attention encoder layers for conditioning (0=MLP, >0=transformer encoder)")
-    parser.add_argument("--use_flow_matching", action="store_true",
-                        help="Use L1 Sample Flow (2-step, L1 loss) instead of DDPM/DDIM")
+    parser.add_argument("--n_cond_layers", type=int, default=4,
+                        help="Self-attention encoder layers for conditioning (0=MLP, 4=recommended)")
+    parser.add_argument("--use_flow_matching", action="store_true", default=True,
+                        help="Use L1 Sample Flow (2-step, L1 loss) instead of DDPM/DDIM (default: True)")
+    parser.add_argument("--no_flow_matching", action="store_true",
+                        help="Disable flow matching, use DDPM/DDIM instead")
 
     # RAE decoder co-training
     parser.add_argument("--lambda_recon", type=float, default=0.0,
@@ -237,6 +239,10 @@ def main():
             args.n_layers = l
         if "--denoiser_type" not in sys.argv:
             args.denoiser_type = "dit"
+
+    # Handle --no_flow_matching override
+    if args.no_flow_matching:
+        args.use_flow_matching = False
 
     # Setup logging
     logging.basicConfig(
