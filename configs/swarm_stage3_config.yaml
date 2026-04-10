@@ -13,7 +13,7 @@ project:
   hf_cache_dir: "/tmp/hf_cache"
   torch_cache_dir: "/tmp/torch_cache"
   scratch_dir: "/tmp/optuna_trials"
-  hf_repo_id: "Denass04/RAEDiTRobotics-stage3-sweeps"
+  hf_repo_id: "swagman8008/RAE-DP-stage3-sweeps"
 
   # Optuna Settings
   n_startup_trials: 10        # random trials before TPE kicks in
