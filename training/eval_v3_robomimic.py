@@ -697,28 +697,91 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="V3 robomimic evaluation")
     parser.add_argument("--checkpoint", required=True, help="Path to V3 checkpoint")
     parser.add_argument("--hdf5", required=True, help="Path to unified HDF5 with env_args")
-    parser.add_argument("--stage1_checkpoint", required=True, help="Path to Stage 1 checkpoint")
+    parser.add_argument("--stage1_checkpoint", type=str, default="",
+                        help="Path to Stage 1 checkpoint (optional if using cached tokens)")
     parser.add_argument("--num_episodes", type=int, default=50)
     parser.add_argument("--n_envs", type=int, default=None, help="Parallel envs (default: num_episodes)")
-    parser.add_argument("--norm_mode", default="minmax", choices=["minmax", "chi"])
+    parser.add_argument("--norm_mode", default=None, choices=["minmax", "chi"],
+                        help="Override norm mode (default: read from checkpoint config)")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--sequential", action="store_true", help="Use sequential eval (no AsyncVectorEnv)")
-    parser.add_argument("--T_pred", type=int, default=10, help="Prediction horizon (must match checkpoint)")
     parser.add_argument("--save_video", action="store_true", help="Save MP4 videos of rollouts")
     parser.add_argument("--video_dir", default="checkpoints/eval_videos", help="Directory for video files")
+
+    # Architecture overrides (auto-detected from checkpoint config if available)
+    parser.add_argument("--d_model", type=int, default=None)
+    parser.add_argument("--n_head", type=int, default=None)
+    parser.add_argument("--n_layers", type=int, default=None)
+    parser.add_argument("--n_cond_layers", type=int, default=None)
+    parser.add_argument("--T_pred", type=int, default=None)
+    parser.add_argument("--n_active_cams", type=int, default=None)
+    parser.add_argument("--spatial_pool_size", type=int, default=None)
+    parser.add_argument("--use_flow_matching", action="store_true", default=None)
+    parser.add_argument("--denoiser_type", type=str, default=None)
     args = parser.parse_args()
 
     from data_pipeline.conversion.compute_norm_stats import load_norm_stats
     from models.policy_v3 import PolicyDiTv3
     from models.stage1_bridge import Stage1Bridge
 
-    # Load model
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
-    bridge = Stage1Bridge(checkpoint_path=args.stage1_checkpoint)
-    policy = PolicyDiTv3(bridge=bridge, T_pred=args.T_pred).to(device)
 
-    # Load checkpoint
+    # Load checkpoint and extract config
     ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    cfg = ckpt.get("config", {})
+
+    if cfg:
+        log.info("Found config in checkpoint")
+    else:
+        log.info("No config in checkpoint — using CLI args / defaults")
+
+    # Helper: CLI arg > checkpoint config > default
+    def _get(name, default):
+        cli_val = getattr(args, name, None)
+        if cli_val is not None:
+            return cli_val
+        return cfg.get(name, default)
+
+    d_model = _get("d_model", 256)
+    n_head = _get("n_head", 4)
+    n_layers = _get("n_layers", 8)
+    n_cond_layers = _get("n_cond_layers", 0)
+    T_pred = _get("T_pred", 10)
+    n_active_cams = _get("n_active_cams", 2)
+    spatial_pool_size = _get("spatial_pool_size", 1)
+    use_flow_matching = _get("use_flow_matching", False)
+    denoiser_type = _get("denoiser_type", "transformer")
+    prediction_type = _get("prediction_type", "epsilon")
+    cfg_drop_rate = _get("cfg_drop_rate", 0.0)
+    cfg_scale = args.cfg_scale if hasattr(args, "cfg_scale") and args.cfg_scale is not None else _get("cfg_scale", 1.0)
+    use_rope = _get("use_rope", False)
+    norm_mode = args.norm_mode or cfg.get("norm_mode", "chi")
+
+    log.info("Arch: d=%d, heads=%d, layers=%d, ncond=%d, spatial=%d, fm=%s, denoiser=%s",
+             d_model, n_head, n_layers, n_cond_layers, spatial_pool_size,
+             use_flow_matching, denoiser_type)
+
+    # Build model
+    bridge = Stage1Bridge(checkpoint_path=args.stage1_checkpoint)
+    policy = PolicyDiTv3(
+        bridge=bridge,
+        ac_dim=_get("ac_dim", 10),
+        proprio_dim=_get("proprio_dim", 9),
+        d_model=d_model,
+        n_head=n_head,
+        n_layers=n_layers,
+        T_obs=_get("T_obs", 2),
+        T_pred=T_pred,
+        n_active_cams=n_active_cams,
+        spatial_pool_size=spatial_pool_size,
+        n_cond_layers=n_cond_layers,
+        use_flow_matching=use_flow_matching,
+        denoiser_type=denoiser_type,
+        prediction_type=prediction_type,
+        cfg_drop_rate=cfg_drop_rate,
+        cfg_scale=cfg_scale,
+        use_rope=use_rope,
+    ).to(device)
 
     # Load policy weights
     if "denoiser" in ckpt:
@@ -734,8 +797,16 @@ if __name__ == "__main__":
         policy.load_state_dict(ckpt.get("policy", ckpt.get("model", {})), strict=False)
 
     # Load EMA weights directly into policy (Chi's approach)
-    if "ema" in ckpt and "averaged_model" in ckpt["ema"]:
-        policy.load_state_dict(ckpt["ema"]["averaged_model"], strict=False)
+    if "ema" in ckpt:
+        ema = ckpt["ema"]
+        if "averaged_model" in ema:
+            # Old format: full model state_dict
+            policy.load_state_dict(ema["averaged_model"], strict=False)
+        elif "denoiser" in ema:
+            # New format: component-wise (no frozen encoder)
+            policy.denoiser.load_state_dict(_strip(ema["denoiser"]))
+            policy.obs_encoder.load_state_dict(_strip(ema["obs_encoder"]))
+            policy.bridge.adapter.load_state_dict(_strip(ema["adapter"]))
         log.info("Loaded EMA weights into policy for eval")
     policy.eval()
 
@@ -747,7 +818,7 @@ if __name__ == "__main__":
             hdf5_path=args.hdf5, norm_stats=norm_stats,
             num_episodes=args.num_episodes,
             use_rot6d=True, device=str(device),
-            norm_mode=args.norm_mode,
+            norm_mode=norm_mode,
             save_video=args.save_video,
             video_dir=args.video_dir,
         )
@@ -757,7 +828,7 @@ if __name__ == "__main__":
             hdf5_path=args.hdf5, norm_stats=norm_stats,
             num_episodes=args.num_episodes, n_envs=args.n_envs,
             use_rot6d=True, device=str(device),
-            norm_mode=args.norm_mode,
+            norm_mode=norm_mode,
             save_video=args.save_video,
             video_dir=args.video_dir,
         )

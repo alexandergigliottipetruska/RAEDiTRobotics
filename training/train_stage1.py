@@ -361,8 +361,10 @@ def load_checkpoint(
     disc.head.load_state_dict(_strip_compile_prefix(ckpt["disc_head"]))
     opt_gen.load_state_dict(ckpt["opt_gen"])
     opt_disc.load_state_dict(ckpt["opt_disc"])
-    log.info("Loaded checkpoint from epoch %d: %s", ckpt["epoch"], path)
-    return ckpt["epoch"] + 1
+    best_val_rec = ckpt.get("val_metrics", {}).get("val_rec", float("inf"))
+    log.info("Loaded checkpoint from epoch %d (best_val_rec=%.4f): %s",
+             ckpt["epoch"], best_val_rec, path)
+    return ckpt["epoch"] + 1, best_val_rec
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +420,7 @@ def train_stage1(
 
     # Load checkpoint BEFORE wrapping in DDP (state_dicts are unwrapped)
     start_epoch = 0
+    _best_val_rec = float("inf")
     if resume_from and os.path.isfile(resume_from):
         # Create temporary optimizers for checkpoint loading
         gen_params = list(adapter.parameters()) + list(decoder.parameters())
@@ -425,7 +428,7 @@ def train_stage1(
                                      betas=config.betas, weight_decay=config.weight_decay)
         _opt_disc = torch.optim.AdamW(disc.head.parameters(), lr=config.lr_disc,
                                       betas=config.betas, weight_decay=config.weight_decay)
-        start_epoch = load_checkpoint(
+        start_epoch, _best_val_rec = load_checkpoint(
             resume_from, adapter, decoder, disc, _opt_gen, _opt_disc
         )
 
@@ -487,16 +490,19 @@ def train_stage1(
     if is_main:
         os.makedirs(config.save_dir, exist_ok=True)
 
-        # Timestamped log file
+        # Merge any fragmented logs from previous runs
+        from training.merge_logs import merge_all
+        merge_all(config.save_dir, start_epoch=start_epoch if resume_from else None)
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(config.save_dir, f"train_{ts}.log")
+        log_file = os.path.join(config.save_dir, "train.log")
         fh = logging.FileHandler(log_file)
         fh.setLevel(logging.INFO)
         fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
         log.addHandler(fh)
 
         # Metrics JSONL (append-friendly, one line per epoch)
-        metrics_path = os.path.join(config.save_dir, f"metrics_{ts}.jsonl")
+        metrics_path = os.path.join(config.save_dir, "metrics.jsonl")
 
         # Write run header as first line
         run_info = {
@@ -570,7 +576,7 @@ def train_stage1(
         log.info("Metrics file: %s", metrics_path)
         log.info("=" * 60)
 
-    best_val_rec = float("inf")
+    best_val_rec = _best_val_rec if resume_from else float("inf")
 
     for epoch in range(start_epoch, config.num_epochs):
         # DistributedSampler must know the epoch for proper shuffling

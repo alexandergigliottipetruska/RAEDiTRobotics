@@ -2,18 +2,17 @@
 
 Wraps an RLBench Environment to implement the BaseManipulationEnv interface.
 Extracts 4 camera views (front, left_shoulder, right_shoulder, wrist),
-resizes to 224x224, applies ImageNet normalization.
+resizes to 224x224, returns float [0,1] images (NO ImageNet normalization —
+policy handles it internally via Stage1Bridge, matching RobomimicWrapper).
 
-The policy outputs 8D absolute EE poses [position(3), quaternion_xyzw(4), gripper(1)].
-This wrapper uses OMPL motion planning (EndEffectorPoseViaPlanning) to reach
-each target pose, matching the approach used by RVT-2 and Chain-of-Action.
+Actions are 8D [pos(3), quat_xyzw(4), gripper(1)]. Gripper is centered
+{-1,1} in training data; thresholded at 0 here for OMPL Discrete() mode.
 
-OMPL plans a collision-free path from the current pose to the target and
-executes it step-by-step through the sim. This handles large pose jumps
-and is the standard action mode used by all major RLBench papers
-(PerAct, RVT, RVT-2, CoA, Act3D).
+Proprio is EE-centric: [eef_pos(3), eef_quat_xyzw(4), gripper_centered(1)] = 8D,
+matching the action space for direct proprio→action correspondence.
 
-Gripper is thresholded at 0.5 to binary {0.0, 1.0}.
+Uses OMPL motion planning (EndEffectorPoseViaPlanning) to reach each target
+pose, matching RVT-2 / CoA evaluation approach.
 
 Requires CoppeliaSim (WSL2 or remote Linux).
 """
@@ -22,10 +21,6 @@ import numpy as np
 from PIL import Image
 
 from data_pipeline.envs.base_env import BaseManipulationEnv
-
-# ImageNet normalization constants
-_IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 # Camera mapping: RLBench uses all 4 slots
 # slot 0: front, slot 1: left_shoulder, slot 2: right_shoulder, slot 3: wrist
@@ -50,27 +45,29 @@ TASK_CLASS_MAP = {
     "reach_and_drag": "ReachAndDrag",
     "place_wine_at_rack_location": "PlaceWineAtRackLocation",
     "sweep_to_dustpan_of_size": "SweepToDustpanOfSize",
+    "sweep_to_dustpan": "SweepToDustpan",
+    "reach_target": "ReachTarget",
 }
 
 
 def _process_image(img_hwc: np.ndarray, target_size: int = 224) -> np.ndarray:
-    """Resize + ImageNet normalize + HWC->CHW.
+    """Resize + HWC->CHW. Returns float32 [0,1] (no ImageNet normalization).
+
+    Matches RobomimicWrapper — policy handles ImageNet norm internally.
 
     Args:
         img_hwc: uint8 [H, W, 3] image from RLBench.
 
     Returns:
-        float32 [3, H, W] ImageNet-normalized.
+        float32 [3, H, W] in [0, 1] range.
     """
     if img_hwc.shape[0] != target_size or img_hwc.shape[1] != target_size:
-        img_hwc = np.array(
-            Image.fromarray(img_hwc).resize(
-                (target_size, target_size), Image.LANCZOS
-            )
+        import cv2
+        img_hwc = cv2.resize(
+            img_hwc, (target_size, target_size), interpolation=cv2.INTER_LINEAR
         )
     img_float = img_hwc.astype(np.float32) / 255.0
-    normalized = (img_float - _IMAGENET_MEAN) / _IMAGENET_STD
-    return np.moveaxis(normalized, -1, -3)  # [3, H, W]
+    return np.moveaxis(img_float, -1, -3)  # [3, H, W]
 
 
 class RLBenchWrapper(BaseManipulationEnv):
@@ -93,6 +90,7 @@ class RLBenchWrapper(BaseManipulationEnv):
         image_size: int = 224,
         headless: bool = True,
         cameras: bool = True,
+        use_ik: bool = False,
     ):
         from rlbench.environment import Environment
         from rlbench.action_modes.action_mode import MoveArmThenGripper
@@ -110,14 +108,28 @@ class RLBenchWrapper(BaseManipulationEnv):
                 f"Supported: {list(TASK_CLASS_MAP.keys())}"
             )
 
+        from pyrep.const import RenderMode
+
         obs_config = ObservationConfig()
         obs_config.set_all_low_dim(True)
         obs_config.set_all_high_dim(cameras)
 
-        # Stock OMPL motion planning — matches replay_rlbench.py and RVT-2.
-        # EndEffectorPoseViaPlanning defaults: absolute_mode=True, ignore_collisions=True
+        # Use OpenGL (not OpenGL3) for Xvfb compatibility
+        if cameras:
+            for cam in [obs_config.front_camera, obs_config.left_shoulder_camera,
+                        obs_config.right_shoulder_camera, obs_config.wrist_camera]:
+                cam.render_mode = RenderMode.OPENGL
+
+        if use_ik:
+            # Direct IK — no OMPL path planning, closest to Robomimic's OSC
+            from rlbench.action_modes.arm_action_modes import EndEffectorPoseViaIK
+            arm_action_mode = EndEffectorPoseViaIK()
+        else:
+            # Stock OMPL motion planning — matches RVT-2 / CoA eval
+            arm_action_mode = EndEffectorPoseViaPlanning()
+
         action_mode = MoveArmThenGripper(
-            arm_action_mode=EndEffectorPoseViaPlanning(),
+            arm_action_mode=arm_action_mode,
             gripper_action_mode=Discrete(),
         )
 
@@ -134,6 +146,10 @@ class RLBenchWrapper(BaseManipulationEnv):
 
         self._last_obs = None
 
+    def seed(self, seed: int) -> None:
+        """Set seed for next reset. RLBench uses np.random for variation sampling."""
+        np.random.seed(seed)
+
     def reset(self) -> dict:
         descriptions, obs = self._task.reset()
         self._last_obs = obs
@@ -147,7 +163,7 @@ class RLBenchWrapper(BaseManipulationEnv):
         """
         position = action[:3].astype(np.float64)
         quat_xyzw = action[3:7].astype(np.float64)
-        gripper = 1.0 if float(action[7]) > 0.5 else 0.0
+        gripper = 1.0 if float(action[7]) > 0.0 else 0.0
 
         # Build action: [x, y, z, qx, qy, qz, qw, gripper]
         abs_action = np.concatenate([position, quat_xyzw, [gripper]])
@@ -175,11 +191,13 @@ class RLBenchWrapper(BaseManipulationEnv):
         return result
 
     def get_proprio(self) -> np.ndarray:
-        """Return [1, 8] proprio: joint_positions(7) + gripper_open(1)."""
+        """Return [1, 8] proprio: eef_pos(3) + eef_quat_xyzw(4) + gripper_centered(1)."""
         obs = self._last_obs
+        pose = obs.gripper_pose  # [7]: x y z qx qy qz qw
         proprio = np.concatenate([
-            np.array(obs.joint_positions, dtype=np.float32),  # [7]
-            [float(obs.gripper_open)],                         # [1]
+            pose[:3].astype(np.float32),              # eef_pos [3]
+            pose[3:].astype(np.float32),              # eef_quat xyzw [4]
+            [float(obs.gripper_open) * 2 - 1],        # grip centered {-1,1} [1]
         ])
         return proprio.reshape(1, -1)
 

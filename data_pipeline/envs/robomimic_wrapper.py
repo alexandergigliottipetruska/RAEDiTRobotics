@@ -44,10 +44,9 @@ def _process_image(img_hwc: np.ndarray, target_size: int = 224) -> np.ndarray:
         float32 [3, H, W] in [0, 1] range.
     """
     if img_hwc.shape[0] != target_size or img_hwc.shape[1] != target_size:
-        img_hwc = np.array(
-            Image.fromarray(img_hwc).resize(
-                (target_size, target_size), Image.LANCZOS
-            )
+        import cv2
+        img_hwc = cv2.resize(
+            img_hwc, (target_size, target_size), interpolation=cv2.INTER_LINEAR
         )
     img_float = img_hwc.astype(np.float32) / 255.0
     return np.moveaxis(img_float, -1, -3)  # [3, H, W]

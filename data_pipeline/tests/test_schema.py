@@ -128,19 +128,10 @@ def test_image_range(first_demo):
 # ---------------------------------------------------------------------------
 
 def test_action_ranges(hdf5_file, train_keys):
-    """Actions must be within expected ranges per benchmark."""
-    benchmark = hdf5_file.attrs.get("benchmark", "robomimic")
-    if benchmark == "robomimic":
-        # OSC_POSE pre-scaling: actions bounded to [-1, 1]
-        for key in train_keys:
-            actions = hdf5_file[f"data/{key}"]["actions"][:]
-            assert actions.min() >= -1.0 - 1e-5, f"Demo {key}: action below -1"
-            assert actions.max() <= 1.0 + 1e-5, f"Demo {key}: action above 1"
-    else:
-        # RLBench/ManiSkill: absolute EE poses or other raw actions, check no NaN/Inf
-        for key in train_keys:
-            actions = hdf5_file[f"data/{key}"]["actions"][:]
-            assert np.isfinite(actions).all(), f"Demo {key}: actions contain NaN/Inf"
+    """Actions must be finite (no NaN/Inf). Absolute actions can exceed [-1,1]."""
+    for key in train_keys:
+        actions = hdf5_file[f"data/{key}"]["actions"][:]
+        assert np.isfinite(actions).all(), f"Demo {key}: actions contain NaN/Inf"
 
 
 # ---------------------------------------------------------------------------

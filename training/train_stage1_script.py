@@ -71,6 +71,11 @@ def main():
         format="%(asctime)s %(name)s %(message)s",
     )
 
+    # Auto-timestamp save_dir (skip on resume to preserve existing path)
+    if not args.resume:
+        from datetime import datetime
+        args.save_dir = f"{args.save_dir}_{datetime.now().strftime('%m%d_%H%M')}"
+
     config = Stage1Config(
         hdf5_paths=args.hdf5,
         batch_size=args.batch_size,

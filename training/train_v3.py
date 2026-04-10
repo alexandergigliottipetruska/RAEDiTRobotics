@@ -9,6 +9,7 @@ V3-specific features:
   - Eval via eval_v3.py (no external ImageNet norm)
 """
 
+import glob
 import json
 import logging
 import math
@@ -16,6 +17,7 @@ import os
 from dataclasses import dataclass, field
 from datetime import datetime
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -67,6 +69,8 @@ def train_step(
     config,
     global_step: int,
     use_amp: bool = False,
+    loss_scale: float = 1.0,
+    step_optimizer: bool = True,
 ) -> dict:
     """One DDPM training step.
 
@@ -77,36 +81,41 @@ def train_step(
         config:      Training config (must have .grad_clip attribute).
         global_step: Current global step (for logging).
         use_amp:     Whether to use BF16 mixed precision.
+        loss_scale:  Multiply loss before backward (1/accum_steps for gradient accumulation).
+        step_optimizer: Whether to clip grads + step optimizer (False for intermediate accum steps).
 
     Returns:
-        Dict of scalar losses for logging.
+        Dict of scalar losses for logging (unscaled).
     """
     device = next(policy.parameters()).device
     device_type = device.type
 
-    # Move batch to device
+    # Move batch to device (non_blocking allows overlap with prior GPU compute)
     batch_dev = {
-        k: v.to(device) if isinstance(v, torch.Tensor) else v
+        k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
         for k, v in batch.items()
     }
 
     with torch.amp.autocast(device_type, dtype=torch.bfloat16, enabled=use_amp):
-        loss = policy(batch_dev)
+        result = policy(batch_dev)
 
-    # Backward + optimizer step
-    optimizer.zero_grad()
-    loss.backward()
+    loss = result["loss"]
 
-    # Gradient clipping
-    if config.grad_clip > 0:
-        torch.nn.utils.clip_grad_norm_(
-            [p for p in policy.parameters() if p.requires_grad],
-            config.grad_clip,
-        )
+    # Scale loss for gradient accumulation and backward
+    (loss * loss_scale).backward()
 
-    optimizer.step()
+    if step_optimizer:
+        # Gradient clipping
+        if config.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in policy.parameters() if p.requires_grad],
+                config.grad_clip,
+            )
 
-    return {"policy": loss.item(), "total": loss.item()}
+        optimizer.step()
+        optimizer.zero_grad()
+
+    return {"policy": result["policy"], "recon": result["recon"], "total": loss.item()}
 
 
 # ---------------------------------------------------------------------------
@@ -177,8 +186,10 @@ class V3Config:
     betas: tuple = (0.9, 0.95)          # Chi transformer (NOT 0.9, 0.999)
     weight_decay_denoiser: float = 1e-3  # Chi: transformer_weight_decay
     weight_decay_encoder: float = 1e-6   # Chi: obs_encoder_weight_decay
+    lr_adapter: float = 0.0              # 0 = use main lr, >0 = separate adapter lr
     num_epochs: int = 100
     grad_clip: float = 0.0              # Chi: no gradient clipping
+    grad_accum_steps: int = 1           # gradient accumulation (effective batch = batch_size * accum)
     warmup_steps: int = 1000            # Chi: 1000
     lr_schedule: str = "cosine"
 
@@ -190,10 +201,37 @@ class V3Config:
     ema_power: float = 0.75             # Chi: power=0.75 (adaptive decay)
     ema_max_decay: float = 0.9999
 
+    # Denoiser backbone
+    denoiser_type: str = "transformer"  # "transformer" (Chi cross-attn) or "dit" (adaLN-Zero)
+
+    # DiT enhancements
+    prediction_type: str = "epsilon"    # "epsilon" (default), "v_prediction", or "sample"
+    cfg_drop_rate: float = 0.0          # CFG: probability of dropping obs conditioning (0=disabled, 0.1=recommended)
+    cfg_scale: float = 1.0              # CFG: guidance scale at inference (1.0=no guidance, 1.5-3.0=recommended)
+    use_rope: bool = False              # Use RoPE instead of learned positional embeddings in DiT
+
+    # Spatial tokens
+    spatial_pool_size: int = 1          # 1=avg pool (default), 4/7/14=spatial tokens
+    use_spatial_softmax: bool = False   # SpatialSoftmax pooling (Chi-style spatial coordinates)
+    n_cond_layers: int = 0              # 0=MLP encoder (Chi), >0=self-attention encoder for spatial tokens
+    use_flow_matching: bool = False     # L1 Sample Flow (2-step, L1 loss) instead of DDPM/DDIM
+
+    # RAE decoder co-training
+    lambda_recon: float = 0.0           # reconstruction loss weight (0=disabled)
+    decoder_weight_decay: float = 1e-6  # weight decay for decoder params
+
+    # Augmentation — periodic token refresh with random crop
+    augment_refresh_every: int = 0      # 0=disabled, 5=refresh train tokens every 5 epochs
+    random_crop_size: int = 208         # crop 224→208→resize 224
+    image_hdf5: str = ""                # raw image HDF5 for token refresh + co-training targets
+
     # Logging & checkpointing
     log_every: int = 100
-    save_every_epoch: int = 10
-    eval_every_epoch: int = 5           # eval every 5 epochs (first 50), then 50
+    save_every_epoch: int = 10           # permanent milestone checkpoints (0=disabled)
+    save_rolling_every: int = 0          # rolling backup every N epochs (overwrites previous, 0=disabled)
+    no_save_best: bool = False           # disable best.pt (val loss)
+    no_save_best_success: bool = False   # disable best_success.pt (eval success rate)
+    eval_every_epoch: int = 10000           # eval every 5 epochs (first 50), then 50
     save_dir: str = "checkpoints/v3"
 
     # Eval
@@ -202,9 +240,12 @@ class V3Config:
     eval_episodes: int = 10
     eval_full_episodes: int = 50        # episodes for full eval (with video)
     eval_full_every_epoch: int = 50     # full eval + video every N epochs
-    eval_n_envs: int = 10              # max parallel envs for eval
+    eval_n_envs: int = 20              # max parallel envs for eval
     eval_image_size: int = 84
-    eval_mode: str = "custom"           # "custom" = our RobomimicWrapper, "robomimic" = Chi's pipeline
+    eval_mode: str = "robomimic"        # robomimic | rlbench
+    eval_exec_horizon: int = 8          # T_a: robomimic=8, RLBench=1
+    keyframe_eval: bool = False         # Deprecated/Experimental NBP
+    stop_after_epochs: int = 0          # If > 0, forcefully terminate training at this epoch
 
     # Val split override (0 = use HDF5 mask, >0 = random split like Chi)
     val_ratio: float = 0.0              # Chi uses 0.02 (4 val demos, seed=42)
@@ -213,6 +254,7 @@ class V3Config:
     # Precision — Chi runs fp32, no torch.compile
     no_amp: bool = False                # disable BF16 autocast
     no_compile: bool = False            # disable torch.compile
+    cache_in_ram: bool = False          # pre-load dataset into RAM
 
     # Reproducibility
     seed: int = 0                       # global seed (0 = random)
@@ -230,6 +272,7 @@ def save_v3_checkpoint(
     optimizer: torch.optim.Optimizer,
     ema_model,
     val_metrics: dict,
+    config=None,
 ):
     """Save V3 checkpoint — trainable components only (skip frozen encoder)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -243,12 +286,23 @@ def save_v3_checkpoint(
         "optimizer": optimizer.state_dict(),
         "val_metrics": val_metrics,
     }
+    # Save decoder if co-training
+    if pu.bridge.decoder is not None:
+        ckpt["decoder"] = pu.bridge.decoder.state_dict()
+    if config is not None:
+        ckpt["config"] = {k: v for k, v in config.__dict__.items()}
     if ema_model is not None:
-        ckpt["ema"] = {
-            "averaged_model": ema_model.averaged_model.state_dict(),
+        ema_avg = ema_model.averaged_model
+        ema_sd = {
+            "denoiser": ema_avg.denoiser.state_dict(),
+            "obs_encoder": ema_avg.obs_encoder.state_dict(),
+            "adapter": ema_avg.bridge.adapter.state_dict(),
             "optimization_step": ema_model.optimization_step,
             "decay": ema_model.decay,
         }
+        if ema_avg.bridge.decoder is not None:
+            ema_sd["decoder"] = ema_avg.bridge.decoder.state_dict()
+        ckpt["ema"] = ema_sd
     torch.save(ckpt, path)
     log.info("Saved V3 checkpoint: %s (epoch %d, step %d)", path, epoch, global_step)
 
@@ -268,26 +322,73 @@ def load_v3_checkpoint(
             return {k.removeprefix(prefix): v for k, v in sd.items()}
         return sd
 
+    def _resize_pos_emb(target_module, loaded_sd, key="cond_pos_emb"):
+        """Expand positional embeddings if the model's buffer is larger than the checkpoint's."""
+        if key in loaded_sd:
+            old = loaded_sd[key]
+            # Resolve dotted key on the module (e.g. "denoiser.cond_pos_emb")
+            obj = target_module
+            for attr in key.split("."):
+                obj = getattr(obj, attr)
+            new_shape = obj.shape
+            if old.shape != new_shape:
+                new_param = torch.zeros(new_shape, dtype=old.dtype, device=old.device)
+                min_len = min(old.shape[1], new_shape[1])
+                new_param[:, :min_len, :] = old[:, :min_len, :]
+                loaded_sd[key] = new_param
+                log.info("Resized %s from %s -> %s", key, list(old.shape), list(new_shape))
+
     # Load trainable components (backward-compat with old full-policy checkpoints)
     if "denoiser" in ckpt:
-        policy.denoiser.load_state_dict(_strip(ckpt["denoiser"]))
+        denoiser_sd = _strip(ckpt["denoiser"])
+        _resize_pos_emb(policy.denoiser, denoiser_sd)
+        policy.denoiser.load_state_dict(denoiser_sd)
         policy.obs_encoder.load_state_dict(_strip(ckpt["obs_encoder"]))
         policy.bridge.adapter.load_state_dict(_strip(ckpt["adapter"]))
+        if "decoder" in ckpt and policy.bridge.decoder is not None:
+            policy.bridge.decoder.load_state_dict(_strip(ckpt["decoder"]))
     else:
         # Old format: full policy state dict
         policy.load_state_dict(_strip(ckpt["policy"]))
     optimizer.load_state_dict(ckpt["optimizer"])
 
+    # Resize optimizer state buffers for any parameters whose shape changed (e.g. cond_pos_emb)
+    for group in optimizer.param_groups:
+        for p in group["params"]:
+            state = optimizer.state.get(p)
+            if state is None:
+                continue
+            for buf_key in ("exp_avg", "exp_avg_sq"):
+                if buf_key in state and state[buf_key].shape != p.shape:
+                    old_buf = state[buf_key]
+                    new_buf = torch.zeros_like(p)
+                    slices = tuple(slice(0, min(o, n)) for o, n in zip(old_buf.shape, p.shape))
+                    new_buf[slices] = old_buf[slices]
+                    state[buf_key] = new_buf
+                    log.info("Resized optimizer %s from %s -> %s", buf_key, list(old_buf.shape), list(p.shape))
+
     if ema_model is not None and "ema" in ckpt:
         ema_state = ckpt["ema"]
         if "averaged_model" in ema_state:
-            # Chi's EMA format
-            ema_model.averaged_model.load_state_dict(ema_state["averaged_model"])
-            ema_model.optimization_step = ema_state.get("optimization_step", 0)
-            ema_model.decay = ema_state.get("decay", 0.0)
+            # OLD format: full model state_dict (includes frozen encoder)
+            ema_sd = ema_state["averaged_model"]
+            _resize_pos_emb(ema_model.averaged_model, ema_sd,
+                            key="denoiser.cond_pos_emb")
+            ema_model.averaged_model.load_state_dict(ema_sd, strict=False)
+        elif "denoiser" in ema_state:
+            # NEW format: component-wise (no frozen encoder)
+            ema_avg = ema_model.averaged_model
+            ema_denoiser_sd = _strip(ema_state["denoiser"])
+            _resize_pos_emb(ema_avg.denoiser, ema_denoiser_sd, key="cond_pos_emb")
+            ema_avg.denoiser.load_state_dict(ema_denoiser_sd)
+            ema_avg.obs_encoder.load_state_dict(_strip(ema_state["obs_encoder"]))
+            ema_avg.bridge.adapter.load_state_dict(_strip(ema_state["adapter"]))
+            if "decoder" in ema_state and ema_avg.bridge.decoder is not None:
+                ema_avg.bridge.decoder.load_state_dict(_strip(ema_state["decoder"]))
         else:
-            # Old diffusers EMA format — skip (incompatible)
-            log.warning("Old diffusers EMA format detected, skipping EMA load (will re-init)")
+            log.warning("Unknown EMA format, skipping EMA load (will re-init)")
+        ema_model.optimization_step = ema_state.get("optimization_step", 0)
+        ema_model.decay = ema_state.get("decay", 0.0)
 
     log.info("Loaded V3 checkpoint from epoch %d, step %d: %s",
              ckpt["epoch"], ckpt["global_step"], path)
@@ -342,6 +443,7 @@ def train_v3(
     bridge = Stage1Bridge(
         checkpoint_path=config.stage1_checkpoint,
         pretrained_encoder=True,
+        load_decoder=(config.lambda_recon > 0),
     )
 
     policy = PolicyDiTv3(
@@ -359,16 +461,34 @@ def train_v3(
         eval_diffusion_steps=config.eval_diffusion_steps,
         p_drop_emb=config.p_drop_emb,
         p_drop_attn=config.p_drop_attn,
+        spatial_pool_size=config.spatial_pool_size,
+        use_spatial_softmax=config.use_spatial_softmax,
+        n_cond_layers=config.n_cond_layers,
+        denoiser_type=config.denoiser_type,
+        use_flow_matching=config.use_flow_matching,
+        prediction_type=config.prediction_type,
+        cfg_drop_rate=config.cfg_drop_rate,
+        cfg_scale=config.cfg_scale,
+        use_rope=config.use_rope,
     )
     policy = policy.to(device)
+    policy._lambda_recon = config.lambda_recon
 
-    # Performance
+    # Eagerly init LPIPS before EMA deepcopy (lazy init would desync modules)
+    if config.lambda_recon > 0 and policy.bridge.decoder is not None:
+        from models.losses import create_lpips_net
+        policy.bridge._lpips_net = create_lpips_net().to(device)
+        policy.bridge._lpips_net.requires_grad_(False)
+
+    # Performance (skip benchmark when seeded — it breaks determinism)
     if device.type == "cuda":
         torch.set_float32_matmul_precision("high")
-        torch.backends.cudnn.benchmark = True
+        if config.seed <= 0:
+            torch.backends.cudnn.benchmark = True
 
     # --- EMA: Chi's implementation (separate model copy) ---
     ema_policy = copy.deepcopy(policy)
+    ema_policy.bridge.encoder = policy.bridge.encoder  # share frozen encoder, don't duplicate
     ema_policy.eval()
     ema_policy.requires_grad_(False)
     ema_model = EMAModel(
@@ -383,16 +503,30 @@ def train_v3(
     denoiser_groups = policy.denoiser.get_optim_groups(
         weight_decay=config.weight_decay_denoiser,
     )
+    adapter_group = {
+        "params": list(policy.bridge.adapter.parameters()),
+        "weight_decay": config.weight_decay_encoder,
+    }
+    if config.lr_adapter > 0:
+        adapter_group["lr"] = config.lr_adapter
+
     param_groups = denoiser_groups + [
         {
             "params": list(policy.obs_encoder.parameters()),
             "weight_decay": config.weight_decay_encoder,
         },
-        {
-            "params": list(policy.bridge.adapter.parameters()),
-            "weight_decay": config.weight_decay_encoder,
-        },
+        adapter_group,
     ]
+
+    # Decoder co-training: add decoder params to optimizer
+    if config.lambda_recon > 0 and policy.bridge.decoder is not None:
+        param_groups.append({
+            "params": list(policy.bridge.decoder.parameters()),
+            "weight_decay": config.decoder_weight_decay,
+        })
+        log.info("RAE co-training enabled: lambda_recon=%.4f, decoder params=%d",
+                 config.lambda_recon,
+                 sum(p.numel() for p in policy.bridge.decoder.parameters()))
 
     optimizer = torch.optim.AdamW(
         param_groups,
@@ -428,7 +562,6 @@ def train_v3(
     valid_keys_override = None
     if config.val_ratio > 0:
         import h5py
-        import numpy as np
         # Get all demo keys from the first HDF5 file
         with h5py.File(config.hdf5_paths[0], "r") as f:
             all_keys = sorted(f["data"].keys())
@@ -451,6 +584,7 @@ def train_v3(
         norm_mode=config.norm_mode, use_rot6d=config.use_rot6d,
         pad_before=config.pad_before, pad_after=config.pad_after,
         demo_keys_override=train_keys_override,
+        image_hdf5_path=config.image_hdf5,
     )
     valid_ds = Stage3Dataset(
         config.hdf5_paths, split="valid",
@@ -460,22 +594,32 @@ def train_v3(
         demo_keys_override=valid_keys_override,
     )
 
+    # Optional: pre-load dataset into RAM to eliminate HDF5 I/O
+    _use_torch_cache = getattr(config, 'cache_in_ram', False)
+    if _use_torch_cache:
+        train_ds.cache_as_torch_tensors()
+        valid_ds.cache_as_torch_tensors()
+        # With torch tensors in RAM, workers add IPC overhead with no benefit
+        config.num_workers = 0
+        log.info("Torch tensor cache active: setting num_workers=0, pin_memory=False")
+
     train_sampler = DistributedSampler(train_ds, shuffle=True) if distributed else None
     persistent = config.num_workers > 0
 
     from data_pipeline.datasets.stage3_dataset import worker_init_open_handles
 
+    _pin = (device.type == "cuda") and not _use_torch_cache  # pin_memory wastes time with torch cache
     train_loader = DataLoader(
         train_ds, batch_size=config.batch_size,
         shuffle=(train_sampler is None), sampler=train_sampler,
-        num_workers=config.num_workers, pin_memory=(device.type == "cuda"),
+        num_workers=config.num_workers, pin_memory=_pin,
         drop_last=True, persistent_workers=persistent,
         prefetch_factor=3 if config.num_workers > 0 else None,
         worker_init_fn=worker_init_open_handles if config.num_workers > 0 else None,
     )
     valid_loader = DataLoader(
         valid_ds, batch_size=config.batch_size, shuffle=False,
-        num_workers=config.num_workers, pin_memory=(device.type == "cuda"),
+        num_workers=config.num_workers, pin_memory=_pin,
         persistent_workers=persistent,
         worker_init_fn=worker_init_open_handles if config.num_workers > 0 else None,
     )
@@ -494,14 +638,19 @@ def train_v3(
     metrics_path = None
     if is_main:
         os.makedirs(config.save_dir, exist_ok=True)
+
+        # Merge any fragmented logs from previous runs
+        from training.merge_logs import merge_all
+        merge_all(config.save_dir, start_epoch=start_epoch if resume_from else None)
+
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = os.path.join(config.save_dir, f"train_{ts}.log")
+        log_file = os.path.join(config.save_dir, "train.log")
         fh = logging.FileHandler(log_file)
         fh.setLevel(logging.INFO)
         fh.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
         log.addHandler(fh)
 
-        metrics_path = os.path.join(config.save_dir, f"metrics_{ts}.jsonl")
+        metrics_path = os.path.join(config.save_dir, "metrics.jsonl")
         run_info = {
             "type": "run_info", "version": "v3", "timestamp": ts,
             "gpu": torch.cuda.get_device_name(device) if torch.cuda.is_available() else "cpu",
@@ -515,16 +664,33 @@ def train_v3(
             mf.write(json.dumps(run_info, default=str) + "\n")
 
         log.info("=" * 60)
-        log.info("V3 Training: Chi's Cross-Attention Transformer")
+        denoiser_label = {
+            "transformer": "Chi's Cross-Attention Transformer",
+            "dit": "DiT with adaLN-Zero Blocks (Peebles & Xie)",
+        }.get(config.denoiser_type, config.denoiser_type)
+        log.info("V3 Training: %s", denoiser_label)
         log.info("=" * 60)
         log.info("Train: %d, Valid: %d, Batch: %d", len(train_ds), len(valid_ds), config.batch_size)
         log.info("Arch: d=%d, heads=%d, layers=%d, ac_dim=%d",
                  config.d_model, config.n_head, config.n_layers, config.ac_dim)
         log.info("Optim: lr=%.1e, betas=%s, WD_den=%.1e, WD_enc=%.1e",
                  config.lr, config.betas, config.weight_decay_denoiser, config.weight_decay_encoder)
-        log.info("EMA: power=%.2f, Diffusion: %d train / %d eval steps",
-                 config.ema_power, config.train_diffusion_steps, config.eval_diffusion_steps)
+        if config.use_flow_matching:
+            log.info("EMA: power=%.2f, L1 Flow (2-step, L1 loss)", config.ema_power)
+        else:
+            log.info("EMA: power=%.2f, Diffusion: %d train / %d eval steps",
+                     config.ema_power, config.train_diffusion_steps, config.eval_diffusion_steps)
         log.info("Precision: AMP=%s, compile=%s", not config.no_amp, not config.no_compile)
+        if config.denoiser_type == "dit":
+            extras = []
+            if config.use_rope:
+                extras.append("RoPE")
+            if config.prediction_type != "epsilon":
+                extras.append(f"pred={config.prediction_type}")
+            if config.cfg_drop_rate > 0:
+                extras.append(f"CFG(drop={config.cfg_drop_rate}, scale={config.cfg_scale})")
+            if extras:
+                log.info("DiT enhancements: %s", ", ".join(extras))
         log.info("=" * 60)
 
     # --- Training loop ---
@@ -532,12 +698,41 @@ def train_v3(
     best_success_rate = -1.0
     last_best_save_epoch = -999  # cooldown for best.pt saves
 
+    # Rolling backup state — detect any existing backup from a previous run
+    prev_rolling_path = None
+    if config.save_rolling_every:
+        existing = sorted(glob.glob(os.path.join(config.save_dir, "latest_backup_*.pt")))
+        if existing:
+            prev_rolling_path = existing[-1]
+
     # Save first training batch for diagnostics (Chi measures t0 on this)
     train_sampling_batch = None
+    scaler = getattr(torch.amp, "GradScaler", torch.cuda.amp.GradScaler)(enabled=not config.no_amp)
 
     for epoch in range(start_epoch, config.num_epochs):
+
+        if config.stop_after_epochs > 0 and epoch >= config.stop_after_epochs:
+            if is_main:
+                log.info(f"Reached early stop condition at epoch {epoch}. Terminating gracefully.")
+            break
+
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+
+        # Periodic token refresh with random crop augmentation
+        if (config.augment_refresh_every > 0
+                and epoch > 0
+                and epoch % config.augment_refresh_every == 0):
+            import time as _time
+            _t0 = _time.time()
+            log.info("Refreshing train tokens with random crop (epoch %d)...", epoch)
+            bridge = _unwrap(policy).bridge
+            train_ds.refresh_cached_tokens(
+                encoder=bridge.encoder,
+                device=device,
+                crop_size=config.random_crop_size,
+            )
+            log.info("Token refresh done in %.1fs", _time.time() - _t0)
 
         policy.train()
         epoch_losses = {}
@@ -548,6 +743,16 @@ def train_v3(
             if is_main else train_loader
         )
 
+        # Prefetch batches to GPU when using torch cache (overlaps collation + H2D with compute)
+        if _use_torch_cache:
+            from training.prefetch_iterator import PrefetchIterator
+            loader_iter = PrefetchIterator(loader_iter, device)
+
+        accum = config.grad_accum_steps
+        loss_scale = 1.0 / accum
+        optimizer.zero_grad()
+        micro_step = 0
+
         for batch in loader_iter:
             if train_sampling_batch is None:
                 train_sampling_batch = {
@@ -555,17 +760,22 @@ def train_v3(
                     for k, v in batch.items()
                 }
 
+            micro_step += 1
+            is_accum_step = (micro_step % accum == 0)
+
             step_losses = train_step(
                 batch, policy, optimizer, config, global_step, use_amp=use_amp,
+                loss_scale=loss_scale, step_optimizer=is_accum_step,
             )
 
-            ema_model.step(_unwrap(policy))
-            lr_scheduler.step()
+            if is_accum_step:
+                ema_model.step(_unwrap(policy))
+                lr_scheduler.step()
+                global_step += 1
 
             for k, v in step_losses.items():
                 epoch_losses[k] = epoch_losses.get(k, 0.0) + v
             n_steps += 1
-            global_step += 1
 
             # Update tqdm with per-step loss
             if is_main and hasattr(loader_iter, 'set_postfix'):
@@ -573,6 +783,19 @@ def train_v3(
                     loss=f"{step_losses['total']:.4f}",
                     avg=f"{epoch_losses['total'] / n_steps:.4f}",
                 )
+
+        # Handle leftover micro-batches that didn't complete an accumulation window
+        if micro_step % accum != 0:
+            if config.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in policy.parameters() if p.requires_grad],
+                    config.grad_clip,
+                )
+            optimizer.step()
+            optimizer.zero_grad()
+            ema_model.step(_unwrap(policy))
+            lr_scheduler.step()
+            global_step += 1
 
         avg = {k: v / max(n_steps, 1) for k, v in epoch_losses.items()}
 
@@ -587,8 +810,8 @@ def train_v3(
                     for k, v in val_batch.items()
                 }
                 with torch.amp.autocast(device.type, dtype=torch.bfloat16, enabled=use_amp):
-                    val_loss = _unwrap(policy)(val_batch_dev)
-                val_losses["policy"] = val_losses.get("policy", 0.0) + val_loss.item()
+                    val_result = _unwrap(policy)(val_batch_dev)
+                val_losses["policy"] = val_losses.get("policy", 0.0) + val_result["policy"]
                 val_steps += 1
         val_avg = {k: v / max(val_steps, 1) for k, v in val_losses.items()}
         policy.train()
@@ -611,30 +834,43 @@ def train_v3(
                         "train": avg, "valid": val_avg,
                     }) + "\n")
 
-            # Periodic checkpoint
-            if (epoch + 1) % config.save_every_epoch == 0:
+            # Periodic checkpoint (permanent milestones)
+            if config.save_every_epoch and (epoch + 1) % config.save_every_epoch == 0:
                 save_v3_checkpoint(
                     os.path.join(config.save_dir, f"epoch_{epoch:03d}.pt"),
                     epoch, global_step, policy, optimizer, ema_model, avg,
+                    config=config,
                 )
 
-            # Per-timestep diagnostics + quick eval every eval_every_epoch
-            is_full_eval_epoch = (epoch + 1) % config.eval_full_every_epoch == 0
-            if (epoch + 1) % config.eval_every_epoch == 0:
-                # Skip diagnostic on full eval epochs — running DDIM sampling
-                # back-to-back with full eval causes ~2x train loss spikes
-                if not is_full_eval_epoch:
-                    try:
-                        _run_per_timestep_diagnostic(
-                            policy, train_loader, valid_loader, ema_model,
-                            epoch, device, use_amp, metrics_path,
-                            train_sampling_batch=train_sampling_batch,
-                        )
-                    except Exception as e:
-                        log.warning("Per-timestep diagnostic failed at epoch %d: %s", epoch, e)
+            # Rolling backup (overwrites previous — frequent saves, constant disk usage)
+            if config.save_rolling_every and (epoch + 1) % config.save_rolling_every == 0:
+                rolling_path = os.path.join(config.save_dir, f"latest_backup_{epoch:04d}.pt")
+                save_v3_checkpoint(
+                    rolling_path, epoch, global_step, policy, optimizer, ema_model, avg,
+                    config=config,
+                )
+                if prev_rolling_path and prev_rolling_path != rolling_path and os.path.isfile(prev_rolling_path):
+                    os.remove(prev_rolling_path)
+                    log.info("Removed old rolling backup: %s", os.path.basename(prev_rolling_path))
+                prev_rolling_path = rolling_path
 
-                # Quick eval (no video) — skip if full eval runs this epoch
-                if not is_full_eval_epoch and config.eval_task and config.eval_hdf5:
+            # Per-timestep diagnostics (t0, denoised-MSE) — every eval_every_epoch + full eval epochs
+            is_last_epoch = (epoch == config.num_epochs - 1)
+            is_full_eval_epoch = (epoch + 1) % config.eval_full_every_epoch == 0
+            run_diag = (epoch + 1) % config.eval_every_epoch == 0 or is_full_eval_epoch or is_last_epoch
+            if run_diag:
+                try:
+                    _run_per_timestep_diagnostic(
+                        policy, train_loader, valid_loader, ema_model,
+                        epoch, device, use_amp, metrics_path,
+                        train_sampling_batch=train_sampling_batch,
+                    )
+                except Exception as e:
+                    log.warning("Per-timestep diagnostic failed at epoch %d: %s", epoch, e)
+
+            # Quick eval (no video) — runs on eval_every_epoch but NOT on full eval epochs
+            if (epoch + 1) % config.eval_every_epoch == 0 and not is_full_eval_epoch:
+                if config.eval_task and config.eval_hdf5:
                     try:
                         sr = _run_v3_eval(policy, ema_model, config, epoch, device,
                                           num_episodes=config.eval_episodes, save_video=False)
@@ -648,11 +884,13 @@ def train_v3(
                                 }) + "\n")
                         if sr > best_success_rate:
                             best_success_rate = sr
-                            save_v3_checkpoint(
-                                os.path.join(config.save_dir, "best_success.pt"),
-                                epoch, global_step, policy, optimizer, ema_model,
-                                {**avg, "success_rate": sr},
-                            )
+                            if not config.no_save_best_success:
+                                save_v3_checkpoint(
+                                    os.path.join(config.save_dir, "best_success.pt"),
+                                    epoch, global_step, policy, optimizer, ema_model,
+                                    {**avg, "success_rate": sr},
+                                    config=config,
+                                )
                             log.info("New best success rate: %.1f%% (epoch %d)", sr * 100, epoch)
                     except Exception as e:
                         log.warning("Eval failed at epoch %d: %s", epoch, e)
@@ -677,22 +915,25 @@ def train_v3(
 
                         if sr > best_success_rate:
                             best_success_rate = sr
-                            save_v3_checkpoint(
-                                os.path.join(config.save_dir, "best_success.pt"),
-                                epoch, global_step, policy, optimizer, ema_model,
-                                {**avg, "success_rate": sr},
-                            )
+                            if not config.no_save_best_success:
+                                save_v3_checkpoint(
+                                    os.path.join(config.save_dir, "best_success.pt"),
+                                    epoch, global_step, policy, optimizer, ema_model,
+                                    {**avg, "success_rate": sr},
+                                    config=config,
+                                )
                             log.info("New best success rate: %.1f%% (epoch %d)", sr * 100, epoch)
                     except Exception as e:
                         log.warning("Eval failed at epoch %d: %s", epoch, e)
 
             # Best checkpoint (by val loss) with 5-epoch cooldown
-            if val_avg.get("policy", float("inf")) < best_val_loss:
+            if not config.no_save_best and val_avg.get("policy", float("inf")) < best_val_loss:
                 best_val_loss = val_avg["policy"]
                 if epoch - last_best_save_epoch >= 5:
                     save_v3_checkpoint(
                         os.path.join(config.save_dir, "best.pt"),
                         epoch, global_step, policy, optimizer, ema_model, avg,
+                        config=config,
                     )
                     last_best_save_epoch = epoch
                 else:
@@ -749,7 +990,10 @@ def _run_per_timestep_diagnostic(
 
     timestep_losses = {}
     obs_cond_val = diag_model._encode_obs(val_dev)
-    for t_val in [0, 25, 50, 75, 99]:
+    n_train_steps = diag_model.train_diffusion_steps
+    # Scale diagnostic timesteps to actual schedule (handles 50 or 100 steps)
+    for t_val in sorted(set([0, n_train_steps // 4, n_train_steps // 2,
+                             3 * n_train_steps // 4, n_train_steps - 1])):
         torch.manual_seed(42)
         noise = torch.randn_like(val_dev["actions"])
         timesteps = torch.full((val_dev["actions"].shape[0],), t_val, device=device, dtype=torch.long)
@@ -836,7 +1080,6 @@ def _run_v3_eval(policy, ema_model, config, epoch, device,
     norm_stats = load_norm_stats(config.eval_hdf5)
 
     if config.eval_mode == "robomimic":
-        import os
         from training.eval_v3_robomimic import evaluate_v3_robomimic_parallel
         video_dir = os.path.join(config.save_dir, "media", f"epoch_{epoch:04d}")
         success_rate, results = evaluate_v3_robomimic_parallel(
@@ -852,12 +1095,44 @@ def _run_v3_eval(policy, ema_model, config, epoch, device,
             video_dir=video_dir,
         )
         n_success = sum(1 for r in results.values() if r["success"])
+    elif config.eval_mode == "rlbench":
+        from training.eval_v3 import V3PolicyWrapper
+        from training.eval_v3_rlbench import evaluate_v3_rlbench
+        video_dir = os.path.join(config.save_dir, "media", f"epoch_{epoch:04d}")
+        wrapper = V3PolicyWrapper(eval_policy, device=str(device))
+        success_rate, results, _run_v3_eval._rlbench_env = evaluate_v3_rlbench(
+            wrapper, norm_stats,
+            task=config.eval_task,
+            num_episodes=num_episodes,
+            obs_horizon=config.T_obs,
+            save_video=save_video,
+            video_dir=video_dir,
+            keyframe_eval=getattr(config, 'keyframe_eval', False),
+            norm_mode=config.norm_mode,
+            _cached_env=getattr(_run_v3_eval, '_rlbench_env', None),
+        )
+        n_success = sum(1 for r in results if r["success"])
+    elif config.eval_mode == "joint":
+        from training.eval_v3 import V3PolicyWrapper
+        from training.eval_v3_joint import evaluate_v3_joint
+        video_dir = os.path.join(config.save_dir, "media", f"epoch_{epoch:04d}")
+        wrapper = V3PolicyWrapper(eval_policy, device=str(device))
+        success_rate, results = evaluate_v3_joint(
+            wrapper, norm_stats,
+            task=config.eval_task,
+            num_episodes=num_episodes,
+            obs_horizon=config.T_obs,
+            exec_horizon=config.eval_exec_horizon,
+            save_video=save_video,
+            video_dir=video_dir,
+        )
+        n_success = sum(1 for r in results if r["success"])
     else:
         from training.eval_v3 import V3PolicyWrapper, evaluate_v3
-        wrapper = V3PolicyWrapper(pu, ema_model=ema_model, device=str(device))
+        wrapper = V3PolicyWrapper(_unwrap(policy), ema_model=ema_model, device=str(device))
         success_rate, results = evaluate_v3(
             wrapper, norm_stats,
-            num_episodes=config.eval_episodes,
+            num_episodes=num_episodes,
             task=config.eval_task,
             image_size=config.eval_image_size,
             use_rot6d=config.use_rot6d,

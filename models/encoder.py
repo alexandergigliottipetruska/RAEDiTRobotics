@@ -39,12 +39,13 @@ class FrozenMultiViewEncoder(nn.Module):
             from huggingface_hub import login
             import yaml
             
-            # Load the secret things from the YAML file
-            with open("configs/secrets.yaml", "r") as file:
-                secrets = yaml.safe_load(file)
-                
-            # Log in using the token
-            login(token=secrets["huggingface_token"])
+            # Log in using secrets.yaml if available, otherwise assume huggingface-cli login
+            try:
+                with open("configs/secrets.yaml", "r") as file:
+                    secrets = yaml.safe_load(file)
+                login(token=secrets["huggingface_token"])
+            except FileNotFoundError:
+                pass  # assume huggingface-cli login was already used
             
             # load the DINOv3 ViT-L16 from Hugging Face
             self.backbone = AutoModel.from_pretrained('facebook/dinov3-vitl16-pretrain-lvd1689m', trust_remote_code=True)
