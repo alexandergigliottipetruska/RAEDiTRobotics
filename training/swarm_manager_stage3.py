@@ -35,7 +35,7 @@ def run_remote(cfg, node_name, domain, command, password=None, is_start_cmd=Fals
     full_address = f"{ssh_user}@{host}" if ssh_user else host
 
     env = os.environ.copy()
-    sshpass_path = cfg.get("manager", {}).get("sshpass_path")
+    sshpass_path = (cfg.get("manager") or {}).get("sshpass_path")
     if password and sshpass_path:
         ssh_cmd = [
             sshpass_path, "-e",
