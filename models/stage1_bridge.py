@@ -201,7 +201,7 @@ class Stage1Bridge(nn.Module):
                 if not mask.any():
                     continue
 
-                tokens_k = cached_tokens[mask, t, k]  # (B_real, 196, 1024)
+                tokens_k = cached_tokens[mask, t, k].float()  # (B_real, 196, 1024)
                 tokens = self.adapter(tokens_k)  # (B_real, 196, 512)
 
                 if adapted is None:
