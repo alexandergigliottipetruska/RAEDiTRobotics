@@ -63,11 +63,11 @@ nodes:
 # FIXED VARIABLES (passed to V3Config via setattr)
 # ---------------------------------------------------------------------------
 training_static:
-  # Paths (update these for your account)
-  stage1_checkpoint: "checkpoints/stage1/epoch_024.pt"
+  # Paths (~ expands to the user's home dir at runtime)
+  stage1_checkpoint: "~/RAEDiTRobotics/checkpoints/stage1_full_rtx5090_0312_0400/epoch_024.pt"
   hdf5_paths:
-    - "data/robomimic/square/ph_abs_v15_tokens_bf16_none.hdf5"
-  eval_hdf5: "data/robomimic/square/ph_abs_v15.hdf5"
+    - "~/data/robomimic/square/ph_abs_v15_tokens_bf16_none.hdf5"
+  eval_hdf5: "~/data/robomimic/square/ph_abs_v15.hdf5"
 
   # Task
   eval_task: "square"

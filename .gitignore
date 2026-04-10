@@ -14,3 +14,10 @@ checkpoints/
 ompl_test_plots/
 ompl_test_videos/
 data/
+SESSION_NOTES_*.md
+outputs/
+plots/
+scratch/
+eval_videos/
+sim_videos/
+*.mp4

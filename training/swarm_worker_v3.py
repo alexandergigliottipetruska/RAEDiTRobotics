@@ -153,10 +153,14 @@ def objective(trial):
     # 1. Sample hyperparameters from search space
     hps = sample_from_config(trial, SWARM_CFG["hyperparameters_search"])
 
-    # 2. Build V3Config with static overrides
+    # 2. Build V3Config with static overrides (expand ~ in paths)
     config = V3Config()
     if "training_static" in SWARM_CFG:
         for key, value in SWARM_CFG["training_static"].items():
+            if isinstance(value, str):
+                value = os.path.expanduser(value)
+            elif isinstance(value, list):
+                value = [os.path.expanduser(v) if isinstance(v, str) else v for v in value]
             setattr(config, key, value)
 
     # 3. Apply dynamic Optuna overrides
