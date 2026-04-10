@@ -282,7 +282,7 @@ class Stage3Dataset(Dataset):
                 }
 
                 if is_cached:
-                    entry["tokens"] = torch.from_numpy(np.array(grp["tokens"], dtype=np.float32))
+                    entry["tokens"] = torch.from_numpy(np.array(grp["tokens"]))  # preserve dtype (fp32 or bf16/fp16)
                     if "active_cam_indices" in grp:
                         entry["active_cam_indices"] = torch.from_numpy(np.array(grp["active_cam_indices"]))
                         entry["K_full"] = int(f.attrs.get("num_cam_slots", 4))
