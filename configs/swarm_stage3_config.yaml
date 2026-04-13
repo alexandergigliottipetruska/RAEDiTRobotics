@@ -1,20 +1,26 @@
-# Distributed Optuna HP sweep for Stage 3 — Round 3c (narrow confirmation)
+# Distributed Optuna HP sweep for Stage 3 — Round 3d (narrow + lr_schedule probe)
 # Metric: 0.3*peak + 0.7*last_6_avg, PercentilePruner(50%)=MedianPruner, 50-epoch rapid sweep.
 #
-# R3c narrows the search space around R3b's top-10 basin and restricts nl to {6, 8}
-# to finally give nl=6 a fair shot at the champion (lr, lr_a, pdrop) corner.
-# R3b top-10 (for reference): lr gmedian=3.78e-4, lr_a gmedian=2.32e-6, pdrop median=0.226,
+# R3d extends R3c's narrow search by adding `lr_schedule ∈ {cosine, constant}` as a HP.
+# This tests whether R3b's 50-epoch cosine proxy systematically under-rewards HPs that
+# need more effective lr×steps to converge. Constant-lr (with warmup) gives ~2× more
+# effective learning budget than cosine for the same peak lr.
+#
+# Search space: nl ∈ {6, 8} × lr_schedule ∈ {cosine, constant} = 4 categorical cells.
+# n_trials_per_worker bumped from 5 to 7 (was R3c) to keep ~20 completed samples per cell
+# after MedianPruner (24 × 7 = 168 → ~84 complete → ~21/cell).
+#
+# R3b top-10 (reference): lr gmedian=3.78e-4, lr_a gmedian=2.32e-6, pdrop median=0.226,
 # all nl=8; champion #160 at lr=4.23e-4, lr_a=2.26e-6, pdrop=0.240, weighted=0.9662.
 #
 # CRITICAL PRUNER SEMANTICS NOTE (learned the hard way in R3b):
 # Optuna's PercentilePruner for a MAXIMIZATION study internally does `percentile = 100 - percentile`.
-# So `PercentilePruner(percentile=25.0)` does NOT "kill bottom 25%". It keeps ONLY the top 25%
-# (prune if best-so-far < 75th percentile of other trials' best-so-far at the same step).
-# R3c uses 50.0 = MedianPruner semantics = keep top 50%, kill bottom 50% (less aggressive).
+# So `PercentilePruner(percentile=25.0)` does NOT "kill bottom 25%". It keeps ONLY the top 25%.
+# R3d uses 50.0 = MedianPruner semantics = keep top 50%, kill bottom 50% (less aggressive).
 # Usage: python training/swarm_manager_stage3.py start|stop|status|restart_idle
 
 project:
-  study_name: "v3_square_bf16_hp_sweep_r3c"
+  study_name: "v3_square_bf16_hp_sweep_r3d"
   domain: "utm.utoronto.ca"
   project_root: "~/RAEDiTRobotics"
   venv_path: "~/venv_rlbench/bin/activate"
@@ -27,11 +33,11 @@ project:
   scratch_dir: "/tmp/optuna_trials"
   hf_repo_id: "swagman8008/RAE-DP-stage3-sweeps"
 
-  # Optuna Settings — MedianPruner, fewer trials (narrow search converges faster)
+  # Optuna Settings — MedianPruner, bumped trials for 4 categorical cells
   n_startup_trials: 10
   n_warmup_steps: 19          # allow ~4 evals before pruning (evals at 4, 9, 14, 19, ...)
   pruning_percentile: 50.0    # MedianPruner semantics: keep top 50%, kill bottom 50%
-  n_trials_per_worker: 5      # 24 workers × 5 trials = 120 total (narrow search needs less)
+  n_trials_per_worker: 7      # 24 workers × 7 trials = 168 (up from R3c's 5 to compensate for 2× cells)
 
 manager:
   # SSH auth: set ssh_password in configs/secrets.yaml, or use SSH keys
@@ -111,11 +117,11 @@ training_static:
   n_cond_layers: 4              # locked: best in R1 d=384 breakdown
   use_flow_matching: true
 
-  # Training — rapid 50-epoch runs with cosine schedule calibrated to 50 epochs
+  # Training — rapid 50-epoch runs
+  # NOTE: lr_schedule moved to hyperparameters_search below (R3d adds it as a HP)
   batch_size: 64
   num_epochs: 50                # rapid sweep: ~50 min per trial at d=384
-  warmup_steps: 1000            # ~2.2 epochs of warmup
-  lr_schedule: "cosine"
+  warmup_steps: 1000            # ~1-2 epochs of warmup
   norm_mode: "chi"
   use_rot6d: true
   cache_in_ram: true
@@ -136,10 +142,13 @@ training_static:
 
 
 # ---------------------------------------------------------------------------
-# DYNAMIC VARIABLES (Optuna Search Space — Round 3c, narrow)
-# Centered on R3b's top-10 champion basin with ~2× margin on each side.
+# DYNAMIC VARIABLES (Optuna Search Space — Round 3d, narrow + lr_schedule probe)
+# Same narrow search as R3c (R3b's top-10 basin) but adds `lr_schedule` as a HP
+# to test whether the 50-epoch cosine proxy is under-rewarding HPs that need
+# more effective-lr time to converge. Constant-lr (with warmup) gives every HP
+# ~2× more effective lr×steps than cosine for the same peak lr, so the optimal
+# peak lr is expected to shift lower for constant-schedule trials.
 # R3b top-10: lr gmedian=3.78e-4, lr_a gmedian=2.32e-6, pdrop median=0.226, all nl=8.
-# R3c narrows to validate the basin, resolve nl=6 vs nl=8 fairly, and drop nl=4.
 # ---------------------------------------------------------------------------
 hyperparameters_search:
   lr:
@@ -166,3 +175,8 @@ hyperparameters_search:
     kwargs:
       low: 0.15            # R3b top-10 interquartile [0.194, 0.240]
       high: 0.26
+
+  lr_schedule:
+    method: "suggest_categorical"
+    kwargs:
+      choices: ["cosine", "constant"]   # R3d probe: is 50-epoch cosine decaying too early?

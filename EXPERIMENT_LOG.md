@@ -495,3 +495,67 @@ Mixing R3c's MedianPruner samples into R3b's aggressive-pruner posterior would c
 3. Do we find a new, even better optimum inside the narrow region that R3b missed?
 4. Does `pdrop` have a cleaner optimum in the narrow range — around 0.22 as R3b suggests, or elsewhere in [0.15, 0.26]?
 
+---
+
+## HuggingFace upload failure (discovered during R3c, 2026-04-13)
+
+**Symptom**: no R3/R3b/R3c trial folders appeared on `swagman8008/RAE-DP-stage3-sweeps`. Worker logs showed `HF upload failed for Trial N: (Request ID: Root=1-...)` with only an S3 Request ID and no error body.
+
+**Diagnosis**:
+- Token and repo access both fine (`whoami` + `repo_info` worked from pc07).
+- Small file upload worked. 100 MB LFS upload also worked.
+- Listing the repo revealed **99,623 files** across the three R2 sweep folders — the R2 uploads had been saving ~1,800 files per trial into `.../trial_N/media/epoch_XXXX/` (eval rollout videos at `eval_full_episodes=100 × eval_full_every_epoch=10 = 10 full evals per trial × ~100 episodes each`).
+- **HuggingFace's documented 100k-files-per-repo soft limit** was being hit. Past that threshold, commits start failing with opaque S3 Request-ID-only errors (not a clean 4xx).
+
+**Fix**:
+- Deleted all 55 R2 `media/` folders via batched `create_commit(CommitOperationDelete)`. File count: **99,623 → 223**.
+- Modified [training/swarm_worker_v3.py:72-98](RAEDiTRobotics/training/swarm_worker_v3.py#L72-L98) to pass `ignore_patterns=["media/**", "*.mp4", "*.gif"]` to `upload_folder`. Going forward, only `metrics.jsonl`, `train.log`, `best_success.pt`, and config files get uploaded — ~5-10 files per trial instead of ~1,800.
+- Also changed error logging from `%s` → `%r` so future failures log `repr(e)` (exception class + full message) instead of just `str(e)`.
+
+**Data lost**: R3b and R3c trial checkpoints + videos never uploaded — by the time uploads failed, the worker's `finally` block had already wiped the local trial directories. Numeric data (success rates, HPs, trajectories) is in the Optuna DB, so no analysis capability lost. Just no model weights to re-use from R3b/R3c winning trials; champions would need to be retrained from scratch.
+
+**Lesson for the paper / infrastructure**: for any distributed sweep that saves media per eval, upload filters are mandatory from day one. Added to [reference_optuna_gotchas.md](~/.claude/projects/-virtual-csc415user/memory/reference_optuna_gotchas.md).
+
+---
+
+## Round 3d: `v3_square_bf16_hp_sweep_r3d` — narrow + `lr_schedule` probe
+
+**Date**: 2026-04-13 onwards (launching after R3c completes)
+
+**Motivation**: R3c's narrow confirmation is running with the same 50-epoch cosine schedule as R3b. But cosine at 50 epochs decays the lr to 0 by the last eval (integral of `0.5(1+cos(πt))` from 0 to 1 = 0.5 → average lr is half of peak), which means fast-warming HPs finish early and slow-warming HPs get cut off before they reach their plateau. The 50-epoch cosine proxy may systematically under-reward HPs that would excel at longer horizons.
+
+R3d tests this directly by adding `lr_schedule ∈ {cosine, constant}` as a categorical HP. Constant-lr (with the same 1000-step warmup) sustains peak lr for all ~48 post-warmup epochs, giving ~2× more effective `lr × steps` than cosine for the same peak. If constant plateaus meaningfully higher, the cosine proxy was premature and the R3b/R3c champion HPs are optimistic.
+
+### Changes from R3c
+
+| Aspect | R3c | R3d |
+|--------|-----|-----|
+| Study name | `..._r3c` | `..._r3d` |
+| Search space | 4 HPs (`lr, lr_a, nl, pdrop`) | **5 HPs** (+ `lr_schedule`) |
+| `lr_schedule` | static `"cosine"` | **HP: `["cosine", "constant"]`** |
+| Categorical cells | 2 (`nl ∈ {6,8}`) | **4** (`nl × schedule`) |
+| `n_trials_per_worker` | 5 | **7** (bumped to keep ~21 samples/cell post-pruning) |
+| Trial budget | 24 × 5 = 120 | 24 × 7 = **168** |
+| HF upload filter | none (broken — see above) | `ignore_patterns=["media/**", "*.mp4", "*.gif"]` |
+
+Everything else identical to R3c: narrow search ranges (`lr [2e-4, 6e-4]`, `lr_a [5e-7, 1e-5]`, `pdrop [0.15, 0.26]`), MedianPruner (`pruning_percentile: 50.0`), same architecture, same metric (`0.3*peak + 0.7*last_6_avg`).
+
+### Expected observations
+
+- **If cosine proxy was fine**: constant-schedule winners cluster at similar plateau to cosine-schedule winners in the narrow region. No significant mean difference in `last_6_avg`.
+- **If cosine proxy was under-rewarding slow-warmers**: constant-schedule trials plateau higher by ≥0.01 at similar HPs. Optimum `lr` shifts lower for constant (expected since constant sustains full lr → lower peak needed).
+- **`nl=6` vs `nl=8` interaction**: possible that `nl=6` benefits more from constant lr (narrower capacity → finishes earlier under cosine, benefits from continued training under constant).
+
+### Questions R3d aims to answer
+
+1. Is the 50-epoch cosine proxy actually measuring final-plateau quality, or is it measuring "how fast can this HP warm up within 50 epochs of cosine decay"?
+2. Does the optimum `(lr, lr_a)` shift between schedules? (Expected: constant favors lower `lr`.)
+3. Does `nl=6` finally match `nl=8` under constant lr? (If yes, the R3b `nl=8` reversal was a cosine-proxy artifact.)
+4. Which schedule should the final 300-epoch paper model use? (Unclear — depends on how the plateau-quality comparison shakes out at 50 epochs and whether that transfers.)
+
+### Infrastructure changes (from the HF incident above)
+
+- Worker code now uses `ignore_patterns=["media/**", "*.mp4", "*.gif"]` in `upload_folder`.
+- Error logging uses `%r` for exception objects (full type + message instead of cropped `str(e)`).
+- Expected repo footprint for R3d: ~168 trials × ~5 files = ~840 files. Well under HF's 100k limit.
+

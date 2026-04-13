@@ -84,16 +84,21 @@ def upload_to_hf_and_clean(trial_dir, trial_number):
     study_name = SWARM_CFG["project"]["study_name"]
     path_in_repo = os.path.join(f"{study_name}_{SESSION_TS}", f"trial_{trial_number}")
 
+    # Exclude media files (eval rollout videos) — they're ~1000 files per trial and
+    # blow through HF's 100k-files-per-repo soft limit. We never use them downstream;
+    # all numeric data is in metrics.jsonl and the Optuna DB. Keep checkpoints (.pt),
+    # logs, and metrics.
     try:
         api.upload_folder(
             folder_path=trial_dir,
             path_in_repo=path_in_repo,
             repo_id=repo_id,
             repo_type="model",
+            ignore_patterns=["media/**", "*.mp4", "*.gif"],
         )
         log.info("Uploaded Trial %d to %s/%s", trial_number, repo_id, path_in_repo)
     except Exception as e:
-        log.warning("HF upload failed for Trial %d: %s", trial_number, e)
+        log.warning("HF upload failed for Trial %d: %r", trial_number, e)
     finally:
         shutil.rmtree(trial_dir, ignore_errors=True)
 
