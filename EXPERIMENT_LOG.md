@@ -297,3 +297,201 @@ Pruning uses raw step-wise SR via `trial.report(sr, epoch)` in `training/train_v
 3. Is the 50-epoch + last_6 averaging combination enough to reliably identify top-3 configs?
 4. Does `last_6_avg` produce a materially different winning HP region than R1/R2's `last_10_avg` over 200-300 epochs?
 
+### R3b final results (240 trials, 2026-04-13)
+
+**Final state**: 240 trials total — ~95 COMPLETE, ~121 PRUNED, rest marked FAIL from orphaned restarts. TPE converged cleanly: late-sweep trials (#235, #237, #239) land in the same champion basin as early trials (#49, #56, #61), confirming the optimum is real and not a TPE artifact.
+
+#### Final top-10
+
+| Rank | Trial | weighted | peak | last_6 | lr | lr_adapter | nl | pdrop |
+|------|-------|----------|------|--------|------|-------------|-----|-------|
+| 1 | **#160** | **0.9662** | **1.00** | 0.952 | 4.23e-4 | 2.26e-6 | 8 | 0.240 |
+| 2 | #239 | 0.9637 | 0.98 | 0.957 | 4.21e-4 | 2.40e-6 | 8 | 0.233 |
+| 3 | #155 | 0.9597 | 0.99 | 0.947 | 4.59e-4 | 3.72e-6 | 8 | 0.243 |
+| 4 | #61  | 0.9595 | 0.97 | 0.955 | 2.81e-4 | 1.77e-6 | 8 | 0.216 |
+| 5 | #187 | 0.9573 | 0.99 | 0.943 | 2.96e-4 | 1.21e-6 | 8 | 0.194 |
+| 6 | #165 | 0.9572 | 0.97 | 0.952 | 2.83e-4 | 1.52e-6 | 8 | 0.175 |
+| 7 | #235 | 0.9568 | 1.00 | 0.938 | 3.91e-4 | 2.38e-6 | 8 | 0.239 |
+| 8 | #88  | 0.9567 | 0.98 | 0.947 | 3.66e-4 | 2.65e-6 | 8 | 0.187 |
+| 9 | #56  | 0.9560 | 0.97 | 0.950 | 2.83e-4 | 1.90e-6 | 8 | 0.218 |
+| 10 | #154 | 0.9543 | 0.98 | 0.943 | 4.32e-4 | 3.52e-6 | 8 | 0.242 |
+
+**Trial #160 hit 100% peak SR** (first in any Square sweep), plateau 0.95–0.97 on last_6. Trial #235 also hit 100% peak. Both are in the same basin as other top-10 trials.
+
+#### Aggregated "best HPs" (top-10, log-space medians for lr/lr_adapter)
+
+These are the numbers to cite as the tuned Stage-3 HPs for the paper:
+
+```
+lr                = 3.5e-4     (gmedian=3.78e-4, top-10 interquartile [2.83e-4, 4.23e-4])
+lr_adapter        = 2.2e-6     (gmedian=2.32e-6, top-10 interquartile [1.77e-6, 2.65e-6])
+n_layers          = 8          (100% of top-20)
+p_drop_attn       = 0.22       (median=0.226, top-10 interquartile [0.194, 0.240])
+
+# locked from earlier rounds
+d_model           = 384
+n_head            = 6
+n_cond_layers     = 4
+T_obs             = 2
+spatial_pool_size = 7
+use_flow_matching = true
+norm_mode         = chi
+use_rot6d         = true
+```
+
+**Tightness of optimum**: top-10 `lr` interquartile spans only 1.5× (2.83e-4 → 4.23e-4), `lr_adapter` interquartile spans only 1.5× (1.77e-6 → 2.65e-6), `pdrop` interquartile spans [0.19, 0.24]. This is a narrow, well-defined optimum — not a broad flat region.
+
+#### Answers to R3b's questions
+
+1. **True optima**: `lr ≈ 3.5e-4`, `lr_adapter ≈ 2.2e-6` (≈ 10× lower than R2's `2.27e-5`!), `pdrop ≈ 0.22`. See top-10 interquartile above for tight confidence.
+
+2. **Bimodal lr_adapter does NOT replicate**. R2 showed modes at ~8e-6 and ~2.5e-5; R3b has a single mode at ~2e-6. The bimodality was an artifact of R2's narrow range + old metric. The "real" answer is that very-low `lr_adapter` (~2e-6) is best — the RAE-pretrained adapter should barely be fine-tuned, confirming and sharpening the R1/R2 thesis.
+
+3. **50 epochs + last_6_avg reliably identifies champions**. Late-sweep trials (#239, #235) landed in the same basin as early winners (#61, #49). TPE convergence was clean by trial ~100.
+
+4. **New metric finds meaningfully different HPs than R2's `last_10_avg`**:
+   - R2 champion: `lr=3.25e-4, lr_a=2.27e-5, nl=6, pdrop=0.188`
+   - R3b champion: `lr=4.23e-4, lr_a=2.26e-6, nl=8, pdrop=0.240`
+   - Under the new metric, `nl=8` dominates (100% of top-20); R2's `nl=6` winner is gone.
+   - Most striking: `lr_adapter` is **10× lower** under the new metric.
+   - Plateau quality is similar (R3b ~0.955, R2 ~0.955) — both metrics find similar *quality* optima, but different *parameters*.
+
+#### Surprise finding: `n_layers=8` reversal
+
+R2 found `nl=6` was best; R3b found `nl=8` dominates all top-20. Why?
+
+| nl | n_complete | avg_w | best_w |
+|----|-----------|-------|--------|
+| 4 | 12 | 0.831 | 0.928 |
+| 6 | 10 | 0.884 | 0.934 |
+| **8** | **67** | **0.921** | **0.966** |
+
+Three plausible explanations:
+1. **New metric favors plateau over peak**: `nl=8`'s higher capacity produces smoother plateaus when regularized (pdrop ~0.22); `nl=6`'s old-metric advantage was driven by peak-detection noise.
+2. **Wider lr range unlocks `nl=8`'s advantage**: R2's `lr ∈ [1.8e-4, 3.6e-4]` was tuned for `nl=6`; R3b's `lr ≈ 4.2e-4` needs `nl=8`'s depth to absorb.
+3. **50 epochs + aggressive cosine decay**: short training doesn't give `nl=8` enough time to overfit the way it would in 300-epoch R1-style runs. R1 also had `nl=8` competitive (champion #61 used `nl=8`); only R2's longer training + narrower lr favored `nl=6`.
+
+**Caveat — TPE commitment bias**: `nl=8` got 138/186 samples (74%); `nl=6` got only 25. TPE committed to `nl=8` around trial ~60 and never properly explored `nl=6` in the champion `(lr, lr_a, pdrop)` corner. We can't rule out that `nl=6` at `(lr≈4e-4, lr_a≈2e-6, pdrop≈0.22)` would also hit ~0.96 — it just wasn't sampled. This is R3c's job.
+
+#### Lessons recorded
+
+See the **Lessons learned** section below — condensed versions of the findings are in `.claude/projects/-virtual-csc415user/memory/` (`project_hp_sweep.md`, `reference_optuna_gotchas.md`).
+
+### R3 post-mortem analysis (24 completed trials, old metric)
+
+After the 24 R3 trials finished under the old metric, we re-ranked them under the new metric to check how much TPE's posterior would have been corrupted. Spearman ρ(old ranks, new ranks) = **0.97** — highly correlated overall — but the mid-band had specific, interpretable mis-rankings:
+
+- **Top-3 champions largely robust**: under old metric #16, #18, #1; under new metric #18, #16, #6. #1 drops from rank 3 → 6 because its trajectory `[0.78, 0.89, 0.96, 0.9, 0.9, 0.92, 0.92, 0.92, 0.87, 0.88]` has a noisy mid-run peak at 0.96 that doesn't reflect its true plateau (~0.90). Old metric rewards the peak; new metric correctly scores it as a solid top-6 not a champion.
+- **Biggest injustice**: trial #2 `[0.01, 0.47, 0.66, 0.8, 0.88, 0.86, 0.88, 0.82, 0.85, 0.8]` was **pruned** at old rank 10 (excluded from TPE's posterior) but is actually new rank 8 (top-10). Its HPs were `lr=3.0e-5, lr_a=1.1e-7, nl=8, pdrop=0.16` — the "very-low-lr + frozen-adapter" corner, consistent with the R1/R2 finding that `lr_adapter` should be essentially frozen.
+- **Slow-climbers systematically punished**: trials #0, #7, #17 (all with epoch-4 SR ≤ 0.22) moved up 2-3 positions under the new metric. These represent slow-warmup HPs that end at solid plateaus (0.78-0.91) but are scored down by their warmup noise.
+
+**Takeaway**: the bug is real but bounded. Champions are stable under both metrics; mid-band rankings shift by 1-3 positions, with slow-climbers being the main beneficiaries of the fix. TPE's posterior from R3 would have been slightly mis-calibrated toward fast-convergence but not catastrophically so.
+
+---
+
+## ⚠️ Pruner semantics: Optuna's `PercentilePruner` flips for maximization
+
+After R3b started running, analysis of trial #45 (pruned at step 19 despite having best-so-far = 0.90) revealed a fundamental misunderstanding of `PercentilePruner` semantics that had been baked into all our configs since R3.
+
+### What we thought `PercentilePruner(percentile=25.0)` meant
+
+"Kill bottom 25% at each step" — i.e. prune the 25% worst trials, keep 75%.
+
+### What it actually does for a maximization study
+
+From Optuna's source (`optuna/pruners/_percentile.py`):
+
+```python
+def _get_percentile_intermediate_result_over_trials(...):
+    ...
+    direction = storage.get_study_direction(study_id)
+    if direction == StudyDirection.MAXIMIZE:
+        percentile = 100 - percentile    # <-- flips for max
+    return float(numpy.percentile(intermediate_values, percentile))
+
+def prune(self, study, trial):
+    ...
+    best_intermediate_result = trial.intermediate_values[step]  # best-so-far at this step
+    p = self._get_percentile_intermediate_result_over_trials(...)
+    if direction == StudyDirection.MAXIMIZE:
+        return best_intermediate_result < p   # prune if below cutoff
+```
+
+For a **maximization** study, `PercentilePruner(percentile=25.0)` does:
+1. Compute the cutoff as the **75th percentile** of other trials' best-so-far at the same step (because 100 - 25 = 75).
+2. Prune any trial whose best-so-far < 75th percentile cutoff.
+
+**Translation**: `PercentilePruner(25%)` **keeps only the top 25%**. It is the most aggressive plausible setting, not the least. `PercentilePruner(50%)` = median pruner = keep top 50%. `PercentilePruner(75%)` = keep top 75% (gentle).
+
+### How this was verified on trial #45
+
+Trial #45's trajectory through step 19: `[0.69, 0.90, 0.86, 0.89]`, best-so-far = 0.90.
+
+At the moment #45 reported step 19, the pool of other trials' best-so-far values at step 19 had a 75th percentile of **~0.9050**. Since 0.90 < 0.9050, #45 was pruned — despite being a solid top-15 trial by any reasonable standard. HPs: `lr=2.04e-4, lr_adapter=4.09e-7, n_layers=8, p_drop_attn=0.037` — a legitimate under-explored corner of the search space that got silently excluded from TPE's posterior.
+
+### Consequences for R3 and R3b results
+
+- **R3 pruned 11/24 (46%)** — consistent with "keep top 25%" once 10 startup trials were past.
+- **R3b pruned ~24/48 (50%)** by trial #47 — same aggressive pattern.
+- Every slow-climber or mid-plateau HP regime is likely under-represented in both posteriors. The bimodal lr_adapter pattern from R2 may be harder to detect because the lower mode (frozen adapter, slow training) warms up slowly and gets killed before it can show its plateau.
+
+### Fix for R3c
+
+Bump `pruning_percentile: 25.0` → `50.0` (= MedianPruner = keep top 50%). This:
+- Still kills the obvious losers (step-19 values < median ~0.5)
+- Preserves legitimate mid-tier trials like #45 in TPE's posterior
+- Doubles the compute cost per sweep round vs R3b's aggressive kill rate — but the sweep is time-bound (9 hours per worker), not compute-bound, so this is essentially free.
+
+---
+
+## Round 3c: `v3_square_bf16_hp_sweep_r3c` — narrow confirmation + `nl=6` validation
+
+**Date**: 2026-04-13 onwards
+
+**Motivation**: R3b found a tight optimum at `(lr≈3.5e-4, lr_a≈2.2e-6, nl=8, pdrop≈0.22)` but left two things open:
+1. **`nl=6` under-exploration**: TPE sampled `nl=8` 138 times vs `nl=6` 25 times. We can't actually rule out that `nl=6` at the champion `(lr, lr_a, pdrop)` would match `nl=8`.
+2. **`PercentilePruner(25%)` mid-trial bias**: R3b used the "keep top 25%" setting (we only discovered this was backwards mid-sweep), which compounded TPE's commitment to `nl=8` by killing slow-warmup nl=6 trials at step 19.
+
+R3c addresses both via (a) a narrow search space around R3b's champion basin, (b) `n_layers ∈ {6, 8}` only (dropping the clearly-worse `nl=4`), (c) `PercentilePruner(50%)` = MedianPruner for less aggressive pruning, (d) fewer trials (narrow ranges converge faster).
+
+### Changes from R3b
+
+| Aspect | R3b | R3c |
+|--------|-----|-----|
+| Study name | `..._r3b` | `..._r3c` (fresh TPE posterior) |
+| `lr` range | [1e-5, 1e-3] log | **[2e-4, 6e-4]** log (centered on top-10 interquartile, ×2 margin) |
+| `lr_adapter` range | [1e-7, 1e-4] log | **[5e-7, 1e-5]** log (centered on 2e-6, ~2 decades wide) |
+| `n_layers` | {4, 6, 8} | **{6, 8}** (drop nl=4) |
+| `p_drop_attn` range | [0.03, 0.25] | **[0.15, 0.26]** (tighter, centered on top-10) |
+| `pruning_percentile` | 25.0 (keep top 25%, aggressive) | **50.0** (MedianPruner = keep top 50%) |
+| `n_trials_per_worker` | 10 | **5** (narrow search converges faster) |
+| Trial budget | 24 × 10 = 240 | 24 × 5 = **120** |
+
+Everything else identical: same objective (`0.3*peak + 0.7*last_6_avg`), same architecture (d=384, n_head=6, n_cond=4, T_obs=2, spatial_pool=7, flow matching, chi norm, rot6d, bf16 cached), same `n_warmup_steps=19`, same `n_startup_trials=10`.
+
+### Why narrow rather than wide again
+
+R3b's wide search already mapped the landscape. Running another 240 wide-search trials would just re-discover what we already know. The narrow search is about **confirmation + resolution**:
+
+- **Confirmation**: does the `(lr≈3.5e-4, lr_a≈2.2e-6, pdrop≈0.22)` basin hold with MedianPruner semantics? If yes, the R3b champion region is validated and can be quoted in the paper with confidence.
+- **`nl=6` resolution**: with 120 trials constrained to `{6, 8}`, TPE will put at least 40–50 trials into `nl=6` (even with its strong `nl=8` prior), directly in the champion `(lr, lr_a, pdrop)` box. If `nl=6` also reaches ~0.96 in that box, we have evidence the `nl` reversal was a spurious TPE commitment. If it clearly underperforms, the `nl=8 > nl=6` finding is solidified.
+- **Pruner sanity check**: with the correct MedianPruner, do we find the same optimum? This is a sanity check on R3b's pruner-biased results.
+
+### Why fresh study (not continuing R3b)
+
+Mixing R3c's MedianPruner samples into R3b's aggressive-pruner posterior would confuse TPE's model of "what gets pruned early". Fresh study, fresh TPE, clean comparison.
+
+### Expected behavior
+
+- **~85/120 trials survive** MedianPruner (vs ~50/240 under R3b's 25%)
+- TPE posterior converges to the same `(lr, lr_a, pdrop)` region as R3b within ~30 trials (narrow search)
+- **`nl=6` gets fair allocation**: TPE will try it with the champion `(lr, lr_a, pdrop)` combo at least 20-30 times, enough to statistically compare vs `nl=8`
+- Total wall-clock: ~4–5 hours (24 workers × 5 trials × ~50 min each) + pruning savings
+
+### Questions R3c aims to answer
+
+1. Does `nl=6` at `(lr≈3.5e-4, lr_a≈2.2e-6, pdrop≈0.22)` match `nl=8`, or is `nl=8` genuinely better?
+2. Does the R3b champion basin reproduce under correct pruner semantics?
+3. Do we find a new, even better optimum inside the narrow region that R3b missed?
+4. Does `pdrop` have a cleaner optimum in the narrow range — around 0.22 as R3b suggests, or elsewhere in [0.15, 0.26]?
+

@@ -1,11 +1,20 @@
-# Distributed Optuna HP sweep for Stage 3 — Round 3b
-# Same as R3 but with fixed metric: 0.3*peak + 0.7*last_6_avg (instead of overall_avg).
-# R3's overall_avg was polluted by pre-convergence warmup evals (epoch 4/9/14 under
-# warmup_steps=1000), biasing TPE toward fast-converging rather than best-converging HPs.
+# Distributed Optuna HP sweep for Stage 3 — Round 3c (narrow confirmation)
+# Metric: 0.3*peak + 0.7*last_6_avg, PercentilePruner(50%)=MedianPruner, 50-epoch rapid sweep.
+#
+# R3c narrows the search space around R3b's top-10 basin and restricts nl to {6, 8}
+# to finally give nl=6 a fair shot at the champion (lr, lr_a, pdrop) corner.
+# R3b top-10 (for reference): lr gmedian=3.78e-4, lr_a gmedian=2.32e-6, pdrop median=0.226,
+# all nl=8; champion #160 at lr=4.23e-4, lr_a=2.26e-6, pdrop=0.240, weighted=0.9662.
+#
+# CRITICAL PRUNER SEMANTICS NOTE (learned the hard way in R3b):
+# Optuna's PercentilePruner for a MAXIMIZATION study internally does `percentile = 100 - percentile`.
+# So `PercentilePruner(percentile=25.0)` does NOT "kill bottom 25%". It keeps ONLY the top 25%
+# (prune if best-so-far < 75th percentile of other trials' best-so-far at the same step).
+# R3c uses 50.0 = MedianPruner semantics = keep top 50%, kill bottom 50% (less aggressive).
 # Usage: python training/swarm_manager_stage3.py start|stop|status|restart_idle
 
 project:
-  study_name: "v3_square_bf16_hp_sweep_r3b"
+  study_name: "v3_square_bf16_hp_sweep_r3c"
   domain: "utm.utoronto.ca"
   project_root: "~/RAEDiTRobotics"
   venv_path: "~/venv_rlbench/bin/activate"
@@ -18,11 +27,11 @@ project:
   scratch_dir: "/tmp/optuna_trials"
   hf_repo_id: "swagman8008/RAE-DP-stage3-sweeps"
 
-  # Optuna Settings — aggressive pruning for rapid 50-epoch runs
+  # Optuna Settings — MedianPruner, fewer trials (narrow search converges faster)
   n_startup_trials: 10
   n_warmup_steps: 19          # allow ~4 evals before pruning (evals at 4, 9, 14, 19, ...)
-  pruning_percentile: 25.0    # PercentilePruner: kill bottom 25%
-  n_trials_per_worker: 10     # each worker does 10 rapid trials (~9 hours at 50 min each)
+  pruning_percentile: 50.0    # MedianPruner semantics: keep top 50%, kill bottom 50%
+  n_trials_per_worker: 5      # 24 workers × 5 trials = 120 total (narrow search needs less)
 
 manager:
   # SSH auth: set ssh_password in configs/secrets.yaml, or use SSH keys
@@ -127,31 +136,33 @@ training_static:
 
 
 # ---------------------------------------------------------------------------
-# DYNAMIC VARIABLES (Optuna Search Space — Round 3, wide)
-# Let TPE explore 2-3 orders of magnitude for lr / lr_adapter
+# DYNAMIC VARIABLES (Optuna Search Space — Round 3c, narrow)
+# Centered on R3b's top-10 champion basin with ~2× margin on each side.
+# R3b top-10: lr gmedian=3.78e-4, lr_a gmedian=2.32e-6, pdrop median=0.226, all nl=8.
+# R3c narrows to validate the basin, resolve nl=6 vs nl=8 fairly, and drop nl=4.
 # ---------------------------------------------------------------------------
 hyperparameters_search:
   lr:
     method: "suggest_float"
     kwargs:
-      low: 1.0e-5
-      high: 1.0e-3
+      low: 2.0e-4          # R3b top-10 interquartile [2.83e-4, 4.23e-4], ~1.5× margin below
+      high: 6.0e-4         # ~1.5× margin above top of interquartile
       log: true
 
   lr_adapter:
     method: "suggest_float"
     kwargs:
-      low: 1.0e-7
-      high: 1.0e-4
+      low: 5.0e-7          # R3b top-10 interquartile [1.77e-6, 2.65e-6], ~3× margin below
+      high: 1.0e-5         # ~4× margin above — probes the "frozen vs mild" boundary
       log: true
 
   n_layers:
     method: "suggest_categorical"
     kwargs:
-      choices: [4, 6, 8]
+      choices: [6, 8]      # dropped nl=4 (clearly worse in R3b: avg 0.831 vs 0.921 for nl=8)
 
   p_drop_attn:
     method: "suggest_float"
     kwargs:
-      low: 0.03
-      high: 0.25
+      low: 0.15            # R3b top-10 interquartile [0.194, 0.240]
+      high: 0.26
